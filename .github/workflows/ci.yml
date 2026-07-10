@@ -1,0 +1,143 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  # Lets publish.yml gate releases on the full CI suite.
+  workflow_call:
+
+env:
+  # Link against the libtorch bundled with the pip-installed torch.
+  LIBTORCH_USE_PYTORCH: "1"
+  LIBTORCH_STATIC: "0"
+  LIBTORCH_BYPASS_VERSION_CHECK: "1"
+  FFMPEG_PKG_CONFIG_PATH: /opt/ffmpeg/lib/pkgconfig
+  TORCH_VERSION: "2.11.0"
+  # Pinned to a dated BtbN autobuild (the `latest` alias is re-published, so
+  # its checksum is not stable) and verified against the checksum below.
+  FFMPEG_RELEASE: autobuild-2026-07-09-14-21
+  FFMPEG_BUILD: ffmpeg-n7.1.5-1-g7d0e842004-linux64-gpl-shared-7.1
+  FFMPEG_SHA256: 13ad56280d03997b04796a37d885b2acc7b0d8b3ff7c6de65f9fc8cc17e4139f
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - uses: astral-sh/setup-uv@f94ec6bedd8674c4426838e6b50417d36b6ab231 # v5.3.1
+
+      - name: Install torch (CPU)
+        run: |
+          uv venv --python 3.12 .venv
+          uv pip install --python .venv/bin/python --index-url https://download.pytorch.org/whl/cpu "torch==${TORCH_VERSION}"
+          uv pip install --python .venv/bin/python "maturin>=1.9,<2.0"
+          echo "$PWD/.venv/bin" >> "$GITHUB_PATH"
+
+      - name: Install FFmpeg 7.1 (shared)
+        run: |
+          curl -fsSL -o /tmp/ffmpeg.tar.xz "https://github.com/BtbN/FFmpeg-Builds/releases/download/${FFMPEG_RELEASE}/${FFMPEG_BUILD}.tar.xz"
+          echo "${FFMPEG_SHA256}  /tmp/ffmpeg.tar.xz" | sha256sum -c -
+          tar -xf /tmp/ffmpeg.tar.xz -C /tmp
+          sudo mv "/tmp/${FFMPEG_BUILD}" /opt/ffmpeg
+          # Tests generate media with the `ffmpeg` binary on PATH; make sure
+          # it is the same FFmpeg the crate links against.
+          echo "/opt/ffmpeg/bin" >> "$GITHUB_PATH"
+
+      - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
+        with:
+          toolchain: stable
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@bc2d2e71bd35c5549942babaa51a89c586b981d1 # v2.8.1
+
+      - name: Set library paths
+        run: |
+          TORCH_LIB=$(python -c "import torch, os; print(os.path.join(os.path.dirname(torch.__file__), 'lib'))")
+          echo "LD_LIBRARY_PATH=/opt/ffmpeg/lib:${TORCH_LIB}" >> "$GITHUB_ENV"
+          echo "LIBRARY_PATH=/opt/ffmpeg/lib:${TORCH_LIB}" >> "$GITHUB_ENV"
+
+      - name: Check formatting
+        run: cargo fmt --check
+
+      - name: Clippy
+        run: cargo clippy --no-default-features --all-targets -- -D warnings
+
+      - name: Build
+        run: cargo build --no-default-features
+
+      - name: Run tests
+        run: make test
+
+      - name: Build wheel
+        run: maturin build --release -o wheelhouse/ -i "$PWD/.venv/bin/python"
+
+      # The wheel is installed first so `import avtensor` resolves for ty
+      # (and this doubles as an import smoke test of the built wheel).
+      - name: Python lint and type check (ruff, ty)
+        run: |
+          uv pip install --python .venv/bin/python ruff==0.15.20 ty==0.0.57 torchcodec matplotlib wheelhouse/avtensor-*.whl
+          python -c "import avtensor"
+          ruff check benchmarks/
+          ruff format --check benchmarks/
+          ty check
+
+  coverage:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - uses: astral-sh/setup-uv@f94ec6bedd8674c4426838e6b50417d36b6ab231 # v5.3.1
+
+      - name: Install torch (CPU)
+        run: |
+          uv venv --python 3.12 .venv
+          uv pip install --python .venv/bin/python --index-url https://download.pytorch.org/whl/cpu "torch==${TORCH_VERSION}"
+          echo "$PWD/.venv/bin" >> "$GITHUB_PATH"
+
+      - name: Install FFmpeg 7.1 (shared)
+        run: |
+          curl -fsSL -o /tmp/ffmpeg.tar.xz "https://github.com/BtbN/FFmpeg-Builds/releases/download/${FFMPEG_RELEASE}/${FFMPEG_BUILD}.tar.xz"
+          echo "${FFMPEG_SHA256}  /tmp/ffmpeg.tar.xz" | sha256sum -c -
+          tar -xf /tmp/ffmpeg.tar.xz -C /tmp
+          sudo mv "/tmp/${FFMPEG_BUILD}" /opt/ffmpeg
+          echo "/opt/ffmpeg/bin" >> "$GITHUB_PATH"
+
+      - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
+        with:
+          toolchain: stable
+          components: llvm-tools-preview
+
+      - uses: taiki-e/install-action@5ebac0d9522d786674368e47e92963ba13f2c376 # v2.82.11
+        with:
+          tool: cargo-llvm-cov
+
+      - uses: Swatinem/rust-cache@bc2d2e71bd35c5549942babaa51a89c586b981d1 # v2.8.1
+
+      - name: Set library paths
+        run: |
+          TORCH_LIB=$(python -c "import torch, os; print(os.path.join(os.path.dirname(torch.__file__), 'lib'))")
+          echo "LD_LIBRARY_PATH=/opt/ffmpeg/lib:${TORCH_LIB}" >> "$GITHUB_ENV"
+          echo "LIBRARY_PATH=/opt/ffmpeg/lib:${TORCH_LIB}" >> "$GITHUB_ENV"
+
+      # decoder/cuda.rs is only exercised by the #[ignore] NVDEC tests, which
+      # cannot run on CPU-only runners, so it is excluded from the metric.
+      - name: Test with coverage
+        run: cargo llvm-cov --no-default-features --lcov --output-path /tmp/lcov.info --ignore-filename-regex 'decoder/cuda\.rs'
+
+      # The threshold is a backstop against large drops, set just below the
+      # current ~67% line coverage; raise it as coverage improves. `report`
+      # reuses the run above and prints the per-file table on failure.
+      - name: Enforce coverage threshold
+        run: cargo llvm-cov report --summary-only --ignore-filename-regex 'decoder/cuda\.rs' --fail-under-lines 65
+
+      - name: Upload coverage report
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: coverage-lcov
+          path: /tmp/lcov.info

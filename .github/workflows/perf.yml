@@ -1,0 +1,118 @@
+name: Performance
+
+# Guards against performance regressions: builds wheels for the PR head and
+# its merge-base with main, measures both with benchmarks/ci_perf.py on the
+# same runner in the same job, and fails when head is slower than base beyond
+# the threshold. The comparison is relative, so runner speed differences
+# cancel out; the compared statistic is min-over-repeats (noise only ever
+# adds time).
+
+on:
+  pull_request:
+    paths:
+      - "src/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "build.rs"
+      - "pyproject.toml"
+      - "benchmarks/ci_perf.py"
+      - ".github/workflows/perf.yml"
+
+concurrency:
+  group: perf-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  LIBTORCH_USE_PYTORCH: "1"
+  LIBTORCH_STATIC: "0"
+  LIBTORCH_BYPASS_VERSION_CHECK: "1"
+  FFMPEG_PKG_CONFIG_PATH: /opt/ffmpeg/lib/pkgconfig
+  TORCH_VERSION: "2.11.0"
+  # Pinned to a dated BtbN autobuild (the `latest` alias is re-published, so
+  # its checksum is not stable) and verified against the checksum below.
+  FFMPEG_RELEASE: autobuild-2026-07-09-14-21
+  FFMPEG_BUILD: ffmpeg-n7.1.5-1-g7d0e842004-linux64-gpl-shared-7.1
+  FFMPEG_SHA256: 13ad56280d03997b04796a37d885b2acc7b0d8b3ff7c6de65f9fc8cc17e4139f
+  REGRESSION_THRESHOLD: "1.25"
+
+jobs:
+  perf:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - uses: astral-sh/setup-uv@f94ec6bedd8674c4426838e6b50417d36b6ab231 # v5.3.1
+
+      - name: Install torch (CPU)
+        run: |
+          uv venv --python 3.12 .venv
+          uv pip install --python .venv/bin/python --index-url https://download.pytorch.org/whl/cpu "torch==${TORCH_VERSION}"
+          uv pip install --python .venv/bin/python "maturin>=1.9,<2.0"
+          echo "$PWD/.venv/bin" >> "$GITHUB_PATH"
+
+      - name: Install FFmpeg 7.1 (shared)
+        run: |
+          curl -fsSL -o /tmp/ffmpeg.tar.xz "https://github.com/BtbN/FFmpeg-Builds/releases/download/${FFMPEG_RELEASE}/${FFMPEG_BUILD}.tar.xz"
+          echo "${FFMPEG_SHA256}  /tmp/ffmpeg.tar.xz" | sha256sum -c -
+          tar -xf /tmp/ffmpeg.tar.xz -C /tmp
+          sudo mv "/tmp/${FFMPEG_BUILD}" /opt/ffmpeg
+          echo "/opt/ffmpeg/bin" >> "$GITHUB_PATH"
+
+      - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
+        with:
+          toolchain: stable
+
+      - uses: Swatinem/rust-cache@bc2d2e71bd35c5549942babaa51a89c586b981d1 # v2.8.1
+
+      - name: Set library paths
+        run: |
+          TORCH_LIB=$(python -c "import torch, os; print(os.path.join(os.path.dirname(torch.__file__), 'lib'))")
+          echo "LD_LIBRARY_PATH=/opt/ffmpeg/lib:${TORCH_LIB}" >> "$GITHUB_ENV"
+          echo "LIBRARY_PATH=/opt/ffmpeg/lib:${TORCH_LIB}" >> "$GITHUB_ENV"
+
+      - name: Build merge-base wheel
+        id: base
+        run: |
+          BASE=$(git merge-base "origin/${{ github.base_ref }}" HEAD)
+          echo "Merge base: $BASE"
+          # Keep the harness from the PR head so both sides run identical
+          # measurement code.
+          cp benchmarks/ci_perf.py /tmp/ci_perf.py
+          git checkout --quiet "$BASE"
+          if maturin build --release --strip -o /tmp/wheel-base/ -i "$PWD/.venv/bin/python"; then
+            echo "built=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "::warning::merge-base failed to build; skipping perf comparison"
+            echo "built=false" >> "$GITHUB_OUTPUT"
+          fi
+          git checkout --quiet -
+
+      - name: Build head wheel
+        if: steps.base.outputs.built == 'true'
+        run: maturin build --release --strip -o /tmp/wheel-head/ -i "$PWD/.venv/bin/python"
+
+      - name: Measure merge-base
+        if: steps.base.outputs.built == 'true'
+        run: |
+          uv pip install --python .venv/bin/python --force-reinstall --no-deps /tmp/wheel-base/*.whl
+          python /tmp/ci_perf.py run -o /tmp/base.json
+
+      - name: Measure head
+        if: steps.base.outputs.built == 'true'
+        run: |
+          uv pip install --python .venv/bin/python --force-reinstall --no-deps /tmp/wheel-head/*.whl
+          python /tmp/ci_perf.py run -o /tmp/head.json
+
+      - name: Compare
+        if: steps.base.outputs.built == 'true'
+        run: python /tmp/ci_perf.py compare /tmp/base.json /tmp/head.json --threshold "${REGRESSION_THRESHOLD}"
+
+      - name: Upload results
+        if: always() && steps.base.outputs.built == 'true'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: perf-results
+          path: /tmp/*.json

@@ -1,0 +1,47 @@
+[package]
+name = "avtensor"
+version = "0.2.0"
+edition = "2021"
+description = "High-performance decoding of media assets to torch Tensors"
+repository = "https://github.com/runwayml/avtensor"
+license = "Apache-2.0"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+[lib]
+name = "avtensor"
+crate-type = ["cdylib", "lib"]
+
+[dependencies]
+anyhow = "1.0.98"
+aws-config = "1"
+aws-sdk-s3 = "1"
+bytes = "1"
+derive_builder = "0.20.2"
+env_logger = {version = "0.11.8", features = ["kv"] }
+google-cloud-gax = "1.9"
+google-cloud-storage = "1.11"
+http = "1.3.1"
+libc = "0.2.175"
+log = { version = "0.4.27", features = ["kv"] }
+pyo3 = "0.25.0"
+pyo3-log = "0.12.4"
+rsmpeg = { version = "0.17.0", features = ["ffmpeg7_1"] }
+tch = { version = "0.24.0", features = ["python-extension"] }
+tempfile = "3.20.0"
+thiserror = "2.0.15"
+libloading = "0.8"
+tokio = { version = "1.47.1", features = ["time"] }
+
+# Workaround for https://pyo3.rs/main/faq#i-cant-run-cargo-test-or-i-cant-build-in-a-cargo-workspace-im-having-linker-issues-like-symbol-not-found-or-undefined-reference-to-_pyexc_systemerror
+[features]
+extension-module = ["pyo3/extension-module"]
+default = ["extension-module"]
+
+[dev-dependencies]
+mel_spec = "0.3.3"
+ndarray = "0.16.1"
+test-case = "3.3.1"
+
+# Required to support profiling
+[profile.release]
+debug = true

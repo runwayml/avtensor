@@ -1,0 +1,57 @@
+[[tool.uv.index]]
+name = "pytorch"
+url = "https://download.pytorch.org/whl/cu130"
+explicit = true
+
+[tool.uv.sources]
+torch = { index = "pytorch" }
+
+[build-system]
+requires = ["maturin>=1.9,<2.0", "torch==2.11.0", "pytorch-triton", "setuptools"]
+build-backend = "maturin"
+
+[project]
+name = "avtensor"
+description = "High-performance media decoding straight into PyTorch tensors"
+readme = "README.md"
+license = { file = "LICENSE" }
+requires-python = ">=3.8"
+keywords = ["video", "audio", "ffmpeg", "pytorch", "decoding"]
+classifiers = [
+    "License :: OSI Approved :: Apache Software License",
+    "Programming Language :: Rust",
+    "Programming Language :: Python :: Implementation :: CPython",
+    "Programming Language :: Python :: Implementation :: PyPy",
+]
+dynamic = ["version"]
+
+[project.urls]
+Repository = "https://github.com/runwayml/avtensor"
+
+# See: https://www.maturin.rs/config.html#configuration-keys
+[tool.maturin]
+features = ["pyo3/extension-module"]
+compatibility = "linux"
+auditwheel = "skip"
+
+# Include some directives to instruct uv to recompile on changes to Rust files.
+[tool.uv]
+cache-keys = [{file = "pyproject.toml"}, {file = "Cargo.toml"}, {file = "**/*.rs"}]
+
+[tool.ruff]
+line-length = 88
+# Python tooling in this repo lives under benchmarks/; the library itself is
+# Rust (src/) with generated type stubs (avtensor.pyi).
+include = ["benchmarks/*.py"]
+
+[tool.ruff.lint]
+select = [
+    "E4", "E7", "E9",  # pycodestyle errors
+    "F",               # pyflakes
+    "I",               # isort
+    "B",               # bugbear
+    "UP",              # pyupgrade
+]
+
+[tool.ty.src]
+include = ["benchmarks"]

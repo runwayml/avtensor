@@ -1,0 +1,283 @@
+{
+  "env": {
+    "torch": "2.11.0+cu130",
+    "torchcodec": "0.14.0+cu130",
+    "avtensor": "0.2.0",
+    "ffmpeg": "n7.1.1-56-gc2184b65d2-20250720",
+    "libavcodec_loaded_by_both": "/opt/ffmpeg/lib/libavcodec.so.61.19.101",
+    "cpu": "Intel(R) Xeon(R) Platinum 8481C CPU @ 2.70GHz",
+    "cpu_count": 208,
+    "gpu": "NVIDIA H100 80GB HBM3"
+  },
+  "single": {
+    "full_1080p_h264_threads1": {
+      "label": "full 1080p H.264, 1 thread",
+      "avtensor": {
+        "wall_median_s": 5.45363047812134,
+        "wall_min_s": 5.40550275426358,
+        "cpu_median_s": 5.453588,
+        "fps": 165.02768268047944
+      },
+      "torchcodec": {
+        "wall_median_s": 5.582020813133568,
+        "wall_min_s": 5.546279626432806,
+        "cpu_median_s": 5.582004999999995,
+        "fps": 161.23193197030895
+      }
+    },
+    "full_1080p_h264_threadsauto": {
+      "label": "full 1080p H.264, auto threads",
+      "avtensor": {
+        "wall_median_s": 2.5420337482355535,
+        "wall_min_s": 2.490206223912537,
+        "cpu_median_s": 6.913932000000003,
+        "fps": 354.0472271954286
+      },
+      "torchcodec": {
+        "wall_median_s": 2.55612766277045,
+        "wall_min_s": 2.4954565493389964,
+        "cpu_median_s": 6.750169999999997,
+        "fps": 352.09509020552525
+      }
+    },
+    "full_1080p_hevc_threadsauto": {
+      "label": "full 1080p HEVC, auto threads",
+      "avtensor": {
+        "wall_median_s": 2.485897345934063,
+        "wall_min_s": 2.4653778611682355,
+        "cpu_median_s": 9.033395999999982,
+        "fps": 362.04230294225187
+      },
+      "torchcodec": {
+        "wall_median_s": 2.4954207818955183,
+        "wall_min_s": 2.4717793888412416,
+        "cpu_median_s": 8.943243000000024,
+        "fps": 360.6606174516032
+      }
+    },
+    "full_720p_h264_threads1": {
+      "label": "full 720p H.264, 1 thread",
+      "avtensor": {
+        "wall_median_s": 0.9027241212315857,
+        "wall_min_s": 0.8957061930559576,
+        "cpu_median_s": 0.902748000000031,
+        "fps": 332.32744417055153
+      },
+      "torchcodec": {
+        "wall_median_s": 0.8999143540859222,
+        "wall_min_s": 0.8962925430387259,
+        "cpu_median_s": 0.8999259999999936,
+        "fps": 333.36505706114843
+      }
+    },
+    "resize256x144_1080p_threads1": {
+      "label": "1080p -> 256x144, 1 thread",
+      "avtensor": {
+        "wall_median_s": 3.72828318644315,
+        "wall_min_s": 3.6677271220833063,
+        "cpu_median_s": 5.276847999999973,
+        "fps": 241.3979719331933
+      },
+      "torchcodec": {
+        "wall_median_s": 6.518522461876273,
+        "wall_min_s": 6.482317681889981,
+        "cpu_median_s": 6.518487999999991,
+        "fps": 138.06809829430986
+      }
+    },
+    "resize256x144_1080p_threadsauto": {
+      "label": "1080p -> 256x144, auto threads",
+      "avtensor": {
+        "wall_median_s": 0.6072206730023026,
+        "wall_min_s": 0.5801066881977022,
+        "cpu_median_s": 6.721318999999937,
+        "fps": 1482.162976352729
+      },
+      "torchcodec": {
+        "wall_median_s": 3.56619611941278,
+        "wall_min_s": 3.5605183322913945,
+        "cpu_median_s": 7.673226999999997,
+        "fps": 252.36974352049842
+      }
+    },
+    "seek_5s_window_1080p": {
+      "label": "5 s window @15 s, 1080p",
+      "avtensor": {
+        "wall_median_s": 0.49526818422600627,
+        "wall_min_s": 0.47029798198491335,
+        "cpu_median_s": 1.4083570000000236,
+        "fps": 302.86621426009134
+      },
+      "torchcodec": {
+        "wall_median_s": 0.5082605853676796,
+        "wall_min_s": 0.48382050869986415,
+        "cpu_median_s": 1.485921000000019,
+        "fps": 295.12420265972196
+      }
+    },
+    "audio_48k": {
+      "label": "audio 48 kHz (30 s)",
+      "avtensor": {
+        "wall_median_s": 0.04024938680231571,
+        "wall_min_s": 0.03979658521711826,
+        "cpu_median_s": 0.040390000000002146
+      },
+      "torchcodec": {
+        "wall_median_s": 0.03196061588823795,
+        "wall_min_s": 0.031645425129681826,
+        "cpu_median_s": 0.031982000000084554
+      }
+    },
+    "audio_resample16k": {
+      "label": "audio resampled to 16 kHz",
+      "avtensor": {
+        "wall_median_s": 0.04754208121448755,
+        "wall_min_s": 0.04648505663499236,
+        "cpu_median_s": 0.04741500000000087
+      },
+      "torchcodec": {
+        "wall_median_s": 0.0393011630512774,
+        "wall_min_s": 0.03902713302522898,
+        "cpu_median_s": 0.039322000000026947
+      }
+    },
+    "video_plus_audio_1080p": {
+      "label": "video + audio, one asset",
+      "avtensor": {
+        "wall_median_s": 2.5128572741523385,
+        "wall_min_s": 2.4810896390117705,
+        "cpu_median_s": 6.7017419999999674
+      },
+      "torchcodec": {
+        "wall_median_s": 2.588743903208524,
+        "wall_min_s": 2.5057393270544708,
+        "cpu_median_s": 6.771286000000032
+      }
+    }
+  },
+  "nvdec": {
+    "nvdec_full_1080p": {
+      "label": "NVDEC full 1080p",
+      "avtensor": {
+        "wall_median_s": 4.066324411891401,
+        "wall_min_s": 4.054668536875397,
+        "cpu_median_s": 10.159439000000248
+      },
+      "torchcodec_cuda": {
+        "wall_median_s": 1.2778490129858255,
+        "wall_min_s": 1.2772198896855116,
+        "cpu_median_s": 0.0601960000001327
+      }
+    },
+    "nvdec_resize256x144_1080p": {
+      "label": "NVDEC 1080p -> 256x144",
+      "avtensor": {
+        "wall_median_s": 1.588560274336487,
+        "wall_min_s": 1.584672074764967,
+        "cpu_median_s": 0.8375899999998637
+      },
+      "torchcodec_cuda": {
+        "wall_median_s": 1.3307301769964397,
+        "wall_min_s": 1.3302176469005644,
+        "cpu_median_s": 0.1315589999999247
+      }
+    }
+  },
+  "concurrency": {
+    "avtensor": {
+      "1": {
+        "jobs": 8,
+        "clips_per_s": 1.1344335534980754,
+        "frames_per_s": 340.3300660494226,
+        "cpu_s": 7.052305000000047,
+        "wall_s": 7.051977592986077
+      },
+      "2": {
+        "jobs": 8,
+        "clips_per_s": 2.1195058203926043,
+        "frames_per_s": 635.8517461177813,
+        "cpu_s": 7.474767000000043,
+        "wall_s": 3.7744647469371557
+      },
+      "4": {
+        "jobs": 12,
+        "clips_per_s": 4.04188223677234,
+        "frames_per_s": 1212.564671031702,
+        "cpu_s": 11.316326000000004,
+        "wall_s": 2.9689138121902943
+      },
+      "8": {
+        "jobs": 24,
+        "clips_per_s": 7.3217634430375105,
+        "frames_per_s": 2196.529032911253,
+        "cpu_s": 23.55964800000004,
+        "wall_s": 3.27789885411039
+      },
+      "16": {
+        "jobs": 48,
+        "clips_per_s": 12.578072534388479,
+        "frames_per_s": 3773.421760316544,
+        "cpu_s": 50.19632799999988,
+        "wall_s": 3.816164986230433
+      },
+      "32": {
+        "jobs": 96,
+        "clips_per_s": 18.19991627097252,
+        "frames_per_s": 5459.974881291756,
+        "cpu_s": 116.80457400000012,
+        "wall_s": 5.2747495411895216
+      }
+    },
+    "torchcodec": {
+      "1": {
+        "jobs": 8,
+        "clips_per_s": 1.120569672258142,
+        "frames_per_s": 336.1709016774426,
+        "cpu_s": 7.288056000000097,
+        "wall_s": 7.1392258759588
+      },
+      "2": {
+        "jobs": 8,
+        "clips_per_s": 2.1511056692392247,
+        "frames_per_s": 645.3317007717675,
+        "cpu_s": 7.541544000000044,
+        "wall_s": 3.719017672818154
+      },
+      "4": {
+        "jobs": 12,
+        "clips_per_s": 4.02549100715824,
+        "frames_per_s": 1207.6473021474721,
+        "cpu_s": 11.90950399999997,
+        "wall_s": 2.9810028090141714
+      },
+      "8": {
+        "jobs": 24,
+        "clips_per_s": 7.798726205737965,
+        "frames_per_s": 2339.6178617213895,
+        "cpu_s": 24.58035099999995,
+        "wall_s": 3.077425641939044
+      },
+      "16": {
+        "jobs": 48,
+        "clips_per_s": 13.181848152115363,
+        "frames_per_s": 3954.554445634609,
+        "cpu_s": 53.12649800000008,
+        "wall_s": 3.641371031291783
+      },
+      "32": {
+        "jobs": 96,
+        "clips_per_s": 21.106619217541507,
+        "frames_per_s": 6331.985765262452,
+        "cpu_s": 128.522156,
+        "wall_s": 4.548336188308895
+      }
+    }
+  },
+  "correctness": {
+    "avtensor_frames": 300,
+    "torchcodec_frames": 300,
+    "mean_abs_diff": 0.0,
+    "max_abs_diff": 0.0,
+    "pct_pixels_diff_gt2": 0.0
+  }
+}

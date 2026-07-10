@@ -1,0 +1,89 @@
+name: Release wheel
+
+# Builds a wheel linked against a specific CUDA build of torch (linking needs
+# no GPU, so standard runners work). Triggered by version tags (v*) or
+# manually with a torch/CUDA override. The full test suite gates the build,
+# and the wheel is attached to the GitHub release.
+#
+# Consumers that mirror wheels elsewhere (e.g. an internal package bucket)
+# should copy the release asset from their own infrastructure.
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      torch_version:
+        description: "torch version to link against"
+        default: "2.11.0"
+        required: true
+      cuda_tag:
+        description: "CUDA tag of the torch build (pip index suffix)"
+        default: "cu130"
+        required: true
+
+env:
+  LIBTORCH_USE_PYTORCH: "1"
+  LIBTORCH_STATIC: "0"
+  FFMPEG_PKG_CONFIG_PATH: /opt/ffmpeg/lib/pkgconfig
+  TORCH_VERSION: ${{ inputs.torch_version || '2.11.0' }}
+  CUDA_TAG: ${{ inputs.cuda_tag || 'cu130' }}
+  FFMPEG_BUILD: ffmpeg-n7.1-latest-linux64-gpl-shared-7.1
+
+jobs:
+  release:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write # create the GitHub release
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - uses: astral-sh/setup-uv@f94ec6bedd8674c4426838e6b50417d36b6ab231 # v5.3.1
+
+      - name: Install torch (${{ env.CUDA_TAG }})
+        run: |
+          uv venv --python 3.12 .venv
+          uv pip install --python .venv/bin/python --index-url "https://download.pytorch.org/whl/${CUDA_TAG}" "torch==${TORCH_VERSION}"
+          uv pip install --python .venv/bin/python "maturin>=1.9,<2.0"
+          echo "$PWD/.venv/bin" >> "$GITHUB_PATH"
+
+      - name: Install FFmpeg 7.1 (shared)
+        run: |
+          curl -fsSL -o /tmp/ffmpeg.tar.xz "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/${FFMPEG_BUILD}.tar.xz"
+          tar -xf /tmp/ffmpeg.tar.xz -C /tmp
+          sudo mv "/tmp/${FFMPEG_BUILD}" /opt/ffmpeg
+          # Tests generate media with the `ffmpeg` binary on PATH; make sure
+          # it is the same FFmpeg the crate links against.
+          echo "/opt/ffmpeg/bin" >> "$GITHUB_PATH"
+
+      - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
+        with:
+          toolchain: stable
+
+      - uses: Swatinem/rust-cache@bc2d2e71bd35c5549942babaa51a89c586b981d1 # v2.8.1
+
+      - name: Set library paths
+        run: |
+          TORCH_LIB=$(python -c "import torch, os; print(os.path.join(os.path.dirname(torch.__file__), 'lib'))")
+          echo "LD_LIBRARY_PATH=/opt/ffmpeg/lib:${TORCH_LIB}" >> "$GITHUB_ENV"
+          echo "LIBRARY_PATH=/opt/ffmpeg/lib:${TORCH_LIB}" >> "$GITHUB_ENV"
+
+      - name: Run tests
+        run: make test
+
+      - name: Build wheel
+        run: maturin build --release -o wheelhouse/ -i "$PWD/.venv/bin/python"
+
+      - name: Stamp commit into wheel name
+        run: |
+          SHA10=$(git rev-parse HEAD | cut -c1-10)
+          for f in wheelhouse/avtensor-*.whl; do
+            mv "$f" "${f/-cp/+${SHA10}-cp}"
+          done
+          ls -la wheelhouse/
+
+      - name: Attach wheel to GitHub release
+        if: startsWith(github.ref, 'refs/tags/')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "${GITHUB_REF_NAME}" wheelhouse/*.whl --title "${GITHUB_REF_NAME}" --generate-notes || gh release upload "${GITHUB_REF_NAME}" wheelhouse/*.whl
