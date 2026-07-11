@@ -211,13 +211,11 @@ with cuvid support.
 
 With `device`, frames never leave the GPU: the returned tensor is
 CUDA-resident, and NV12 → RGB conversion runs on the device (NPP), so the
-GPU→CPU transfer and CPU color conversion disappear.
+GPU→CPU transfer and CPU color conversion disappear. `device` implies
+`hardware_acceleration`.
 
 ```python
-request.video_stream = VideoStreamRequest(
-    hardware_acceleration=True,
-    device="cuda",  # tensor lands on cuda:0
-)
+request.video_stream = VideoStreamRequest(device="cuda")  # tensor lands on cuda:0
 ```
 
 Constraints on this path:
@@ -301,7 +299,7 @@ All attributes default to `None`, meaning "keep the source value".
 | `number_of_threads` | `int \| None` | FFmpeg decoder threads (default: 1; `0` = FFmpeg auto) |
 | `hardware_acceleration` | `bool \| None` | decode on the GPU's NVDEC engine (see [GPU-accelerated decoding](#gpu-accelerated-decoding-nvdec)) |
 | `dimension_order` | `str \| None` | `"NCHW"` (default, `[T, C, H, W]`, a non-contiguous view) or `"NHWC"` (`[T, H, W, C]`, contiguous) |
-| `device` | `str \| None` | `"cuda"` / `"cuda:N"`: keep frames on the GPU (see [GPU-accelerated decoding](#gpu-accelerated-decoding-nvdec)) |
+| `device` | `str \| None` | `"cuda"` / `"cuda:N"`: keep frames on the GPU, implies `hardware_acceleration` (see [GPU-accelerated decoding](#gpu-accelerated-decoding-nvdec)) |
 | `dtype` | `str \| None` | `"uint8"` (default) or `"float32"` (`[0, 1]`, NCHW-contiguous, preserves 10/12-bit source depth) |
 
 ### `AudioStreamRequest`

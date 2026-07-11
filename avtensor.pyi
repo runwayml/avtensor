@@ -25,9 +25,9 @@ class VideoStreamRequest:
     # "NCHW" (default, [T, C, H, W], a non-contiguous view) or "NHWC"
     # ([T, H, W, C], contiguous).
     dimension_order: str | None
-    # "cuda" or "cuda:N": keep decoded frames on the GPU (requires
-    # hardware_acceleration). The returned tensor is CUDA-resident; frames
-    # are never copied to system memory.
+    # "cuda" or "cuda:N": keep decoded frames on the GPU. Implies
+    # hardware_acceleration (an explicit False is an error). The returned
+    # tensor is CUDA-resident; frames are never copied to system memory.
     device: str | None
     # "uint8" (default) or "float32". float32 decodes to planar float in
     # [0, 1] (NCHW-contiguous), preserving the depth of 10/12-bit sources.
