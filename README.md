@@ -7,8 +7,7 @@ High-performance media decoding straight into PyTorch tensors.
 
 avtensor is a Rust library with Python bindings that decodes video, audio
 and images into `torch.Tensor`s using FFmpeg. It is built for ML
-data-loading pipelines: data moves directly from FFmpeg frames into tensors,
-and the GIL is released while decoding. Inputs can be local files, `gs://` /
+data-loading pipelines: data moves directly from FFmpeg frames into tensors. Inputs can be local files, `gs://` /
 `s3://` objects or any HTTP(S) URL.
 
 - Decode-time transforms inside FFmpeg: resize, frame-rate resampling,
@@ -22,7 +21,7 @@ and the GIL is released while decoding. Inputs can be local files, `gs://` /
 
 [torchcodec](https://github.com/meta-pytorch/torchcodec) is PyTorch's
 official media decoder. Both decode through FFmpeg and produce bit-identical
-RGB output on CPU decode. The focus differs, as of torchcodec 0.14:
+RGB output on CPU decode. Some differences as of torchcodec 0.14:
 
 | | avtensor | torchcodec |
 | --- | --- | --- |
