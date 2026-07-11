@@ -139,10 +139,10 @@ pub struct VideoStreamRequest {
     /// if the FFmpeg build has no hardware decoder for the stream's codec or
     /// no GPU is available.
     pub hardware_acceleration: Option<bool>,
-    /// CUDA ordinal to keep decoded frames on. Requires
-    /// `hardware_acceleration`; the output tensor is allocated on this
-    /// device and NV12 -> RGB conversion runs on the GPU (NPP), so frames
-    /// are never copied back to system memory. Only NVDEC's own downscaling
+    /// CUDA ordinal to keep decoded frames on. Implies
+    /// `hardware_acceleration` (an explicit `false` is an error); the output
+    /// tensor is allocated on this device and NV12 -> RGB conversion runs on
+    /// the GPU (NPP), so frames are never copied back to system memory. Only NVDEC's own downscaling
     /// is available (`width`/`height` must both be set, even, and a strict
     /// downscale — or both unset); fps resampling and HDR tone mapping are
     /// not supported on this path.
@@ -638,11 +638,23 @@ fn init_video_stream_context(
     let default_decoder = AVCodec::find_decoder(codecpar.codec_id)
         .with_context(|| anyhow!("Failed to find decoder for video stream #{}", video_index))?;
 
+    // device="cuda" decodes on NVDEC, so an unset hardware_acceleration is
+    // implied; an explicit false contradicts it.
+    let hardware_acceleration = match (request.hardware_acceleration, request.device) {
+        (Some(false), Some(_)) => {
+            return Err(anyhow!(
+                "device=\"cuda\" decodes on NVDEC and cannot be combined with \
+                 hardware_acceleration=false"
+            ));
+        }
+        (hw, device) => hw == Some(true) || device.is_some(),
+    };
+
     // When hardware acceleration is requested, decode on NVDEC via the
     // codec's cuvid wrapper (e.g. h264_cuvid). Without a hardware device
     // context these decoders return frames in system memory (NV12), so the
     // downstream filter graph and tensor conversion are unchanged.
-    let decoder = if request.hardware_acceleration == Some(true) {
+    let decoder = if hardware_acceleration {
         let hw_name = format!("{}_cuvid", default_decoder.name().to_string_lossy());
         let hw_name_c = CString::new(hw_name.clone()).context("building decoder name")?;
         let hw_decoder = AVCodec::find_decoder_by_name(&hw_name_c).with_context(|| {
@@ -665,11 +677,6 @@ fn init_video_stream_context(
     if let Some(device) = request.device {
         // GPU-resident output is a constrained pipeline: frames never reach
         // system memory, so only NVDEC's own capabilities are available.
-        if request.hardware_acceleration != Some(true) {
-            return Err(anyhow!(
-                "device=\"cuda\" requires hardware_acceleration=true"
-            ));
-        }
         if request.frame_rate.is_some() {
             return Err(anyhow!(
                 "device=\"cuda\" does not support fps resampling (frames never \
@@ -711,7 +718,7 @@ fn init_video_stream_context(
         let _ = device;
     }
 
-    if request.hardware_acceleration == Some(true) {
+    if hardware_acceleration {
         // Attach a CUDA device context to the decoder. The ffmpeg CLI creates
         // one implicitly for cuvid decoders; in library use the decoder needs
         // it to reach the GPU.
@@ -779,7 +786,7 @@ fn init_video_stream_context(
     // by the scale factor and removes most of the CPU scaling cost; the
     // filter graph still runs afterwards and guarantees the exact requested
     // dimensions.
-    let hw_resize = if request.hardware_acceleration == Some(true) {
+    let hw_resize = if hardware_acceleration {
         compute_hw_resize(codecpar.width, codecpar.height, request)
     } else {
         None
@@ -3900,6 +3907,33 @@ mod tests {
     }
 
     #[test]
+    fn test_device_with_hardware_acceleration_false_is_rejected() -> anyhow::Result<()> {
+        init_logger();
+        // The contradiction is caught before any CUDA machinery is touched,
+        // so this runs on CPU-only machines.
+        let test_video = generate_test_video_file(&TestVideoParameters::default())?;
+        let err = match decode_media(MediaDecodeRequest {
+            source: MediaSource::Uri(test_video.path().to_str().unwrap().into()),
+            start_time: None,
+            end_time: None,
+            video_stream: Some(VideoStreamRequest {
+                hardware_acceleration: Some(false),
+                device: Some(0),
+                ..Default::default()
+            }),
+            audio_streams: None,
+        }) {
+            Ok(_) => anyhow::bail!("expected the contradiction to be rejected"),
+            Err(err) => err,
+        };
+        assert!(
+            format!("{err:#}").contains("cannot be combined with hardware_acceleration=false"),
+            "unexpected error: {err:#}"
+        );
+        Ok(())
+    }
+
+    #[test]
     #[ignore = "requires an NVIDIA GPU with NVDEC"]
     fn test_decode_media_gpu_resident_output() -> anyhow::Result<()> {
         init_logger();
@@ -3930,12 +3964,12 @@ mod tests {
             }),
             audio_streams: None,
         })?;
+        // device alone implies hardware acceleration.
         let gpu = decode_media(MediaDecodeRequest {
             source: MediaSource::Uri(path),
             start_time: None,
             end_time: None,
             video_stream: Some(VideoStreamRequest {
-                hardware_acceleration: Some(true),
                 device: Some(0),
                 ..Default::default()
             }),
