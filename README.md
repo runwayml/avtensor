@@ -211,8 +211,7 @@ with cuvid support.
 
 With `device`, frames never leave the GPU: the returned tensor is
 CUDA-resident, and NV12 → RGB conversion runs on the device (NPP), so the
-GPU→CPU transfer and CPU color conversion disappear. Use it when the next
-pipeline stage runs on the GPU.
+GPU→CPU transfer and CPU color conversion disappear.
 
 ```python
 request.video_stream = VideoStreamRequest(
