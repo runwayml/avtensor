@@ -76,8 +76,10 @@ fn get_storage() -> Result<&'static Storage, anyhow::Error> {
 ///
 /// Credentials and region come from the standard AWS environment (env vars,
 /// shared config, IMDS, ...). S3-compatible providers are supported through
-/// the SDK's standard `AWS_ENDPOINT_URL_S3` / `AWS_ENDPOINT_URL` overrides;
-/// set `AVTENSOR_S3_FORCE_PATH_STYLE=1` for providers that require
+/// the SDK's standard `AWS_ENDPOINT_URL_S3` / `AWS_ENDPOINT_URL` overrides,
+/// or the avtensor-scoped `AVTENSOR_S3_ENDPOINT_URL` / `AVTENSOR_S3_REGION`,
+/// which take precedence.
+/// Set `AVTENSOR_S3_FORCE_PATH_STYLE=1` for providers that require
 /// path-style addressing.
 fn get_s3_client() -> Result<&'static aws_sdk_s3::Client, anyhow::Error> {
     let client = GLOBAL_S3_CLIENT.get_or_init(|| {
@@ -88,6 +90,14 @@ fn get_s3_client() -> Result<&'static aws_sdk_s3::Client, anyhow::Error> {
                 .load(),
         )?;
         let mut builder = aws_sdk_s3::config::Builder::from(&config);
+        if let Ok(endpoint) = std::env::var("AVTENSOR_S3_ENDPOINT_URL") {
+            log::info!("AVTENSOR_S3_ENDPOINT_URL={endpoint}: overriding S3 endpoint");
+            builder = builder.endpoint_url(endpoint);
+        }
+        if let Ok(region) = std::env::var("AVTENSOR_S3_REGION") {
+            log::info!("AVTENSOR_S3_REGION={region}: overriding S3 region");
+            builder = builder.region(aws_sdk_s3::config::Region::new(region));
+        }
         if std::env::var("AVTENSOR_S3_FORCE_PATH_STYLE").is_ok_and(|v| v == "1") {
             log::info!("AVTENSOR_S3_FORCE_PATH_STYLE=1: using path-style addressing");
             builder = builder.force_path_style(true);

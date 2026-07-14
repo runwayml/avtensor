@@ -340,6 +340,10 @@ S3-compatible providers work by overriding the endpoint:
 ```bash
 export AWS_ENDPOINT_URL_S3=https://objects.example.com
 
+# Or scoped to avtensor only that take precedence
+export AVTENSOR_S3_ENDPOINT_URL=https://objects.example.com
+export AVTENSOR_S3_REGION=my-region-1
+
 # MinIO and other path-style-only stores additionally need:
 export AVTENSOR_S3_FORCE_PATH_STYLE=1
 ```
@@ -376,7 +380,7 @@ provider-specific support — the URL is handed to FFmpeg's http protocol.
   filter (libzimg); use a build that includes it.
 - **`s3://` works with AWS but not with your S3-compatible store** — check
   whether the store requires path-style addressing
-  (`AVTENSOR_S3_FORCE_PATH_STYLE=1`) and that `AWS_ENDPOINT_URL_S3` is set.
+  (`AVTENSOR_S3_FORCE_PATH_STYLE=1`) and that `AVTENSOR_S3_ENDPOINT_URL` or `AWS_ENDPOINT_URL_S3` is set.
 
 ## Contributing
 
