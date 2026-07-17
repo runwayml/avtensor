@@ -14,7 +14,7 @@ use tch::IndexOp;
 use crate::{
     conversion::convert_audio_into_tensor,
     decoder::io::{cloud_storage_avio_reader, memory_avio_reader},
-    util::{ffmpeg::RetUpgrade, pts_to_seconds},
+    util::{ffmpeg::RetUpgrade, pts_to_seconds, s3::S3Config},
 };
 
 use crate::conversion;
@@ -168,12 +168,15 @@ pub enum MediaSource {
 
 impl MediaSource {
     /// Opens an [`AVFormatContextInput`] for this source.
-    fn open(self) -> Result<AVFormatContextInput, anyhow::Error> {
+    ///
+    /// `s3_config` is the explicit S3 client configuration for `s3://` URIs;
+    /// it is ignored for other sources.
+    fn open(self, s3_config: Option<S3Config>) -> Result<AVFormatContextInput, anyhow::Error> {
         match self {
             MediaSource::Uri(uri) => {
                 let file_path =
                     CString::new(uri).context("Failed to create CStr from file path")?;
-                cloud_storage_avio_reader(&file_path)
+                cloud_storage_avio_reader(&file_path, s3_config)
             }
             MediaSource::Bytes(bytes) => memory_avio_reader(bytes),
         }
@@ -195,7 +198,10 @@ struct Seek {
 }
 
 /// Decodes media given a [`MediaDecodeRequest`].
-pub fn decode_media(request: MediaDecodeRequest) -> Result<Vec<DecodedStream>, anyhow::Error> {
+pub fn decode_media(
+    request: MediaDecodeRequest,
+    s3_config: Option<S3Config>,
+) -> Result<Vec<DecodedStream>, anyhow::Error> {
     let MediaDecodeRequest {
         source,
         start_time,
@@ -204,7 +210,7 @@ pub fn decode_media(request: MediaDecodeRequest) -> Result<Vec<DecodedStream>, a
         audio_streams,
     } = request;
 
-    let mut input_format_context = source.open()?;
+    let mut input_format_context = source.open(s3_config)?;
 
     // Stream selection
     let video_stream = select_video_stream(&input_format_context, video_stream_request)?;
@@ -513,8 +519,11 @@ pub struct ProbedMedia {
 }
 
 /// Probes a media asset's stream layout without decoding it.
-pub fn probe_media(source: MediaSource) -> Result<ProbedMedia, anyhow::Error> {
-    let input_format_context = source.open()?;
+pub fn probe_media(
+    source: MediaSource,
+    s3_config: Option<S3Config>,
+) -> Result<ProbedMedia, anyhow::Error> {
+    let input_format_context = source.open(s3_config)?;
     let mut probed = ProbedMedia::default();
     for (index, stream) in input_format_context.streams().iter().enumerate() {
         let codecpar = stream.codecpar();
@@ -2780,13 +2789,16 @@ mod tests {
         let params = TestVideoParameters::default();
         let test_video = generate_test_video_file(&params)?;
         let start = Instant::now();
-        let result = decode_media(MediaDecodeRequest {
-            source: MediaSource::Uri(test_video.path().to_str().unwrap().into()),
-            start_time: None,
-            end_time: None,
-            video_stream: Some(VideoStreamRequest::default()),
-            audio_streams: Some(vec![AudioStreamRequest::default()]),
-        });
+        let result = decode_media(
+            MediaDecodeRequest {
+                source: MediaSource::Uri(test_video.path().to_str().unwrap().into()),
+                start_time: None,
+                end_time: None,
+                video_stream: Some(VideoStreamRequest::default()),
+                audio_streams: Some(vec![AudioStreamRequest::default()]),
+            },
+            None,
+        );
         match result {
             Ok(decoded_streams) => {
                 let elapsed = start.elapsed();
@@ -2823,13 +2835,16 @@ mod tests {
         }
 
         // Do not specify which stream to decode -> should not yield decoded streams.
-        match decode_media(MediaDecodeRequest {
-            source: MediaSource::Uri(test_video.path().to_str().unwrap().into()),
-            start_time: None,
-            end_time: None,
-            video_stream: None,
-            audio_streams: None,
-        }) {
+        match decode_media(
+            MediaDecodeRequest {
+                source: MediaSource::Uri(test_video.path().to_str().unwrap().into()),
+                start_time: None,
+                end_time: None,
+                video_stream: None,
+                audio_streams: None,
+            },
+            None,
+        ) {
             Ok(decoded_streams) => assert!(
                 decoded_streams.is_empty(),
                 "Expected no streams to be decoded when no video or audio streams are requested."
@@ -2853,17 +2868,20 @@ mod tests {
             ..Default::default()
         })?;
         let start = Instant::now();
-        let decoded_streams = decode_media(MediaDecodeRequest {
-            source: MediaSource::Uri(test_video.path().to_str().unwrap().into()),
-            start_time: None,
-            end_time: None,
-            video_stream: Some(VideoStreamRequest {
-                width: Some(width as u32),
-                height: Some(height as u32),
-                ..Default::default()
-            }),
-            audio_streams: Some(vec![AudioStreamRequest::default()]),
-        })
+        let decoded_streams = decode_media(
+            MediaDecodeRequest {
+                source: MediaSource::Uri(test_video.path().to_str().unwrap().into()),
+                start_time: None,
+                end_time: None,
+                video_stream: Some(VideoStreamRequest {
+                    width: Some(width as u32),
+                    height: Some(height as u32),
+                    ..Default::default()
+                }),
+                audio_streams: Some(vec![AudioStreamRequest::default()]),
+            },
+            None,
+        )
         .unwrap();
 
         let elapsed = start.elapsed();
@@ -2931,16 +2949,19 @@ mod tests {
             ..Default::default()
         })?;
         let start = Instant::now();
-        let decoded_streams = decode_media(MediaDecodeRequest {
-            source: MediaSource::Uri(test_video.path().to_str().unwrap().into()),
-            start_time: None,
-            end_time: None,
-            video_stream: Some(VideoStreamRequest {
-                frame_rate: Some(target_frame_rate),
-                ..Default::default()
-            }),
-            audio_streams: Some(vec![AudioStreamRequest::default()]),
-        })
+        let decoded_streams = decode_media(
+            MediaDecodeRequest {
+                source: MediaSource::Uri(test_video.path().to_str().unwrap().into()),
+                start_time: None,
+                end_time: None,
+                video_stream: Some(VideoStreamRequest {
+                    frame_rate: Some(target_frame_rate),
+                    ..Default::default()
+                }),
+                audio_streams: Some(vec![AudioStreamRequest::default()]),
+            },
+            None,
+        )
         .unwrap();
 
         let elapsed = start.elapsed();
@@ -2991,16 +3012,19 @@ mod tests {
             ..Default::default()
         })?;
         let start = Instant::now();
-        let decoded_streams = decode_media(MediaDecodeRequest {
-            source: MediaSource::Uri(test_video.path().to_str().unwrap().into()),
-            start_time: None,
-            end_time: None,
-            video_stream: None,
-            audio_streams: Some(vec![AudioStreamRequest {
-                sample_rate: Some(target_sample_rate as u32),
-                ..Default::default()
-            }]),
-        })
+        let decoded_streams = decode_media(
+            MediaDecodeRequest {
+                source: MediaSource::Uri(test_video.path().to_str().unwrap().into()),
+                start_time: None,
+                end_time: None,
+                video_stream: None,
+                audio_streams: Some(vec![AudioStreamRequest {
+                    sample_rate: Some(target_sample_rate as u32),
+                    ..Default::default()
+                }]),
+            },
+            None,
+        )
         .unwrap();
 
         let elapsed = start.elapsed();
@@ -3043,22 +3067,25 @@ mod tests {
             ..Default::default()
         })?;
         let start = Instant::now();
-        let decoded_streams = decode_media(MediaDecodeRequest {
-            source: MediaSource::Uri(test_video.path().to_str().unwrap().into()),
-            start_time: None,
-            end_time: None,
-            video_stream: None,
-            audio_streams: Some(vec![AudioStreamRequest {
-                sample_rate: Some(target_sample_rate as u32),
-                loudness_normalization: Some(LoudnessNormalization {
-                    integrated_loudness_target: Some(-18.0),
-                    loudness_range_target: Some(7.0),
-                    true_peak_level_target: Some(-2.0),
+        let decoded_streams = decode_media(
+            MediaDecodeRequest {
+                source: MediaSource::Uri(test_video.path().to_str().unwrap().into()),
+                start_time: None,
+                end_time: None,
+                video_stream: None,
+                audio_streams: Some(vec![AudioStreamRequest {
+                    sample_rate: Some(target_sample_rate as u32),
+                    loudness_normalization: Some(LoudnessNormalization {
+                        integrated_loudness_target: Some(-18.0),
+                        loudness_range_target: Some(7.0),
+                        true_peak_level_target: Some(-2.0),
+                        ..Default::default()
+                    }),
                     ..Default::default()
-                }),
-                ..Default::default()
-            }]),
-        })
+                }]),
+            },
+            None,
+        )
         .unwrap();
 
         let elapsed = start.elapsed();
@@ -3104,18 +3131,21 @@ mod tests {
             ..Default::default()
         };
         let test_video = generate_test_video_file(&params)?;
-        let gcs_decoded = decode_media(MediaDecodeRequest {
-            source: MediaSource::Uri(test_video.path().to_str().unwrap().into()),
-            start_time: None,
-            end_time: Some(7.319999999999999), // (rikheijdens): The end_time here is significant and necessary for reproducing.
-            video_stream: Some(VideoStreamRequest {
-                frame_rate: Some(10.0),
-                width: Some(256),
-                height: Some(256),
-                ..Default::default()
-            }),
-            audio_streams: None,
-        })
+        let gcs_decoded = decode_media(
+            MediaDecodeRequest {
+                source: MediaSource::Uri(test_video.path().to_str().unwrap().into()),
+                start_time: None,
+                end_time: Some(7.319999999999999), // (rikheijdens): The end_time here is significant and necessary for reproducing.
+                video_stream: Some(VideoStreamRequest {
+                    frame_rate: Some(10.0),
+                    width: Some(256),
+                    height: Some(256),
+                    ..Default::default()
+                }),
+                audio_streams: None,
+            },
+            None,
+        )
         .unwrap();
 
         let elapsed = start.elapsed();
@@ -3150,13 +3180,16 @@ mod tests {
             ..Default::default()
         })?;
         let start = Instant::now();
-        let result = decode_media(MediaDecodeRequest {
-            source: MediaSource::Uri(test_video.path().to_str().unwrap().into()),
-            start_time: Some(start_time),
-            end_time: Some(end_time),
-            video_stream: Some(VideoStreamRequest::default()),
-            audio_streams: Some(vec![AudioStreamRequest::default()]),
-        });
+        let result = decode_media(
+            MediaDecodeRequest {
+                source: MediaSource::Uri(test_video.path().to_str().unwrap().into()),
+                start_time: Some(start_time),
+                end_time: Some(end_time),
+                video_stream: Some(VideoStreamRequest::default()),
+                audio_streams: Some(vec![AudioStreamRequest::default()]),
+            },
+            None,
+        );
         match result {
             Ok(decoded_streams) => {
                 let elapsed = start.elapsed();
@@ -3199,13 +3232,16 @@ mod tests {
         let test_video = generate_test_video_file(&TestVideoParameters::default())?;
 
         // Specify to decode video only, should only yield the video stream.
-        match decode_media(MediaDecodeRequest {
-            source: MediaSource::Uri(test_video.path().to_str().unwrap().into()),
-            start_time: None,
-            end_time: None,
-            video_stream: Some(VideoStreamRequest::default()),
-            audio_streams: None,
-        }) {
+        match decode_media(
+            MediaDecodeRequest {
+                source: MediaSource::Uri(test_video.path().to_str().unwrap().into()),
+                start_time: None,
+                end_time: None,
+                video_stream: Some(VideoStreamRequest::default()),
+                audio_streams: None,
+            },
+            None,
+        ) {
             Ok(decoded_streams) => {
                 assert_eq!(decoded_streams.len(), 1);
                 assert_eq!(decoded_streams[0].stream_type(), StreamType::Video);
@@ -3222,13 +3258,16 @@ mod tests {
         let test_video = generate_test_video_file(&TestVideoParameters::default())?;
 
         // Requesting audio only should only yield the audio stream.
-        match decode_media(MediaDecodeRequest {
-            source: MediaSource::Uri(test_video.path().to_str().unwrap().into()),
-            start_time: None,
-            end_time: None,
-            video_stream: None,
-            audio_streams: Some(vec![AudioStreamRequest::default()]),
-        }) {
+        match decode_media(
+            MediaDecodeRequest {
+                source: MediaSource::Uri(test_video.path().to_str().unwrap().into()),
+                start_time: None,
+                end_time: None,
+                video_stream: None,
+                audio_streams: Some(vec![AudioStreamRequest::default()]),
+            },
+            None,
+        ) {
             Ok(decoded_streams) => {
                 assert_eq!(decoded_streams.len(), 1);
                 assert_eq!(decoded_streams[0].stream_type(), StreamType::Audio);
@@ -3260,13 +3299,16 @@ mod tests {
         let num_channels = channel_layout.num_channels();
         let expected_num_samples = params.sample_rate as u64 * params.duration.as_secs();
 
-        let decoded_streams = decode_media(MediaDecodeRequest {
-            source: MediaSource::Uri(test_video.path().to_str().unwrap().into()),
-            start_time: None,
-            end_time: None,
-            video_stream: None,
-            audio_streams: Some(vec![AudioStreamRequest::default()]),
-        })?;
+        let decoded_streams = decode_media(
+            MediaDecodeRequest {
+                source: MediaSource::Uri(test_video.path().to_str().unwrap().into()),
+                start_time: None,
+                end_time: None,
+                video_stream: None,
+                audio_streams: Some(vec![AudioStreamRequest::default()]),
+            },
+            None,
+        )?;
 
         assert_eq!(decoded_streams.len(), 1);
         assert_eq!(decoded_streams[0].stream_type(), StreamType::Audio);
@@ -3336,19 +3378,22 @@ mod tests {
         let sample_rate = 48000;
         let end_time = 2.0;
         let start = Instant::now();
-        let result = decode_media(MediaDecodeRequest {
-            source: MediaSource::Uri(test_video.path().to_str().unwrap().into()),
-            start_time: None,
-            end_time: Some(end_time),
-            video_stream: Some(VideoStreamRequest {
-                frame_rate: Some(frame_rate as f64),
-                ..Default::default()
-            }),
-            audio_streams: Some(vec![AudioStreamRequest {
-                sample_rate: Some(sample_rate),
-                ..Default::default()
-            }]),
-        });
+        let result = decode_media(
+            MediaDecodeRequest {
+                source: MediaSource::Uri(test_video.path().to_str().unwrap().into()),
+                start_time: None,
+                end_time: Some(end_time),
+                video_stream: Some(VideoStreamRequest {
+                    frame_rate: Some(frame_rate as f64),
+                    ..Default::default()
+                }),
+                audio_streams: Some(vec![AudioStreamRequest {
+                    sample_rate: Some(sample_rate),
+                    ..Default::default()
+                }]),
+            },
+            None,
+        );
         match result {
             Ok(decoded_streams) => {
                 let elapsed = start.elapsed();
@@ -3664,13 +3709,16 @@ mod tests {
         let flac =
             crate::util::test_utils::generate_test_flac_file(sample_rate, Duration::from_secs(2))?;
 
-        let decoded_streams = decode_media(MediaDecodeRequest {
-            source: MediaSource::Uri(flac.path().to_str().unwrap().into()),
-            start_time: None,
-            end_time: None,
-            video_stream: None,
-            audio_streams: Some(vec![AudioStreamRequest::default()]),
-        })?;
+        let decoded_streams = decode_media(
+            MediaDecodeRequest {
+                source: MediaSource::Uri(flac.path().to_str().unwrap().into()),
+                start_time: None,
+                end_time: None,
+                video_stream: None,
+                audio_streams: Some(vec![AudioStreamRequest::default()]),
+            },
+            None,
+        )?;
 
         assert_eq!(decoded_streams.len(), 1, "Expected a single audio stream");
         for stream in decoded_streams {
@@ -3701,13 +3749,16 @@ mod tests {
         // above 50, which must not produce a 51st (black) frame.
         let video = crate::util::test_utils::generate_fractional_fps_video(50)?;
 
-        let decoded_streams = decode_media(MediaDecodeRequest {
-            source: MediaSource::Uri(video.path().to_str().unwrap().into()),
-            start_time: None,
-            end_time: None,
-            video_stream: Some(VideoStreamRequest::default()),
-            audio_streams: None,
-        })?;
+        let decoded_streams = decode_media(
+            MediaDecodeRequest {
+                source: MediaSource::Uri(video.path().to_str().unwrap().into()),
+                start_time: None,
+                end_time: None,
+                video_stream: Some(VideoStreamRequest::default()),
+                audio_streams: None,
+            },
+            None,
+        )?;
 
         for stream in decoded_streams {
             let num_tensor_frames = stream.data.as_ref().unwrap().size()[0] as usize;
@@ -3729,13 +3780,16 @@ mod tests {
         let source = generate_test_video_file(&TestVideoParameters::default())?;
         let vfr = crate::util::test_utils::make_vfr_video(source.path())?;
 
-        let decoded_streams = decode_media(MediaDecodeRequest {
-            source: MediaSource::Uri(vfr.path().to_str().unwrap().into()),
-            start_time: None,
-            end_time: None,
-            video_stream: Some(VideoStreamRequest::default()),
-            audio_streams: None,
-        })?;
+        let decoded_streams = decode_media(
+            MediaDecodeRequest {
+                source: MediaSource::Uri(vfr.path().to_str().unwrap().into()),
+                start_time: None,
+                end_time: None,
+                video_stream: Some(VideoStreamRequest::default()),
+                audio_streams: None,
+            },
+            None,
+        )?;
 
         for stream in decoded_streams {
             assert!(!stream.decoded_frames.is_empty());
@@ -3763,13 +3817,16 @@ mod tests {
         let source = generate_test_video_file(&TestVideoParameters::default())?;
         let offset_video = crate::util::test_utils::make_av_offset_video(source.path(), offset)?;
 
-        let decoded_streams = decode_media(MediaDecodeRequest {
-            source: MediaSource::Uri(offset_video.path().to_str().unwrap().into()),
-            start_time: None,
-            end_time: None,
-            video_stream: Some(VideoStreamRequest::default()),
-            audio_streams: Some(vec![AudioStreamRequest::default()]),
-        })?;
+        let decoded_streams = decode_media(
+            MediaDecodeRequest {
+                source: MediaSource::Uri(offset_video.path().to_str().unwrap().into()),
+                start_time: None,
+                end_time: None,
+                video_stream: Some(VideoStreamRequest::default()),
+                audio_streams: Some(vec![AudioStreamRequest::default()]),
+            },
+            None,
+        )?;
 
         assert_eq!(decoded_streams.len(), 2, "Expected video and audio streams");
         for stream in decoded_streams {
@@ -3805,13 +3862,16 @@ mod tests {
 
         // Non-gs:// URLs are handed to FFmpeg's own protocol layer; http(s)
         // is how presigned cloud-storage URLs (S3, GCS, Azure, ...) decode.
-        let decoded_streams = decode_media(MediaDecodeRequest {
-            source: MediaSource::Uri(url),
-            start_time: None,
-            end_time: None,
-            video_stream: Some(VideoStreamRequest::default()),
-            audio_streams: Some(vec![AudioStreamRequest::default()]),
-        })?;
+        let decoded_streams = decode_media(
+            MediaDecodeRequest {
+                source: MediaSource::Uri(url),
+                start_time: None,
+                end_time: None,
+                video_stream: Some(VideoStreamRequest::default()),
+                audio_streams: Some(vec![AudioStreamRequest::default()]),
+            },
+            None,
+        )?;
 
         assert_eq!(decoded_streams.len(), 2, "Expected video and audio streams");
         for stream in decoded_streams {
@@ -3835,23 +3895,29 @@ mod tests {
         })?;
         let path: String = test_video.path().to_str().unwrap().into();
 
-        let sw = decode_media(MediaDecodeRequest {
-            source: MediaSource::Uri(path.clone()),
-            start_time: None,
-            end_time: None,
-            video_stream: Some(VideoStreamRequest::default()),
-            audio_streams: None,
-        })?;
-        let hw = decode_media(MediaDecodeRequest {
-            source: MediaSource::Uri(path),
-            start_time: None,
-            end_time: None,
-            video_stream: Some(VideoStreamRequest {
-                hardware_acceleration: Some(true),
-                ..Default::default()
-            }),
-            audio_streams: None,
-        })?;
+        let sw = decode_media(
+            MediaDecodeRequest {
+                source: MediaSource::Uri(path.clone()),
+                start_time: None,
+                end_time: None,
+                video_stream: Some(VideoStreamRequest::default()),
+                audio_streams: None,
+            },
+            None,
+        )?;
+        let hw = decode_media(
+            MediaDecodeRequest {
+                source: MediaSource::Uri(path),
+                start_time: None,
+                end_time: None,
+                video_stream: Some(VideoStreamRequest {
+                    hardware_acceleration: Some(true),
+                    ..Default::default()
+                }),
+                audio_streams: None,
+            },
+            None,
+        )?;
 
         let sw_data = sw[0].data.as_ref().unwrap().to_kind(tch::Kind::Float);
         let hw_data = hw[0].data.as_ref().unwrap().to_kind(tch::Kind::Float);
@@ -3912,17 +3978,20 @@ mod tests {
         // The contradiction is caught before any CUDA machinery is touched,
         // so this runs on CPU-only machines.
         let test_video = generate_test_video_file(&TestVideoParameters::default())?;
-        let err = match decode_media(MediaDecodeRequest {
-            source: MediaSource::Uri(test_video.path().to_str().unwrap().into()),
-            start_time: None,
-            end_time: None,
-            video_stream: Some(VideoStreamRequest {
-                hardware_acceleration: Some(false),
-                device: Some(0),
-                ..Default::default()
-            }),
-            audio_streams: None,
-        }) {
+        let err = match decode_media(
+            MediaDecodeRequest {
+                source: MediaSource::Uri(test_video.path().to_str().unwrap().into()),
+                start_time: None,
+                end_time: None,
+                video_stream: Some(VideoStreamRequest {
+                    hardware_acceleration: Some(false),
+                    device: Some(0),
+                    ..Default::default()
+                }),
+                audio_streams: None,
+            },
+            None,
+        ) {
             Ok(_) => anyhow::bail!("expected the contradiction to be rejected"),
             Err(err) => err,
         };
@@ -3954,27 +4023,33 @@ mod tests {
         })?;
         let path: String = test_video.path().to_str().unwrap().into();
 
-        let cpu = decode_media(MediaDecodeRequest {
-            source: MediaSource::Uri(path.clone()),
-            start_time: None,
-            end_time: None,
-            video_stream: Some(VideoStreamRequest {
-                hardware_acceleration: Some(true),
-                ..Default::default()
-            }),
-            audio_streams: None,
-        })?;
+        let cpu = decode_media(
+            MediaDecodeRequest {
+                source: MediaSource::Uri(path.clone()),
+                start_time: None,
+                end_time: None,
+                video_stream: Some(VideoStreamRequest {
+                    hardware_acceleration: Some(true),
+                    ..Default::default()
+                }),
+                audio_streams: None,
+            },
+            None,
+        )?;
         // device alone implies hardware acceleration.
-        let gpu = decode_media(MediaDecodeRequest {
-            source: MediaSource::Uri(path),
-            start_time: None,
-            end_time: None,
-            video_stream: Some(VideoStreamRequest {
-                device: Some(0),
-                ..Default::default()
-            }),
-            audio_streams: None,
-        })?;
+        let gpu = decode_media(
+            MediaDecodeRequest {
+                source: MediaSource::Uri(path),
+                start_time: None,
+                end_time: None,
+                video_stream: Some(VideoStreamRequest {
+                    device: Some(0),
+                    ..Default::default()
+                }),
+                audio_streams: None,
+            },
+            None,
+        )?;
 
         let cpu_data = cpu[0].data.as_ref().unwrap();
         let gpu_data = gpu[0].data.as_ref().unwrap();
@@ -4024,8 +4099,8 @@ mod tests {
             audio_streams: None,
         };
 
-        let sw = decode_media(request(false))?;
-        let hw = decode_media(request(true))?;
+        let sw = decode_media(request(false), None)?;
+        let hw = decode_media(request(true), None)?;
 
         let sw_data = sw[0].data.as_ref().unwrap().to_kind(tch::Kind::Float);
         let hw_data = hw[0].data.as_ref().unwrap().to_kind(tch::Kind::Float);
@@ -4132,8 +4207,8 @@ mod tests {
             audio_streams: None,
         };
 
-        let hdr_result = decode_media(hdr_request)?;
-        let sdr_result = decode_media(sdr_request)?;
+        let hdr_result = decode_media(hdr_request, None)?;
+        let sdr_result = decode_media(sdr_request, None)?;
 
         // Both should decode successfully with video streams.
         assert!(!hdr_result.is_empty(), "HDR decode produced no output");
@@ -4170,13 +4245,16 @@ mod tests {
     /// Decodes only the video stream of `path` and returns its output tensor
     /// and per-frame pts.
     fn decode_video_tensor(source: MediaSource) -> anyhow::Result<(tch::Tensor, Vec<f64>)> {
-        let mut streams = decode_media(MediaDecodeRequest {
-            source,
-            start_time: None,
-            end_time: None,
-            video_stream: Some(VideoStreamRequest::default()),
-            audio_streams: None,
-        })?;
+        let mut streams = decode_media(
+            MediaDecodeRequest {
+                source,
+                start_time: None,
+                end_time: None,
+                video_stream: Some(VideoStreamRequest::default()),
+                audio_streams: None,
+            },
+            None,
+        )?;
         let stream = streams.remove(0);
         Ok((
             stream.data.context("video stream should have data")?,
@@ -4240,13 +4318,16 @@ mod tests {
         let path: String = test_video.path().to_str().unwrap().into();
 
         let decode_audio = |path: String| -> anyhow::Result<tch::Tensor> {
-            let mut streams = decode_media(MediaDecodeRequest {
-                source: MediaSource::Uri(path),
-                start_time: None,
-                end_time: None,
-                video_stream: None,
-                audio_streams: Some(vec![AudioStreamRequest::default()]),
-            })?;
+            let mut streams = decode_media(
+                MediaDecodeRequest {
+                    source: MediaSource::Uri(path),
+                    start_time: None,
+                    end_time: None,
+                    video_stream: None,
+                    audio_streams: Some(vec![AudioStreamRequest::default()]),
+                },
+                None,
+            )?;
             streams
                 .remove(0)
                 .data
@@ -4289,16 +4370,19 @@ mod tests {
         let path: String = test_video.path().to_str().unwrap().into();
 
         let decode = |dtype: OutputDtype| -> anyhow::Result<tch::Tensor> {
-            let mut streams = decode_media(MediaDecodeRequest {
-                source: MediaSource::Uri(path.clone()),
-                start_time: None,
-                end_time: None,
-                video_stream: Some(VideoStreamRequest {
-                    dtype,
-                    ..Default::default()
-                }),
-                audio_streams: None,
-            })?;
+            let mut streams = decode_media(
+                MediaDecodeRequest {
+                    source: MediaSource::Uri(path.clone()),
+                    start_time: None,
+                    end_time: None,
+                    video_stream: Some(VideoStreamRequest {
+                        dtype,
+                        ..Default::default()
+                    }),
+                    audio_streams: None,
+                },
+                None,
+            )?;
             streams
                 .remove(0)
                 .data
@@ -4402,7 +4486,10 @@ mod tests {
 
         let params = TestVideoParameters::default();
         let test_video = generate_test_video_file(&params)?;
-        let probed = probe_media(MediaSource::Uri(test_video.path().to_str().unwrap().into()))?;
+        let probed = probe_media(
+            MediaSource::Uri(test_video.path().to_str().unwrap().into()),
+            None,
+        )?;
 
         assert_eq!(probed.video_streams.len(), 1);
         let video = &probed.video_streams[0];
@@ -4418,7 +4505,7 @@ mod tests {
 
         // Probing from bytes goes through the in-memory reader.
         let bytes = std::fs::read(test_video.path())?;
-        let probed_bytes = probe_media(MediaSource::Bytes(bytes))?;
+        let probed_bytes = probe_media(MediaSource::Bytes(bytes), None)?;
         assert_eq!(probed_bytes.video_streams.len(), 1);
         assert_eq!(probed_bytes.audio_streams.len(), 1);
         Ok(())

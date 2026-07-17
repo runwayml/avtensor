@@ -411,6 +411,83 @@ impl MediaDecodeRequest {
     }
 }
 
+/// Explicit configuration for avtensor's S3 client.
+///
+/// Fields set here are authoritative — the environment is not consulted for
+/// them; unset fields fall back to the standard AWS environment. Requests
+/// with distinct configs get distinct cached clients, so one process can
+/// read from several S3-compatible stores (with different endpoints and
+/// credentials) at the same time.
+// No Debug/__repr__: `secret_access_key`/`session_token` must not leak into
+// logs or tracebacks.
+#[pyclass(eq)]
+#[derive(Clone, PartialEq)]
+pub struct S3Config {
+    /// Endpoint URL of the store.
+    #[pyo3(get, set)]
+    endpoint_url: Option<String>,
+    /// Signing region.
+    #[pyo3(get, set)]
+    region: Option<String>,
+    /// Static credentials; must be set together with `secret_access_key`.
+    #[pyo3(get, set)]
+    access_key_id: Option<String>,
+    #[pyo3(get, set)]
+    secret_access_key: Option<String>,
+    /// Session token accompanying the static credentials.
+    #[pyo3(get, set)]
+    session_token: Option<String>,
+    /// Credentials mode: "default" (the standard provider chain) or
+    /// "container" (container credentials exclusively). Mutually exclusive
+    /// with static credentials.
+    #[pyo3(get, set)]
+    credentials: Option<String>,
+    /// Use path-style addressing (required by MinIO and some other stores).
+    #[pyo3(get, set)]
+    force_path_style: Option<bool>,
+}
+
+#[pymethods]
+impl S3Config {
+    #[new]
+    #[pyo3(signature = (*, endpoint_url=None, region=None, access_key_id=None, secret_access_key=None, session_token=None, credentials=None, force_path_style=None))]
+    #[allow(clippy::too_many_arguments)]
+    pub fn py_new(
+        endpoint_url: Option<String>,
+        region: Option<String>,
+        access_key_id: Option<String>,
+        secret_access_key: Option<String>,
+        session_token: Option<String>,
+        credentials: Option<String>,
+        force_path_style: Option<bool>,
+    ) -> Self {
+        S3Config {
+            endpoint_url,
+            region,
+            access_key_id,
+            secret_access_key,
+            session_token,
+            credentials,
+            force_path_style,
+        }
+    }
+}
+
+impl S3Config {
+    /// Snapshots the config into the decoder-facing struct.
+    fn to_decoder_config(&self) -> crate::util::s3::S3Config {
+        crate::util::s3::S3Config {
+            endpoint_url: self.endpoint_url.clone(),
+            region: self.region.clone(),
+            access_key_id: self.access_key_id.clone(),
+            secret_access_key: self.secret_access_key.clone(),
+            session_token: self.session_token.clone(),
+            credentials: self.credentials.clone(),
+            force_path_style: self.force_path_style,
+        }
+    }
+}
+
 /// Metadata for an audio stream.
 #[derive(IntoPyObject, Debug, Clone)]
 pub struct AudioStreamMetadata {
@@ -549,15 +626,21 @@ impl DecodeResult {
 }
 
 #[pyfunction]
-fn probe_asset(py: Python<'_>, input: MediaInput) -> PyResult<MediaMetadata> {
+#[pyo3(signature = (input, *, s3_config=None))]
+fn probe_asset(
+    py: Python<'_>,
+    input: MediaInput,
+    s3_config: Option<PyRef<'_, S3Config>>,
+) -> PyResult<MediaMetadata> {
     let source = match input {
         MediaInput::Uri(uri) => decoder::MediaSource::Uri(uri),
         MediaInput::Bytes(bytes) => decoder::MediaSource::Bytes(bytes),
     };
+    let s3_config = s3_config.map(|c| c.to_decoder_config());
 
     // Release the GIL while probing (it may perform network I/O).
     let probed = py
-        .allow_threads(move || decoder::probe_media(source))
+        .allow_threads(move || decoder::probe_media(source, s3_config))
         .map_err(|e| PyValueError::new_err(format!("Failed to probe media: {:?}", e)))?;
 
     Ok(MediaMetadata {
@@ -583,13 +666,17 @@ fn probe_asset(py: Python<'_>, input: MediaInput) -> PyResult<MediaMetadata> {
 }
 
 #[pyfunction]
+#[pyo3(signature = (request, *, s3_config=None))]
 fn decode_asset(
     py: Python<'_>,
     request: PyRef<'_, MediaDecodeRequest>,
+    s3_config: Option<PyRef<'_, S3Config>>,
 ) -> PyResult<Vec<DecodeResult>> {
     let decoder_request = request
         .to_decoder_request(py)
         .map_err(|e| PyValueError::new_err(format!("Failed to convert request: {:?}", e)))?;
+    // Snapshot into a plain Rust struct before releasing the GIL.
+    let s3_config = s3_config.map(|c| c.to_decoder_config());
     let nhwc = match &request.video_stream {
         Some(v) => v
             .borrow(py)
@@ -604,7 +691,7 @@ fn decode_asset(
     // Release the GIL while decoding.
     py.allow_threads(move || {
         // Decode media.
-        let decoded_streams = decode_media(request)
+        let decoded_streams = decode_media(request, s3_config)
             .map_err(|e| PyValueError::new_err(format!("Failed to decode media: {:?}", e)))?
             .into_iter()
             .inspect(|stream| {
@@ -647,6 +734,7 @@ fn avtensor(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<VideoStreamRequest>()?;
     m.add_class::<AudioStreamRequest>()?;
     m.add_class::<MediaDecodeRequest>()?;
+    m.add_class::<S3Config>()?;
     m.add_class::<StreamType>()?;
     m.add_class::<LoudnessNormalization>()?;
     m.add_function(wrap_pyfunction!(probe_asset, m)?)?;

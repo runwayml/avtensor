@@ -7,6 +7,17 @@ pub fn is_s3_url(url: &str) -> bool {
     url.starts_with("s3://")
 }
 
+#[derive(Clone, Default, PartialEq, Eq, Hash)]
+pub struct S3Config {
+    pub endpoint_url: Option<String>,
+    pub region: Option<String>,
+    pub access_key_id: Option<String>,
+    pub secret_access_key: Option<String>,
+    pub session_token: Option<String>,
+    pub credentials: Option<String>,
+    pub force_path_style: Option<bool>,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct S3Uri {
     pub bucket: String,

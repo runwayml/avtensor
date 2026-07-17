@@ -344,6 +344,28 @@ export AWS_ENDPOINT_URL_S3=https://objects.example.com
 export AVTENSOR_S3_FORCE_PATH_STYLE=1
 ```
 
+S3 Configuration can also be passed explicitly per call with an `S3Config`,
+instead of through the environment.
+
+```python
+import avtensor
+
+s3_cfg = avtensor.S3Config(
+    endpoint_url="https://objects.example.com",
+    region="us-east-1",
+    access_key_id=...,
+    secret_access_key=...,
+    force_path_style=True,
+)
+
+request = avtensor.MediaDecodeRequest("s3://bucket/key.mp4", ...)
+avtensor.decode_asset(request, s3_config=s3_cfg)
+avtensor.probe_asset("s3://bucket/key.mp4", s3_config=s3_cfg)
+```
+
+Fields set on an `S3Config` are authoritative — the environment is not
+consulted for them; unset fields fall back to the standard AWS environment.
+
 ### Anything else: presigned HTTP(S) URLs
 
 Any provider that can issue a presigned or public HTTP(S) URL works without
