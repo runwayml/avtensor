@@ -17,7 +17,7 @@ use crate::{
     get_runtime, get_s3_client, get_storage,
     util::{
         gcs::{is_gcs_url, parse_gcs_uri, GCSUri},
-        s3::{is_s3_url, parse_s3_uri, S3Uri},
+        s3::{is_s3_url, parse_s3_uri, S3Config, S3Uri},
     },
 };
 
@@ -207,7 +207,7 @@ fn max_cloud_object_size() -> usize {
 #[derive(Clone)]
 enum CloudUri {
     Gcs(GCSUri),
-    S3(S3Uri),
+    S3(S3Uri, Option<S3Config>),
 }
 
 /// A byte stream read from cloud storage.
@@ -248,8 +248,8 @@ async fn open_cloud_stream(
             let size = resp.object().size as usize;
             Ok((size, CloudChunkStream::Gcs(resp)))
         }
-        CloudUri::S3(S3Uri { bucket, key }) => {
-            let client = get_s3_client()?;
+        CloudUri::S3(S3Uri { bucket, key }, s3_config) => {
+            let client = get_s3_client(s3_config.as_ref())?;
             let resp = client
                 .get_object()
                 .bucket(bucket)
@@ -336,12 +336,18 @@ async fn cloud_asset_reader(
 }
 
 /// Returns an [`AVFormatContextInput`] capable of streaming data from cloud storage.
-pub fn cloud_storage_avio_reader(filename: &CStr) -> Result<AVFormatContextInput, anyhow::Error> {
+///
+/// `s3_config` is the explicit S3 client configuration for `s3://` URIs (see
+/// [`S3Config`]); it is ignored for other schemes.
+pub fn cloud_storage_avio_reader(
+    filename: &CStr,
+    s3_config: Option<S3Config>,
+) -> Result<AVFormatContextInput, anyhow::Error> {
     let file_name_str = filename.to_str()?;
     let cloud_uri = if is_gcs_url(file_name_str) {
         CloudUri::Gcs(parse_gcs_uri(file_name_str)?)
     } else if is_s3_url(file_name_str) {
-        CloudUri::S3(parse_s3_uri(file_name_str)?)
+        CloudUri::S3(parse_s3_uri(file_name_str)?, s3_config)
     } else {
         log::debug!(
             "Opening filename using the default AVFormatContextInput implementation because the provided filename is not a cloud-storage URL: {}",

@@ -87,6 +87,27 @@ class AudioStreamRequest:
         loudness_normalization: LoudnessNormalization | None = None,
     ): ...
 
+class S3Config:
+    endpoint_url: str | None
+    region: str | None
+    access_key_id: str | None
+    secret_access_key: str | None
+    session_token: str | None
+    credentials: str | None
+    force_path_style: bool | None
+
+    def __init__(
+        self,
+        *,
+        endpoint_url: str | None = None,
+        region: str | None = None,
+        access_key_id: str | None = None,
+        secret_access_key: str | None = None,
+        session_token: str | None = None,
+        credentials: str | None = None,
+        force_path_style: bool | None = None,
+    ): ...
+
 class MediaDecodeRequest:
     input: str | bytes
     start_time: float | None
@@ -133,11 +154,15 @@ class DecodeResult(TypedDict):
     # shape [T] - only set for Video Streams
     pts: NotRequired[torch.Tensor]
 
-def decode_asset(request: MediaDecodeRequest) -> list[DecodeResult]:
+def decode_asset(
+    request: MediaDecodeRequest, *, s3_config: S3Config | None = None
+) -> list[DecodeResult]:
     """Decodes the requested streams from the media asset."""
     ...
 
-def probe_asset(input: str | bytes) -> MediaMetadata:
+def probe_asset(
+    input: str | bytes, *, s3_config: S3Config | None = None
+) -> MediaMetadata:
     """Probes the asset's stream layout (dimensions, frame rate, sample rate)
     without decoding it."""
     ...
