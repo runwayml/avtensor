@@ -150,6 +150,9 @@ pub struct VideoStreamRequest {
     /// Element type of the decoded video tensor. `Float32` decodes via
     /// 16-bit RGB, preserving the full depth of >8-bit sources.
     pub dtype: OutputDtype,
+    /// HDR handling: `Tonemap` (default, SDR BT.709 preview) or `Raw`
+    /// (preserve PQ/HLG code values; matrix/range conversion only).
+    pub hdr_mode: HdrMode,
 }
 
 #[derive(Default, Debug, Clone)]
@@ -2191,6 +2194,33 @@ impl SourceColorInfo {
     }
 }
 
+/// How HDR/wide-gamut sources are handled during decode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum HdrMode {
+    /// Tone map to SDR BT.709 (the historical default): linearize, hable
+    /// tone map, convert primaries/transfer/matrix to BT.709.
+    #[default]
+    Tonemap,
+    /// Preserve the source's raw code values: YUV→RGB uses the stream's
+    /// tagged matrix and range only; the transfer function (e.g. PQ/HLG)
+    /// is NOT linearized, tone mapped, or converted. Required when the
+    /// consumer needs the actual HDR signal (training on PQ masters,
+    /// colorimetric measurement) rather than an SDR preview.
+    Raw,
+}
+
+impl HdrMode {
+    pub fn parse(value: Option<&str>) -> Result<Self, anyhow::Error> {
+        match value {
+            None | Some("tonemap") => Ok(Self::Tonemap),
+            Some("raw") => Ok(Self::Raw),
+            Some(other) => Err(anyhow::anyhow!(
+                "hdr_mode must be \"tonemap\" or \"raw\", got {other:?}"
+            )),
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct VideoFilterConfig {
     /// Desired frame rate for the video.
@@ -2205,6 +2235,8 @@ pub struct VideoFilterConfig {
     source_color: SourceColorInfo,
     /// CUDA ordinal for GPU-resident output (frames stay on the GPU).
     device: Option<i32>,
+    /// How HDR sources are converted (tone-mapped SDR vs raw code values).
+    hdr_mode: HdrMode,
 }
 
 impl Display for VideoFilterConfig {
@@ -2227,7 +2259,10 @@ impl Display for VideoFilterConfig {
 
         // For HDR/wide-gamut content, insert tone mapping and gamut conversion
         // to produce correct sRGB output instead of a naive YUV→RGB conversion.
-        if self.source_color.is_hdr() {
+        // With `HdrMode::Raw` the block is skipped entirely: the plain
+        // format conversion below honors the tagged matrix/range but leaves
+        // the transfer function (PQ/HLG code values) untouched.
+        if self.source_color.is_hdr() && self.hdr_mode == HdrMode::Tonemap {
             log::debug!(
                 "HDR source detected (trc={:?}, primaries={:?}), inserting tone mapping pipeline",
                 self.source_color.color_trc,
@@ -2261,6 +2296,7 @@ impl Default for VideoFilterConfig {
             height: Default::default(),
             source_color: Default::default(),
             device: Default::default(),
+            hdr_mode: Default::default(),
         }
     }
 }
@@ -2278,6 +2314,7 @@ impl TryFrom<&VideoStreamRequest> for VideoFilterConfig {
                 OutputDtype::Uint8 => "rgb24".to_string(),
                 OutputDtype::Float32 => "gbrpf32le".to_string(),
             },
+            hdr_mode: req.hdr_mode,
             ..Default::default()
         })
     }
@@ -3528,6 +3565,22 @@ mod tests {
     )]
     #[test_case(
         VideoFilterConfig {
+            pixel_format: "rgb24".to_string(),
+            device: None,
+            source_color: SourceColorInfo {
+                color_trc: Some("smpte2084".to_string()),
+                color_primaries: Some("bt2020".to_string()),
+                colorspace: Some("bt2020nc".to_string()),
+                color_range: Some("tv".to_string()),
+            },
+            hdr_mode: HdrMode::Raw,
+            ..Default::default()
+        },
+        "format=pix_fmts=rgb24";
+        "PQ BT.2020 source with raw hdr_mode skips tone mapping and keeps code values"
+    )]
+    #[test_case(
+        VideoFilterConfig {
             frame_rate: Some(24.0),
             width: Some(1920),
             height: Some(1080),
@@ -3538,6 +3591,7 @@ mod tests {
                 color_primaries: Some("bt2020".to_string()),
                 ..Default::default()
             },
+            hdr_mode: HdrMode::Tonemap,
         },
         "fps=24,scale=width=1920:height=1080,zscale=t=linear:npl=100,format=gbrpf32le,tonemap=hable:desat=0,zscale=p=bt709:t=bt709:m=bt709:range=tv,format=pix_fmts=rgb24";
         "HDR with fps and scale options"
