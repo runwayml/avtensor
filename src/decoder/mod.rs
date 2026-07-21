@@ -2197,15 +2197,19 @@ impl SourceColorInfo {
 /// How HDR/wide-gamut sources are handled during decode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum HdrMode {
-    /// Tone map to SDR BT.709 (the historical default): linearize, hable
-    /// tone map, convert primaries/transfer/matrix to BT.709.
-    #[default]
+    /// Tone map to an SDR BT.709 preview: linearize, hable tone map,
+    /// convert primaries/transfer/matrix to BT.709. Opt-in for
+    /// display-oriented consumers that want viewable frames.
     Tonemap,
-    /// Preserve the source's raw code values: YUV→RGB uses the stream's
-    /// tagged matrix and range only; the transfer function (e.g. PQ/HLG)
-    /// is NOT linearized, tone mapped, or converted. Required when the
-    /// consumer needs the actual HDR signal (training on PQ masters,
-    /// colorimetric measurement) rather than an SDR preview.
+    /// Preserve the source's raw code values (the default): YUV→RGB uses
+    /// the stream's tagged matrix and range only; the transfer function
+    /// (e.g. PQ/HLG) is NOT linearized, tone mapped, or converted. A
+    /// decoder should hand back the signal it decoded — silently grading
+    /// HDR sources corrupted downstream training targets, and the failure
+    /// mode of "raw" (visibly flat frames in display pipelines) is loud
+    /// while the failure mode of "tonemap" (plausible but wrong tensors)
+    /// is silent.
+    #[default]
     Raw,
 }
 
@@ -2214,8 +2218,8 @@ impl TryFrom<Option<&str>> for HdrMode {
 
     fn try_from(value: Option<&str>) -> Result<Self, Self::Error> {
         match value {
-            None | Some("tonemap") => Ok(Self::Tonemap),
-            Some("raw") => Ok(Self::Raw),
+            None | Some("raw") => Ok(Self::Raw),
+            Some("tonemap") => Ok(Self::Tonemap),
             Some(other) => Err(anyhow::anyhow!(
                 "hdr_mode must be \"tonemap\" or \"raw\", got {other:?}"
             )),
@@ -3545,10 +3549,11 @@ mod tests {
                 colorspace: Some("bt2020nc".to_string()),
                 color_range: Some("tv".to_string()),
             },
+            hdr_mode: HdrMode::Tonemap,
             ..Default::default()
         },
         "zscale=t=linear:npl=100,format=gbrpf32le,tonemap=hable:desat=0,zscale=p=bt709:t=bt709:m=bt709:range=tv,format=pix_fmts=rgb24";
-        "HLG BT.2020 source triggers HDR tone mapping pipeline"
+        "HLG BT.2020 source with tonemap hdr_mode triggers HDR tone mapping pipeline"
     )]
     #[test_case(
         VideoFilterConfig {
@@ -3560,10 +3565,11 @@ mod tests {
                 colorspace: Some("bt2020nc".to_string()),
                 color_range: Some("tv".to_string()),
             },
+            hdr_mode: HdrMode::Tonemap,
             ..Default::default()
         },
         "zscale=t=linear:npl=100,format=gbrpf32le,tonemap=hable:desat=0,zscale=p=bt709:t=bt709:m=bt709:range=tv,format=pix_fmts=rgb24";
-        "PQ BT.2020 source triggers HDR tone mapping pipeline"
+        "PQ BT.2020 source with tonemap hdr_mode triggers HDR tone mapping pipeline"
     )]
     #[test_case(
         VideoFilterConfig {
@@ -3575,11 +3581,10 @@ mod tests {
                 colorspace: Some("bt2020nc".to_string()),
                 color_range: Some("tv".to_string()),
             },
-            hdr_mode: HdrMode::Raw,
             ..Default::default()
         },
         "format=pix_fmts=rgb24";
-        "PQ BT.2020 source with raw hdr_mode skips tone mapping and keeps code values"
+        "PQ BT.2020 source default (raw) skips tone mapping and keeps code values"
     )]
     #[test_case(
         VideoFilterConfig {

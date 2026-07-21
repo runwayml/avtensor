@@ -32,11 +32,11 @@ class VideoStreamRequest:
     # "uint8" (default) or "float32". float32 decodes to planar float in
     # [0, 1] (NCHW-contiguous), preserving the depth of 10/12-bit sources.
     dtype: str | None
-    # HDR handling for PQ/HLG or wide-gamut sources: "tonemap" (default)
-    # tone maps to an SDR BT.709 preview; "raw" preserves the source's code
-    # values (tagged matrix/range only — transfer function untouched). Use
-    # "raw" when you need the actual HDR signal, e.g. training on PQ
-    # masters or colorimetric measurement.
+    # HDR handling for PQ/HLG or wide-gamut sources: "raw" (default)
+    # preserves the source's code values (tagged matrix/range only —
+    # transfer function untouched). "tonemap" produces a display-oriented
+    # SDR BT.709 preview; opt in for viewable frames (thumbnails,
+    # captioning) rather than signal-domain use (training, measurement).
     hdr_mode: Literal["tonemap", "raw"] | None
 
     def __init__(

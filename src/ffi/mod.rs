@@ -89,13 +89,14 @@ pub struct VideoStreamRequest {
     /// of 10/12-bit sources instead of quantizing them to 8 bits.
     #[pyo3(get, set)]
     dtype: Option<String>,
-    /// HDR handling for PQ/HLG or wide-gamut sources: "tonemap" (the
-    /// default) tone maps to an SDR BT.709 preview; "raw" preserves the
-    /// source's code values — YUV→RGB uses the tagged matrix/range only
-    /// and the transfer function is left untouched. Use "raw" whenever the
-    /// consumer needs the actual HDR signal (training on PQ masters,
-    /// colorimetric measurement); the tone-mapped default is display-
-    /// oriented and substantially alters both luminance and chroma.
+    /// HDR handling for PQ/HLG or wide-gamut sources: "raw" (the default)
+    /// preserves the source's code values — YUV→RGB uses the tagged
+    /// matrix/range only and the transfer function is left untouched.
+    /// "tonemap" produces a display-oriented SDR BT.709 preview instead;
+    /// opt in for viewable frames (thumbnails, captioning). Tone mapping
+    /// substantially alters both luminance and chroma, so it must never be
+    /// applied implicitly to signal-domain consumers (training,
+    /// measurement).
     #[pyo3(get, set)]
     hdr_mode: Option<String>,
 }
