@@ -2209,8 +2209,10 @@ pub enum HdrMode {
     Raw,
 }
 
-impl HdrMode {
-    pub fn parse(value: Option<&str>) -> Result<Self, anyhow::Error> {
+impl TryFrom<Option<&str>> for HdrMode {
+    type Error = anyhow::Error;
+
+    fn try_from(value: Option<&str>) -> Result<Self, Self::Error> {
         match value {
             None | Some("tonemap") => Ok(Self::Tonemap),
             Some("raw") => Ok(Self::Raw),

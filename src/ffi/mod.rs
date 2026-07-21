@@ -182,7 +182,7 @@ impl VideoStreamRequest {
             hardware_acceleration: self.hardware_acceleration,
             device: self.device_ordinal()?,
             dtype: self.dtype_parsed()?,
-            hdr_mode: decoder::HdrMode::parse(self.hdr_mode.as_deref())?,
+            hdr_mode: decoder::HdrMode::try_from(self.hdr_mode.as_deref())?,
         })
     }
 }
