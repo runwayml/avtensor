@@ -9,7 +9,10 @@ use std::{
     ffi::CStr,
     fs::File,
     io::{Read, Seek, SeekFrom},
-    sync::{Arc, Mutex},
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc, Mutex,
+    },
 };
 use tokio::task::JoinHandle;
 
@@ -203,6 +206,33 @@ fn max_cloud_object_size() -> usize {
     }
 }
 
+/// Default distance (bytes) between the fetched frontier and a forward-seek
+/// target beyond which the seek callback opens a new range request instead
+/// of waiting for an existing reader to stream through the gap.
+const DEFAULT_CLOUD_SEEK_THRESHOLD: usize = 64 * 1024 * 1024; // 64 MiB
+
+/// The forward-seek threshold: `AVTENSOR_CLOUD_SEEK_THRESHOLD_BYTES` (bytes)
+/// when set to a valid integer, otherwise [`DEFAULT_CLOUD_SEEK_THRESHOLD`].
+/// Lowering it makes seeks over cloud objects switch to a new range request
+/// (skipping the bytes in between) more eagerly — useful when decoding a
+/// subset of streams from finely-interleaved containers, where the skipped
+/// gaps are much smaller than 64 MiB.
+fn cloud_seek_threshold() -> usize {
+    match std::env::var("AVTENSOR_CLOUD_SEEK_THRESHOLD_BYTES") {
+        Ok(value) => match value.parse::<usize>() {
+            Ok(bytes) => bytes,
+            Err(_) => {
+                log::warn!(
+                    "Ignoring invalid AVTENSOR_CLOUD_SEEK_THRESHOLD_BYTES value {value:?}; \
+                     using the default of {DEFAULT_CLOUD_SEEK_THRESHOLD} bytes"
+                );
+                DEFAULT_CLOUD_SEEK_THRESHOLD
+            }
+        },
+        Err(_) => DEFAULT_CLOUD_SEEK_THRESHOLD,
+    }
+}
+
 /// A parsed cloud-storage URI.
 #[derive(Clone)]
 enum CloudUri {
@@ -269,10 +299,14 @@ async fn open_cloud_stream(
 /// Arguments:
 /// - `stream`: The byte stream to read data from.
 /// - `start`: The index of the first byte in the buffer to start writing data to.
+/// - `range_end`: One past the last byte this reader should fetch. Starts at
+///   the object size and may be truncated concurrently by the seek callback
+///   when FFmpeg skips forward past this reader's position.
 /// - `context`: A handle to the storage buffer to which we should write data as it comes in.
 async fn cloud_asset_reader(
     mut stream: CloudChunkStream,
     start: usize,
+    range_end: Arc<AtomicUsize>,
     context: Arc<tokio::sync::Mutex<CloudStorageReaderContext>>,
 ) -> Result<(), anyhow::Error> {
     let mut current_position = start;
@@ -306,6 +340,19 @@ async fn cloud_asset_reader(
                 // Update the write position
                 current_position = new_position;
 
+                // Stop when a forward seek truncated this reader's range:
+                // the bytes past `range_end` were skipped by FFmpeg, and if
+                // they are ever needed another reader fetches them.
+                let end = range_end.load(Ordering::Relaxed);
+                if current_position >= end {
+                    log::debug!(
+                        "cloud_asset_reader: range was truncated to end at {} - stopping at {}",
+                        end,
+                        current_position
+                    );
+                    break;
+                }
+
                 // Check whether we should continue to consume the stream.
                 let next_position = buffer
                     .indicators
@@ -333,6 +380,37 @@ async fn cloud_asset_reader(
     }
 
     Ok(())
+}
+
+/// Decides which readers to truncate when a forward seek to `seek_target`
+/// spawns a new reader.
+///
+/// `ranges` holds the `(start, end)` byte ranges of the existing readers and
+/// `frontier` is one past the last fetched byte below the seek target
+/// (`closest_available_byte + 1`). A reader whose range covers the frontier
+/// would keep streaming through the `[frontier, seek_target)` gap FFmpeg
+/// just skipped, so it is truncated to end at the frontier — its useful
+/// extent. Returns `(reader_index, new_end)` pairs.
+///
+/// A later backward seek into the truncated gap still works: the truncated
+/// reader no longer covers the gap, so the seek (and the read callback's
+/// stall recovery) sees no live reader for those bytes and spawns a fresh
+/// one at the requested position.
+fn reader_truncations(
+    ranges: &[(usize, usize)],
+    frontier: usize,
+    seek_target: usize,
+) -> Vec<(usize, usize)> {
+    if frontier >= seek_target {
+        // No gap is being skipped.
+        return Vec::new();
+    }
+    ranges
+        .iter()
+        .enumerate()
+        .filter(|(_, (start, end))| *start < frontier && frontier < *end)
+        .map(|(index, _)| (index, frontier))
+        .collect()
 }
 
 /// Returns an [`AVFormatContextInput`] capable of streaming data from cloud storage.
@@ -422,21 +500,21 @@ pub fn cloud_storage_avio_reader(
     }));
 
     // Spawn a future to sequentially read data from the stream into the StorageBuffer.
-    let read_sequential_future = cloud_asset_reader(stream, 0, context.clone());
+    let range_end = Arc::new(AtomicUsize::new(obj_size));
+    let read_sequential_future = cloud_asset_reader(stream, 0, range_end.clone(), context.clone());
     runtime.block_on(async {
         let mut context = context.lock().await;
         context.readers.push(DataReader {
             range: ReadRange {
                 start: 0,
-                end: obj_size,
+                end: range_end,
             },
             handle: runtime.spawn(read_sequential_future),
         });
     });
 
-    // TODO (rikheijdens): we could make these configurable and tunable.
     let ffmpeg_buffer_size = 32768;
-    let data_segment_size = 64 * 1024 * 1024; // 64 MiB
+    let data_segment_size = cloud_seek_threshold();
 
     let read_context = context.clone();
     let seek_context = context.clone();
@@ -520,7 +598,7 @@ pub fn cloud_storage_avio_reader(
                             // waiting; otherwise surface it for a respawn.
                             let covered = readers.iter().any(|reader| {
                                 reader.range.start <= first_missing
-                                    && first_missing < reader.range.end
+                                    && first_missing < reader.range.end.load(Ordering::Relaxed)
                                     && !reader.handle.is_finished()
                             });
                             (!covered).then_some(first_missing)
@@ -552,15 +630,20 @@ pub fn cloud_storage_avio_reader(
                             let (_, stream) = open_cloud_stream(&read_uri, pos)
                                 .await
                                 .context("reopening cloud stream after a reader stall")?;
-                            let read_future =
-                                cloud_asset_reader(stream, pos, read_context.clone());
+                            let range_end = Arc::new(AtomicUsize::new(obj_size));
+                            let read_future = cloud_asset_reader(
+                                stream,
+                                pos,
+                                range_end.clone(),
+                                read_context.clone(),
+                            );
                             let CloudStorageReaderContext {
                                 ref mut readers, ..
                             } = *read_context.lock().await;
                             readers.push(DataReader {
                                 range: ReadRange {
                                     start: pos,
-                                    end: obj_size,
+                                    end: range_end,
                                 },
                                 handle: runtime.spawn(read_future),
                             });
@@ -665,7 +748,7 @@ pub fn cloud_storage_avio_reader(
                         // then we'll assume the data will come in from that data loader.
                         for reader in readers.iter() {
                             if reader.range.start <= closest_available_byte
-                                && closest_available_byte < reader.range.end
+                                && closest_available_byte < reader.range.end.load(Ordering::Relaxed)
                                 && !reader.handle.is_finished()
                             {
                                 // We have an active reader that is already fetching the data we need,
@@ -678,16 +761,47 @@ pub fn cloud_storage_avio_reader(
                     // There isn't a reader that is reading any data that we're after, or that is close to it
                     // spawn a new one by making a range request, to minimize the number of requests that we're making
                     // we'll request a read range starting from the requested offset to the end of the file.
+                    //
+                    // Truncate readers that would otherwise keep streaming
+                    // through the `[frontier, position)` gap FFmpeg just
+                    // skipped, so the skipped bytes are not downloaded.
+                    let frontier = closest_available_byte + 1;
+                    let ranges: Vec<(usize, usize)> = readers
+                        .iter()
+                        .map(|reader| {
+                            (
+                                reader.range.start,
+                                reader.range.end.load(Ordering::Relaxed),
+                            )
+                        })
+                        .collect();
+                    for (index, new_end) in reader_truncations(&ranges, frontier, position) {
+                        log::debug!(
+                            "Truncating DataReader [{}..{}] to end at {} after seek to {}",
+                            ranges[index].0,
+                            ranges[index].1,
+                            new_end,
+                            position
+                        );
+                        readers[index].range.end.store(new_end, Ordering::Relaxed);
+                    }
+
                     let (_, stream) = open_cloud_stream(&seek_uri, position).await?;
 
-                    let read_future = cloud_asset_reader(stream, position, seek_context.clone());
+                    let range_end = Arc::new(AtomicUsize::new(obj_size));
+                    let read_future = cloud_asset_reader(
+                        stream,
+                        position,
+                        range_end.clone(),
+                        seek_context.clone(),
+                    );
 
                     // Spawn the future and keep track of the reader.
                     log::debug!("Spawned new DataReader to read range [{}..{}]", position, obj_size);
                     readers.push(DataReader {
                         range: ReadRange {
                             start: position,
-                            end: obj_size
+                            end: range_end
                         },
                         handle: runtime.spawn(read_future)
                     });
@@ -714,8 +828,11 @@ struct CloudStorageBuffer {
 struct ReadRange {
     // Start of the range in bytes.
     start: usize,
-    // End of the range in bytes.
-    end: usize,
+    // End of the range in bytes (exclusive). Shared with the reader task,
+    // which stops once its write position reaches it, so a later forward
+    // seek can truncate the range and stop the reader from downloading
+    // bytes FFmpeg skipped over.
+    end: Arc<AtomicUsize>,
 }
 
 struct DataReader {
@@ -754,5 +871,46 @@ mod tests {
 
         let filename = CString::new(test_video.path().to_str().unwrap()).unwrap();
         avio_reader(filename.as_c_str()).unwrap();
+    }
+
+    /// Exercises the default, a valid override, and an invalid override in a
+    /// single test: environment variables are process-global, so splitting
+    /// the cases across tests would race under the parallel test runner.
+    #[test]
+    fn test_cloud_seek_threshold_env_override() {
+        init_logger();
+
+        std::env::remove_var("AVTENSOR_CLOUD_SEEK_THRESHOLD_BYTES");
+        assert_eq!(cloud_seek_threshold(), DEFAULT_CLOUD_SEEK_THRESHOLD);
+
+        std::env::set_var("AVTENSOR_CLOUD_SEEK_THRESHOLD_BYTES", "1048576");
+        assert_eq!(cloud_seek_threshold(), 1048576);
+
+        std::env::set_var("AVTENSOR_CLOUD_SEEK_THRESHOLD_BYTES", "not-a-number");
+        assert_eq!(cloud_seek_threshold(), DEFAULT_CLOUD_SEEK_THRESHOLD);
+
+        std::env::remove_var("AVTENSOR_CLOUD_SEEK_THRESHOLD_BYTES");
+    }
+
+    #[test]
+    fn test_reader_truncations() {
+        // The eager reader covering the frontier is truncated to it.
+        assert_eq!(reader_truncations(&[(0, 1000)], 10, 500), vec![(0, 10)]);
+        // A reader starting past the seek target is untouched.
+        assert_eq!(reader_truncations(&[(600, 1000)], 10, 500), vec![]);
+        // A reader that already stops at (or below) the frontier is untouched.
+        assert_eq!(reader_truncations(&[(0, 10)], 10, 500), vec![]);
+        assert_eq!(reader_truncations(&[(0, 5)], 10, 500), vec![]);
+        // No gap between the frontier and the seek target -> nothing to do.
+        assert_eq!(reader_truncations(&[(0, 1000)], 500, 500), vec![]);
+        assert_eq!(reader_truncations(&[(0, 1000)], 600, 500), vec![]);
+        // No readers at all.
+        assert_eq!(reader_truncations(&[], 10, 500), vec![]);
+        // Multiple readers: only the ones covering the frontier are
+        // truncated, and the returned indices identify them.
+        assert_eq!(
+            reader_truncations(&[(0, 1000), (20, 1000), (600, 1000)], 100, 500),
+            vec![(0, 100), (1, 100)]
+        );
     }
 }

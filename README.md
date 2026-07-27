@@ -321,8 +321,12 @@ normalization, `offset_gain`, `linear` and `dual_mono`.
 
 `gs://` and `s3://` objects are fetched with streaming reads and concurrent
 range requests on seek, buffered in memory (`AVTENSOR_MAX_CLOUD_OBJECT_BYTES`
-caps the buffer; default 16 GiB). HTTP(S) inputs go through FFmpeg's own
-protocol layer.
+caps the buffer; default 16 GiB). A seek that lands more than
+`AVTENSOR_CLOUD_SEEK_THRESHOLD_BYTES` (default 64 MiB) past the
+already-fetched data opens a new range request instead of streaming through
+the gap, and stops readers that would keep downloading the skipped bytes;
+lower it to skip more aggressively when decoding a subset of streams.
+HTTP(S) inputs go through FFmpeg's own protocol layer.
 
 ### Google Cloud Storage (`gs://`)
 

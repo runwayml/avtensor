@@ -216,6 +216,13 @@ pub fn decode_media(
     let video_stream = select_video_stream(&input_format_context, video_stream_request)?;
     let audio_streams = select_audio_streams(&input_format_context, audio_streams)?;
 
+    // Tell the demuxer to skip every stream we are not going to decode.
+    let mut selected_indices: Vec<usize> = video_stream.iter().filter_map(|s| s.index).collect();
+    if let Some(audio_streams) = &audio_streams {
+        selected_indices.extend(audio_streams.iter().filter_map(|s| s.index));
+    }
+    discard_unselected_streams(&mut input_format_context, &selected_indices);
+
     // Count the number of streams that we'll be decoding.
     let num_streams_to_decode = if video_stream.is_some() { 1 } else { 0 }
         + audio_streams
@@ -550,6 +557,29 @@ pub fn probe_media(
         }
     }
     Ok(probed)
+}
+
+/// Marks every stream whose index is not in `selected_indices` with
+/// `AVDISCARD_ALL`, so the demuxer skips their packets instead of parsing
+/// them. Index-based demuxers (notably mp4/mov) additionally skip *reading*
+/// discarded streams' chunks on seekable inputs, which turns into real
+/// bandwidth savings on remote (http(s)/gs/s3) sources — e.g. an audio-only
+/// decode no longer downloads the video track where the container layout
+/// allows skipping it.
+///
+/// The packet loop still drops packets without a matching filter context;
+/// that stays as defense in depth for demuxers that ignore `discard`.
+fn discard_unselected_streams(
+    input_format_context: &mut AVFormatContextInput,
+    selected_indices: &[usize],
+) {
+    for stream in input_format_context.streams_mut() {
+        let index = stream.index as usize;
+        if !selected_indices.contains(&index) {
+            log::debug!("Marking unselected stream #{index} as AVDISCARD_ALL");
+            stream.set_discard(ffi::AVDISCARD_ALL);
+        }
+    }
 }
 
 /// Selects video streams to decode
@@ -4429,6 +4459,107 @@ mod tests {
         assert!(
             frac > 0.05,
             "float32 output carries no more depth than uint8 (sub-8-bit fraction {frac:.4})"
+        );
+        Ok(())
+    }
+
+    /// Streams that were not selected for decoding must be marked
+    /// `AVDISCARD_ALL`, so the demuxer skips their packets (and, on seekable
+    /// inputs, avoids reading their chunks); selected streams must be left
+    /// untouched.
+    #[test]
+    fn test_discard_unselected_streams() -> anyhow::Result<()> {
+        init_logger();
+
+        let test_video = generate_test_video_file(&TestVideoParameters::default())?;
+        let source = MediaSource::Uri(test_video.path().to_str().unwrap().into());
+        let mut input_format_context = source.open(None)?;
+
+        let audio_index = input_format_context
+            .find_best_stream(ffi::AVMEDIA_TYPE_AUDIO)?
+            .map(|(index, _)| index)
+            .context("test video should contain an audio stream")?;
+
+        discard_unselected_streams(&mut input_format_context, &[audio_index]);
+
+        assert!(
+            input_format_context.streams().len() > 1,
+            "test video should contain more than one stream"
+        );
+        for stream in input_format_context.streams() {
+            if stream.index as usize == audio_index {
+                assert_ne!(
+                    stream.discard,
+                    ffi::AVDISCARD_ALL,
+                    "selected stream #{audio_index} must not be discarded"
+                );
+            } else {
+                assert_eq!(
+                    stream.discard,
+                    ffi::AVDISCARD_ALL,
+                    "unselected stream #{} must be discarded",
+                    stream.index
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// An audio-only decode — with the video stream discarded at the demuxer
+    /// — must produce exactly the same samples as the audio stream of a full
+    /// A/V decode.
+    #[test]
+    fn test_decode_media_audio_only_matches_full_decode() -> anyhow::Result<()> {
+        init_logger();
+
+        let test_video = generate_test_video_file(&TestVideoParameters {
+            channel_layout: ChannelLayout::Stereo,
+            ..Default::default()
+        })?;
+        let path: String = test_video.path().to_str().unwrap().into();
+
+        let decode =
+            |video_stream: Option<VideoStreamRequest>| -> anyhow::Result<Vec<DecodedStream>> {
+                decode_media(
+                    MediaDecodeRequest {
+                        source: MediaSource::Uri(path.clone()),
+                        start_time: None,
+                        end_time: None,
+                        video_stream,
+                        audio_streams: Some(vec![AudioStreamRequest::default()]),
+                    },
+                    None,
+                )
+            };
+
+        let mut audio_only = decode(None)?;
+        assert_eq!(
+            audio_only.len(),
+            1,
+            "audio-only decode must yield exactly one stream"
+        );
+        let audio_only = audio_only.remove(0);
+        assert_eq!(audio_only.stream_type(), StreamType::Audio);
+        assert!(!audio_only.decoded_frames.is_empty());
+        let audio_only_data = audio_only.data.context("audio stream should have data")?;
+
+        let full_audio_data = decode(Some(VideoStreamRequest::default()))?
+            .into_iter()
+            .find(|s| s.stream_type() == StreamType::Audio)
+            .context("full decode should contain an audio stream")?
+            .data
+            .context("audio stream should have data")?;
+
+        assert_eq!(audio_only_data.size(), full_audio_data.size());
+        let max_diff: f64 = audio_only_data
+            .f_sub(&full_audio_data)?
+            .abs()
+            .max()
+            .to_kind(tch::Kind::Float)
+            .try_into()?;
+        assert_eq!(
+            max_diff, 0.0,
+            "audio-only decode must match the full decode's audio samples"
         );
         Ok(())
     }
