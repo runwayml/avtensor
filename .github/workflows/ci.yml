@@ -16,9 +16,11 @@ env:
   TORCH_VERSION: "2.11.0"
   # Pinned to a dated BtbN autobuild (the `latest` alias is re-published, so
   # its checksum is not stable) and verified against the checksum below.
-  FFMPEG_RELEASE: autobuild-2026-07-09-14-21
-  FFMPEG_BUILD: ffmpeg-n7.1.5-1-g7d0e842004-linux64-gpl-shared-7.1
-  FFMPEG_SHA256: 13ad56280d03997b04796a37d885b2acc7b0d8b3ff7c6de65f9fc8cc17e4139f
+  # NOTE: BtbN prunes dated autobuilds after ~2-4 weeks; when the download
+  # 404s, re-pin to a current autobuild (keep perf.yml in sync).
+  FFMPEG_RELEASE: autobuild-2026-08-02-13-17
+  FFMPEG_BUILD: ffmpeg-n7.1.5-12-g1fdbca85aa-linux64-gpl-shared-7.1
+  FFMPEG_SHA256: 5f855947aa05767c708329c991f75a4702a2bb1d896ce23fb125df57591470c2
 
 jobs:
   build:
