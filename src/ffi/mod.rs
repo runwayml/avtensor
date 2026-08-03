@@ -89,6 +89,15 @@ pub struct VideoStreamRequest {
     /// of 10/12-bit sources instead of quantizing them to 8 bits.
     #[pyo3(get, set)]
     dtype: Option<String>,
+    /// HDR handling for PQ/HLG or wide-gamut sources: "tonemap" (the
+    /// default) tone maps to an SDR BT.709 preview; "raw" preserves the
+    /// source's code values — YUV→RGB uses the tagged matrix/range only
+    /// and the transfer function is left untouched. Use "raw" whenever the
+    /// consumer needs the actual HDR signal (training on PQ masters,
+    /// colorimetric measurement); the tone-mapped default is display-
+    /// oriented and substantially alters both luminance and chroma.
+    #[pyo3(get, set)]
+    hdr_mode: Option<String>,
 }
 
 impl VideoStreamRequest {
@@ -108,7 +117,7 @@ impl VideoStreamRequest {
 #[pymethods]
 impl VideoStreamRequest {
     #[new]
-    #[pyo3(signature = (*, index=None, width=None, height=None, fps=None, number_of_threads=None, hardware_acceleration=None, dimension_order=None, device=None, dtype=None))]
+    #[pyo3(signature = (*, index=None, width=None, height=None, fps=None, number_of_threads=None, hardware_acceleration=None, dimension_order=None, device=None, dtype=None, hdr_mode=None))]
     #[allow(clippy::too_many_arguments)]
     pub fn py_new(
         index: Option<usize>,
@@ -120,6 +129,7 @@ impl VideoStreamRequest {
         dimension_order: Option<String>,
         device: Option<String>,
         dtype: Option<String>,
+        hdr_mode: Option<String>,
     ) -> Self {
         VideoStreamRequest {
             index,
@@ -131,6 +141,7 @@ impl VideoStreamRequest {
             dimension_order,
             device,
             dtype,
+            hdr_mode,
         }
     }
 }
@@ -171,6 +182,7 @@ impl VideoStreamRequest {
             hardware_acceleration: self.hardware_acceleration,
             device: self.device_ordinal()?,
             dtype: self.dtype_parsed()?,
+            hdr_mode: decoder::HdrMode::try_from(self.hdr_mode.as_deref())?,
         })
     }
 }
