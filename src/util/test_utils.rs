@@ -158,7 +158,8 @@ pub fn generate_test_video(
             .context("Could not convert output file path to string")?,
     ]);
 
-    cmd.status()?;
+    let status = cmd.status().context("running ffmpeg")?;
+    anyhow::ensure!(status.success(), "ffmpeg exited with {status}");
     Ok(())
 }
 
@@ -317,6 +318,21 @@ pub fn init_logger() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_generate_test_video_reports_ffmpeg_failure() {
+        let output = NamedTempFile::with_suffix(".mp4").unwrap();
+        let result = generate_test_video(
+            &TestVideoParameters {
+                video_codec: "not-a-real-video-codec".to_string(),
+                ..Default::default()
+            },
+            output.path(),
+        );
+
+        let error = result.expect_err("an unavailable encoder must fail generation");
+        assert!(error.to_string().contains("ffmpeg exited with"));
+    }
 
     #[test]
     fn test_generating_multi_channel_test_video() {
