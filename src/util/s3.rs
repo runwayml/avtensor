@@ -15,6 +15,8 @@ pub struct S3Config {
     pub secret_access_key: Option<String>,
     pub session_token: Option<String>,
     pub credentials: Option<String>,
+    pub profile: Option<String>,
+    pub profile_config_file: Option<String>,
     pub force_path_style: Option<bool>,
 }
 

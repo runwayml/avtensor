@@ -143,6 +143,7 @@ version = "0.3.0"
 dependencies = [
  "anyhow",
  "aws-config",
+ "aws-runtime",
  "aws-sdk-s3",
  "bytes",
  "derive_builder",
