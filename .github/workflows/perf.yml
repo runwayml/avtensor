@@ -32,9 +32,9 @@ env:
   # its checksum is not stable) and verified against the checksum below.
   # NOTE: BtbN prunes dated autobuilds after ~2-4 weeks; when the download
   # 404s, re-pin to a current autobuild (keep ci.yml in sync).
-  FFMPEG_RELEASE: autobuild-2026-08-02-13-17
+  FFMPEG_RELEASE: autobuild-2026-07-31-14-10
   FFMPEG_BUILD: ffmpeg-n7.1.5-12-g1fdbca85aa-linux64-gpl-shared-7.1
-  FFMPEG_SHA256: 5f855947aa05767c708329c991f75a4702a2bb1d896ce23fb125df57591470c2
+  FFMPEG_SHA256: df7e15a2d2fe0ee15ae36e0e3b83596dd088ee0a0767874241d9a54380df0add
   REGRESSION_THRESHOLD: "1.25"
 
 jobs:
@@ -84,7 +84,7 @@ jobs:
           # measurement code.
           cp benchmarks/ci_perf.py /tmp/ci_perf.py
           git checkout --quiet "$BASE"
-          if maturin build --release --strip -o /tmp/wheel-base/ -i "$PWD/.venv/bin/python"; then
+          if maturin build --locked --release --strip -o /tmp/wheel-base/ -i "$PWD/.venv/bin/python"; then
             echo "built=true" >> "$GITHUB_OUTPUT"
           else
             echo "::warning::merge-base failed to build; skipping perf comparison"
@@ -94,7 +94,7 @@ jobs:
 
       - name: Build head wheel
         if: steps.base.outputs.built == 'true'
-        run: maturin build --release --strip -o /tmp/wheel-head/ -i "$PWD/.venv/bin/python"
+        run: maturin build --locked --release --strip -o /tmp/wheel-head/ -i "$PWD/.venv/bin/python"
 
       - name: Measure merge-base
         if: steps.base.outputs.built == 'true'
