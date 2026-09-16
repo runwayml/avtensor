@@ -18,9 +18,9 @@ env:
   # its checksum is not stable) and verified against the checksum below.
   # NOTE: BtbN prunes dated autobuilds after ~2-4 weeks; when the download
   # 404s, re-pin to a current autobuild (keep perf.yml in sync).
-  FFMPEG_RELEASE: autobuild-2026-08-02-13-17
+  FFMPEG_RELEASE: autobuild-2026-07-31-14-10
   FFMPEG_BUILD: ffmpeg-n7.1.5-12-g1fdbca85aa-linux64-gpl-shared-7.1
-  FFMPEG_SHA256: 5f855947aa05767c708329c991f75a4702a2bb1d896ce23fb125df57591470c2
+  FFMPEG_SHA256: df7e15a2d2fe0ee15ae36e0e3b83596dd088ee0a0767874241d9a54380df0add
 
 jobs:
   build:
@@ -66,16 +66,16 @@ jobs:
         run: cargo fmt --check
 
       - name: Clippy
-        run: cargo clippy --no-default-features --all-targets -- -D warnings
+        run: cargo clippy --locked --no-default-features --all-targets -- -D warnings
 
       - name: Build
-        run: cargo build --no-default-features
+        run: cargo build --locked --no-default-features
 
       - name: Run tests
         run: make test
 
       - name: Build wheel
-        run: maturin build --release -o wheelhouse/ -i "$PWD/.venv/bin/python"
+        run: maturin build --locked --release -o wheelhouse/ -i "$PWD/.venv/bin/python"
 
       # The wheel is installed first so `import avtensor` resolves for ty
       # (and this doubles as an import smoke test of the built wheel).
@@ -130,7 +130,7 @@ jobs:
       # decoder/cuda.rs is only exercised by the #[ignore] NVDEC tests, which
       # cannot run on CPU-only runners, so it is excluded from the metric.
       - name: Test with coverage
-        run: cargo llvm-cov --no-default-features --lcov --output-path /tmp/lcov.info --ignore-filename-regex 'decoder/cuda\.rs'
+        run: cargo llvm-cov --locked --no-default-features --lcov --output-path /tmp/lcov.info --ignore-filename-regex 'decoder/cuda\.rs'
 
       # The threshold is a backstop against large drops, set just below the
       # current ~67% line coverage; raise it as coverage improves. `report`
