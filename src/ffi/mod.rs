@@ -455,11 +455,14 @@ pub struct S3Config {
     /// exclusive with static credentials.
     #[pyo3(get, set)]
     credentials: Option<String>,
-    /// Profile name, required when `credentials="profile"`.
+    /// Profile name, required when `credentials="profile"`. The profile
+    /// supplies credentials only; `region` and `endpoint_url` come from this
+    /// config, not the profile.
     #[pyo3(get, set)]
     profile: Option<String>,
     /// Config file to read the profile from; when unset the standard AWS
-    /// locations are used. Only consulted with `credentials="profile"`.
+    /// locations are used. Requires `credentials="profile"` (setting it in
+    /// another mode is an error).
     #[pyo3(get, set)]
     profile_config_file: Option<String>,
     /// Use path-style addressing (required by MinIO and some other stores).
