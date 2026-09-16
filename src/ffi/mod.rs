@@ -449,11 +449,22 @@ pub struct S3Config {
     /// Session token accompanying the static credentials.
     #[pyo3(get, set)]
     session_token: Option<String>,
-    /// Credentials mode: "default" (the standard provider chain) or
-    /// "container" (container credentials exclusively). Mutually exclusive
-    /// with static credentials.
+    /// Credentials mode: "default" (the standard provider chain),
+    /// "container" (container credentials exclusively), or "profile" (a named
+    /// profile whose `credential_process` mints credentials). Mutually
+    /// exclusive with static credentials.
     #[pyo3(get, set)]
     credentials: Option<String>,
+    /// Profile name, required when `credentials="profile"`. The profile
+    /// supplies credentials only; `region` and `endpoint_url` come from this
+    /// config, not the profile.
+    #[pyo3(get, set)]
+    profile: Option<String>,
+    /// Config file to read the profile from; when unset the standard AWS
+    /// locations are used. Requires `credentials="profile"` (setting it in
+    /// another mode is an error).
+    #[pyo3(get, set)]
+    profile_config_file: Option<String>,
     /// Use path-style addressing (required by MinIO and some other stores).
     #[pyo3(get, set)]
     force_path_style: Option<bool>,
@@ -462,7 +473,7 @@ pub struct S3Config {
 #[pymethods]
 impl S3Config {
     #[new]
-    #[pyo3(signature = (*, endpoint_url=None, region=None, access_key_id=None, secret_access_key=None, session_token=None, credentials=None, force_path_style=None))]
+    #[pyo3(signature = (*, endpoint_url=None, region=None, access_key_id=None, secret_access_key=None, session_token=None, credentials=None, profile=None, profile_config_file=None, force_path_style=None))]
     #[allow(clippy::too_many_arguments)]
     pub fn py_new(
         endpoint_url: Option<String>,
@@ -471,6 +482,8 @@ impl S3Config {
         secret_access_key: Option<String>,
         session_token: Option<String>,
         credentials: Option<String>,
+        profile: Option<String>,
+        profile_config_file: Option<String>,
         force_path_style: Option<bool>,
     ) -> Self {
         S3Config {
@@ -480,6 +493,8 @@ impl S3Config {
             secret_access_key,
             session_token,
             credentials,
+            profile,
+            profile_config_file,
             force_path_style,
         }
     }
@@ -495,6 +510,8 @@ impl S3Config {
             secret_access_key: self.secret_access_key.clone(),
             session_token: self.session_token.clone(),
             credentials: self.credentials.clone(),
+            profile: self.profile.clone(),
+            profile_config_file: self.profile_config_file.clone(),
             force_path_style: self.force_path_style,
         }
     }

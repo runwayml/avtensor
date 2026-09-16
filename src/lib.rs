@@ -82,6 +82,13 @@ enum S3CredentialsSource {
     Default,
     /// Container credentials (`AWS_CONTAINER_CREDENTIALS_*`) exclusively.
     Container,
+    /// A named profile whose `credential_process` mints credentials.
+    Profile {
+        name: String,
+        /// Config file to read the profile from; `None` uses the standard
+        /// AWS locations.
+        config_file: Option<String>,
+    },
     /// Static credentials passed explicitly in the config.
     Static(aws_sdk_s3::config::Credentials),
 }
@@ -92,6 +99,7 @@ impl S3CredentialsSource {
         match self {
             Self::Default => "default",
             Self::Container => "container",
+            Self::Profile { .. } => "profile",
             Self::Static(_) => "static",
         }
     }
@@ -105,12 +113,34 @@ impl S3CredentialsSource {
             Self::Container => Some(SharedCredentialsProvider::new(
                 aws_config::ecs::EcsCredentialsProvider::builder().build(),
             )),
+            Self::Profile { name, config_file } => {
+                use aws_config::profile::ProfileFileCredentialsProvider;
+                use aws_runtime::env_config::file::{EnvConfigFileKind, EnvConfigFiles};
+                let mut builder = ProfileFileCredentialsProvider::builder().profile_name(name);
+                if let Some(config_file) = config_file {
+                    builder = builder.profile_files(
+                        EnvConfigFiles::builder()
+                            .with_file(EnvConfigFileKind::Config, config_file)
+                            .build(),
+                    );
+                }
+                Some(SharedCredentialsProvider::new(builder.build()))
+            }
             Self::Static(creds) => Some(SharedCredentialsProvider::new(creds)),
         }
     }
 }
 
 fn resolve_s3_credentials(config: &S3Config) -> Result<S3CredentialsSource, anyhow::Error> {
+    // The profile fields are only consulted in "profile" mode; setting them in
+    // any other mode is a misconfiguration, so fail rather than silently ignore.
+    if (config.profile.is_some() || config.profile_config_file.is_some())
+        && config.credentials.as_deref() != Some("profile")
+    {
+        return Err(anyhow!(
+            "S3 config profile/profile_config_file require credentials mode \"profile\""
+        ));
+    }
     match (&config.access_key_id, &config.secret_access_key) {
         (Some(id), Some(secret)) => {
             if config.credentials.is_some() {
@@ -143,10 +173,19 @@ fn resolve_s3_credentials(config: &S3Config) -> Result<S3CredentialsSource, anyh
     }
     match config.credentials.as_deref() {
         Some("container") => Ok(S3CredentialsSource::Container),
+        Some("profile") => {
+            let name = config.profile.clone().ok_or_else(|| {
+                anyhow!("S3 config credentials mode \"profile\" requires a profile name")
+            })?;
+            Ok(S3CredentialsSource::Profile {
+                name,
+                config_file: config.profile_config_file.clone(),
+            })
+        }
         Some("default") | None => Ok(S3CredentialsSource::Default),
         Some(other) => Err(anyhow!(
             "invalid S3 config credentials mode {other:?} \
-             (expected \"default\" or \"container\")"
+             (expected \"default\", \"container\", or \"profile\")"
         )),
     }
 }
@@ -270,6 +309,29 @@ mod tests {
     }
 
     #[test]
+    fn test_resolve_s3_credentials_profile() {
+        let source = resolve_s3_credentials(&S3Config {
+            credentials: Some("profile".into()),
+            profile: Some("my-profile".into()),
+            profile_config_file: Some("/some/aws/config".into()),
+            ..Default::default()
+        })
+        .unwrap();
+        assert!(matches!(
+            source,
+            S3CredentialsSource::Profile { name, config_file }
+                if name == "my-profile"
+                    && config_file.as_deref() == Some("/some/aws/config")
+        ));
+        // The profile name is required.
+        assert!(resolve_s3_credentials(&S3Config {
+            credentials: Some("profile".into()),
+            ..Default::default()
+        })
+        .is_err());
+    }
+
+    #[test]
     fn test_resolve_s3_credentials_invalid_combinations() {
         // Incomplete static pair.
         assert!(resolve_s3_credentials(&S3Config {
@@ -288,6 +350,18 @@ mod tests {
         assert!(resolve_s3_credentials(&S3Config {
             access_key_id: Some("id".into()),
             secret_access_key: Some("secret".into()),
+            credentials: Some("container".into()),
+            ..Default::default()
+        })
+        .is_err());
+        // Profile fields set without the "profile" mode.
+        assert!(resolve_s3_credentials(&S3Config {
+            profile: Some("my-profile".into()),
+            ..Default::default()
+        })
+        .is_err());
+        assert!(resolve_s3_credentials(&S3Config {
+            profile_config_file: Some("/some/aws/config".into()),
             credentials: Some("container".into()),
             ..Default::default()
         })
