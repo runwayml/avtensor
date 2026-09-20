@@ -7,7 +7,7 @@ explicit = true
 torch = { index = "pytorch" }
 
 [build-system]
-requires = ["maturin>=1.9,<2.0", "torch==2.11.0", "pytorch-triton", "setuptools"]
+requires = ["maturin>=1.9,<2.0", "torch==2.13.0", "pytorch-triton", "setuptools"]
 build-backend = "maturin"
 
 [project]
