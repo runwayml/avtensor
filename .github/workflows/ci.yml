@@ -17,7 +17,7 @@ env:
   # Pinned to a dated BtbN autobuild (the `latest` alias is re-published, so
   # its checksum is not stable) and verified against the checksum below.
   # NOTE: BtbN prunes dated autobuilds after ~2-4 weeks; when the download
-  # 404s, re-pin to a current autobuild (keep perf.yml in sync).
+  # 404s, re-pin to a current autobuild (keep perf.yml and release.yml in sync).
   FFMPEG_RELEASE: autobuild-2026-07-31-14-10
   FFMPEG_BUILD: ffmpeg-n7.1.5-12-g1fdbca85aa-linux64-gpl-shared-7.1
   FFMPEG_SHA256: df7e15a2d2fe0ee15ae36e0e3b83596dd088ee0a0767874241d9a54380df0add

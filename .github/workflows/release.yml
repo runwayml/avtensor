@@ -28,7 +28,10 @@ env:
   FFMPEG_PKG_CONFIG_PATH: /opt/ffmpeg/lib/pkgconfig
   TORCH_VERSION: ${{ inputs.torch_version || '2.11.0' }}
   CUDA_TAG: ${{ inputs.cuda_tag || 'cu130' }}
-  FFMPEG_BUILD: ffmpeg-n7.1-latest-linux64-gpl-shared-7.1
+  # Keep in sync with the pin in ci.yml.
+  FFMPEG_RELEASE: autobuild-2026-07-31-14-10
+  FFMPEG_BUILD: ffmpeg-n7.1.5-12-g1fdbca85aa-linux64-gpl-shared-7.1
+  FFMPEG_SHA256: df7e15a2d2fe0ee15ae36e0e3b83596dd088ee0a0767874241d9a54380df0add
 
 jobs:
   release:
@@ -49,7 +52,8 @@ jobs:
 
       - name: Install FFmpeg 7.1 (shared)
         run: |
-          curl -fsSL -o /tmp/ffmpeg.tar.xz "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/${FFMPEG_BUILD}.tar.xz"
+          curl -fsSL -o /tmp/ffmpeg.tar.xz "https://github.com/BtbN/FFmpeg-Builds/releases/download/${FFMPEG_RELEASE}/${FFMPEG_BUILD}.tar.xz"
+          echo "${FFMPEG_SHA256}  /tmp/ffmpeg.tar.xz" | sha256sum -c -
           tar -xf /tmp/ffmpeg.tar.xz -C /tmp
           sudo mv "/tmp/${FFMPEG_BUILD}" /opt/ffmpeg
           # Tests generate media with the `ffmpeg` binary on PATH; make sure
