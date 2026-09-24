@@ -27,7 +27,7 @@ env:
   LIBTORCH_STATIC: "0"
   LIBTORCH_BYPASS_VERSION_CHECK: "1"
   FFMPEG_PKG_CONFIG_PATH: /opt/ffmpeg/lib/pkgconfig
-  TORCH_VERSION: "2.11.0"
+  TORCH_VERSION: "2.13.0"
   # Pinned to a dated BtbN autobuild (the `latest` alias is re-published, so
   # its checksum is not stable) and verified against the checksum below.
   # NOTE: BtbN prunes dated autobuilds after ~2-4 weeks; when the download

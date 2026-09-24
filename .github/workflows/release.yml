@@ -15,7 +15,7 @@ on:
     inputs:
       torch_version:
         description: "torch version to link against"
-        default: "2.11.0"
+        default: "2.13.0"
         required: true
       cuda_tag:
         description: "CUDA tag of the torch build (pip index suffix)"
@@ -26,7 +26,7 @@ env:
   LIBTORCH_USE_PYTORCH: "1"
   LIBTORCH_STATIC: "0"
   FFMPEG_PKG_CONFIG_PATH: /opt/ffmpeg/lib/pkgconfig
-  TORCH_VERSION: ${{ inputs.torch_version || '2.11.0' }}
+  TORCH_VERSION: ${{ inputs.torch_version || '2.13.0' }}
   CUDA_TAG: ${{ inputs.cuda_tag || 'cu130' }}
   # Keep in sync with the pin in ci.yml.
   FFMPEG_RELEASE: autobuild-2026-07-31-14-10
