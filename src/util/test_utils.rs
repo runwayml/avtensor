@@ -170,6 +170,23 @@ pub fn generate_test_video_file(
     Ok(file)
 }
 
+/// Generates a VP9 + Opus WebM file.
+pub fn generate_test_webm_file(duration: Duration) -> Result<NamedTempFile, anyhow::Error> {
+    let file = NamedTempFile::with_suffix(".webm")?;
+    let params = TestVideoParameters {
+        width: 320,
+        height: 240,
+        duration,
+        video_codec: "libvpx-vp9".to_string(),
+        audio_codec: "libopus".to_string(),
+        sample_rate: 48000,
+        channel_layout: ChannelLayout::Stereo,
+        ..Default::default()
+    };
+    generate_test_video(&params, file.path())?;
+    Ok(file)
+}
+
 /// Runs an ffmpeg command, failing loudly on a non-zero exit.
 fn run_ffmpeg(args: &[&str]) -> Result<(), anyhow::Error> {
     let status = Command::new(get_ffmpeg_binary())
@@ -186,7 +203,19 @@ pub fn generate_test_flac_file(
     sample_rate: usize,
     duration: Duration,
 ) -> Result<NamedTempFile, anyhow::Error> {
-    let file = NamedTempFile::with_suffix(".flac")?;
+    generate_test_audio_file(sample_rate, duration, "flac", ".flac")
+}
+
+/// Generates an audio-only file containing a sine tone, encoded with
+/// `audio_codec`. The container is inferred from `suffix` (e.g. ".opus" for
+/// Ogg, ".webm" for Matroska/WebM).
+pub fn generate_test_audio_file(
+    sample_rate: usize,
+    duration: Duration,
+    audio_codec: &str,
+    suffix: &str,
+) -> Result<NamedTempFile, anyhow::Error> {
+    let file = NamedTempFile::with_suffix(suffix)?;
     run_ffmpeg(&[
         "-f",
         "lavfi",
@@ -197,7 +226,7 @@ pub fn generate_test_flac_file(
             sample_rate
         ),
         "-c:a",
-        "flac",
+        audio_codec,
         file.path().to_str().context("temp path")?,
     ])?;
     Ok(file)
