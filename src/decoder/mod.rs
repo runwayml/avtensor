@@ -2,7 +2,7 @@ use anyhow::{anyhow, bail, Context};
 use rsmpeg::{
     avcodec::{AVCodec, AVCodecContext, AVPacket},
     avfilter::{AVFilter, AVFilterContextMut, AVFilterGraph, AVFilterInOut},
-    avformat::AVFormatContextInput,
+    avformat::{AVFormatContextInput, AVStreamRef},
     avutil::{av_q2d, get_sample_fmt_name, AVChannelLayout, AVDictionary, AVFrame, AVRational},
     error::RsmpegError,
     ffi::{self, AVPixelFormat, AV_NOPTS_VALUE},
@@ -828,14 +828,14 @@ fn init_video_stream_context(
     video_filter.source_color = SourceColorInfo::from_codec_context(&decode_context);
     log::debug!("Source color info: {:?}", video_filter.source_color);
 
-    let (num_frames, frame_rate) = match video_stream.duration {
-        d if d == AV_NOPTS_VALUE => {
-            // If the duration of the stream is not known, assume we are dealing with an image.
+    let (num_frames, frame_rate) = match stream_duration_seconds(input_format_context, video_stream)
+    {
+        None => {
+            // If neither the stream nor the container reports a duration, assume we are dealing with an image.
             (1, 1.0)
         }
-        duration => {
+        Some(stream_duration) => {
             // Estimate the duration of media we'll be decoding, this will be the minimum of the specified end time (if any), or duration of the stream.
-            let stream_duration = video_stream.duration as f64 * av_q2d(video_stream.time_base);
             let duration_seconds = asset_duration(stream_duration, seek)?;
 
             // In order to allocate storage for the decoded frames, we need to know the frame rate.
@@ -851,8 +851,8 @@ fn init_video_stream_context(
                             "Could not guess frame rate, falling back to nb_frames / duration"
                         );
                         let num_frames = video_stream.nb_frames;
-                        if num_frames > 0 && duration > 0 {
-                            num_frames as f64 / (duration as f64 * av_q2d(video_stream.time_base))
+                        if num_frames > 0 && stream_duration > 0.0 {
+                            num_frames as f64 / stream_duration
                         } else {
                             // Err: could not determine framerate.
                             return Err(anyhow!("Could not determine frame rate."));
@@ -932,18 +932,16 @@ fn init_audio_stream_context(
         .open(None) // TODO (rikheijdens): here we need to pass options such as number of threads
         .context("Failed to open audio codec")?;
 
-    // A stream without a reported duration (AV_NOPTS_VALUE) yields a large
-    // negative `stream_duration`, which would produce a negative sample count
-    // and panic when allocating the output Tensor. The container does not tell
-    // us how much to preallocate, so fail with a clear error instead.
-    if audio_stream.duration == AV_NOPTS_VALUE {
-        return Err(anyhow!(
-            "Audio stream #{audio_index} does not report a duration; cannot preallocate the output buffer"
-        ));
-    }
+    // Without a duration from either the stream or the container we cannot
+    // tell how much to preallocate, so fail with a clear error.
+    let stream_duration = stream_duration_seconds(input_format_context, audio_stream)
+        .ok_or_else(|| {
+            anyhow!(
+                "Audio stream #{audio_index} does not report a duration; cannot preallocate the output buffer"
+            )
+        })?;
 
     // Estimate the duration of media we'll be decoding, this will be the minimum of the specified end time (if any), or duration of the stream.
-    let stream_duration = audio_stream.duration as f64 * av_q2d(audio_stream.time_base);
     let duration_seconds = asset_duration(stream_duration, seek)?;
 
     // The sample rate will either be the source sample rate, or the sample rate that we're targeting.
@@ -1008,6 +1006,29 @@ fn check_output_tensor_size(shape: &[i64], element_size: usize) -> Result<(), an
         ));
     }
     Ok(())
+}
+
+/// Returns the duration of `stream` in seconds, falling back to the container
+/// duration when the stream does not report one. Matroska/WebM only stores a
+/// segment-level duration, so its streams report `AV_NOPTS_VALUE`. The
+/// container duration spans every stream, so it never underestimates a
+/// single stream; the output tensor is trimmed to what was actually decoded.
+fn stream_duration_seconds(
+    input_format_context: &AVFormatContextInput,
+    stream: &AVStreamRef,
+) -> Option<f64> {
+    if stream.duration != AV_NOPTS_VALUE {
+        return Some(stream.duration as f64 * av_q2d(stream.time_base));
+    }
+    let container_duration = input_format_context.duration;
+    if container_duration != AV_NOPTS_VALUE && container_duration > 0 {
+        log::debug!(
+            "Stream #{} does not report a duration, using the container duration",
+            stream.index
+        );
+        return Some(container_duration as f64 * av_q2d(ffi::AV_TIME_BASE_Q));
+    }
+    None
 }
 
 fn asset_duration(stream_duration: f64, seek: &Seek) -> Result<f64, anyhow::Error> {
@@ -3793,6 +3814,204 @@ mod tests {
                 }
             }
         }
+
+        Ok(())
+    }
+
+    /// Decodes the sole audio stream of `path`, asserting it holds ~`seconds`
+    /// of audio at `expected_sample_rate`.
+    fn assert_decodes_audio_only(
+        path: &std::path::Path,
+        request: AudioStreamRequest,
+        expected_sample_rate: u32,
+        seconds: f64,
+    ) -> anyhow::Result<()> {
+        let decoded_streams = decode_media(
+            MediaDecodeRequest {
+                source: MediaSource::Uri(path.to_str().unwrap().into()),
+                start_time: None,
+                end_time: None,
+                video_stream: None,
+                audio_streams: Some(vec![request]),
+            },
+            None,
+        )?;
+
+        assert_eq!(decoded_streams.len(), 1, "Expected a single audio stream");
+        let stream = &decoded_streams[0];
+        let StreamMetadata::Audio { sample_rate } = stream.metadata else {
+            panic!("Expected an audio stream");
+        };
+        assert_eq!(sample_rate, expected_sample_rate);
+        let num_samples = *stream.data.as_ref().unwrap().size().last().unwrap();
+        let expected = (seconds * expected_sample_rate as f64) as i64;
+        assert!(
+            (num_samples - expected).abs() <= expected_sample_rate as i64 / 10,
+            "Expected ~{expected} samples, got {num_samples}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_decode_ogg_opus_audio() -> anyhow::Result<()> {
+        init_logger();
+
+        let opus = crate::util::test_utils::generate_test_audio_file(
+            48000,
+            Duration::from_secs(2),
+            "libopus",
+            ".opus",
+        )?;
+        // Opus always decodes at 48 kHz.
+        assert_decodes_audio_only(opus.path(), AudioStreamRequest::default(), 48000, 2.0)?;
+        assert_decodes_audio_only(
+            opus.path(),
+            AudioStreamRequest {
+                sample_rate: Some(16000),
+                ..Default::default()
+            },
+            16000,
+            2.0,
+        )
+    }
+
+    #[test]
+    fn test_decode_webm_opus_audio() -> anyhow::Result<()> {
+        init_logger();
+
+        // Matroska/WebM streams carry no per-stream duration, so the output
+        // buffer must be sized from the container duration.
+        let webm = crate::util::test_utils::generate_test_audio_file(
+            48000,
+            Duration::from_secs(2),
+            "libopus",
+            ".webm",
+        )?;
+        assert_decodes_audio_only(webm.path(), AudioStreamRequest::default(), 48000, 2.0)
+    }
+
+    #[test]
+    fn test_decode_webm_video_and_audio() -> anyhow::Result<()> {
+        init_logger();
+
+        let webm = crate::util::test_utils::generate_test_webm_file(Duration::from_secs(2))?;
+
+        let decoded_streams = decode_media(
+            MediaDecodeRequest {
+                source: MediaSource::Uri(webm.path().to_str().unwrap().into()),
+                start_time: None,
+                end_time: None,
+                video_stream: Some(VideoStreamRequest::default()),
+                audio_streams: Some(vec![AudioStreamRequest::default()]),
+            },
+            None,
+        )?;
+
+        assert_eq!(decoded_streams.len(), 2, "Expected video and audio streams");
+        for stream in decoded_streams {
+            let data = stream.data.as_ref().unwrap();
+            match stream.metadata {
+                StreamMetadata::Video { frame_rate } => {
+                    assert_eq!(frame_rate, 30.0);
+                    // Previously a missing stream duration was mistaken for
+                    // an image and only a single frame was decoded.
+                    assert_eq!(data.size(), vec![60, 240, 320, 3]);
+                    assert_eq!(stream.decoded_frames.len(), 60);
+                }
+                StreamMetadata::Audio { sample_rate } => {
+                    assert_eq!(sample_rate, 48000);
+                    assert_eq!(data.size()[0], 2);
+                    let num_samples = data.size()[1];
+                    assert!(
+                        (num_samples - 96000).abs() <= 4800,
+                        "Expected ~96000 samples, got {num_samples}"
+                    );
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_decode_webm_seek() -> anyhow::Result<()> {
+        init_logger();
+
+        let webm = crate::util::test_utils::generate_test_webm_file(Duration::from_secs(4))?;
+
+        let decoded_streams = decode_media(
+            MediaDecodeRequest {
+                source: MediaSource::Uri(webm.path().to_str().unwrap().into()),
+                start_time: Some(1.0),
+                end_time: Some(3.0),
+                video_stream: Some(VideoStreamRequest::default()),
+                audio_streams: Some(vec![AudioStreamRequest::default()]),
+            },
+            None,
+        )?;
+
+        assert_eq!(decoded_streams.len(), 2, "Expected video and audio streams");
+        for stream in decoded_streams {
+            let first_pts = stream.decoded_frames.first().unwrap().pts_seconds();
+            assert!(
+                first_pts >= 1.0 - 0.05,
+                "First PTS {first_pts} before start"
+            );
+            let data = stream.data.as_ref().unwrap();
+            match stream.metadata {
+                StreamMetadata::Video { .. } => assert_eq!(data.size()[0], 60),
+                StreamMetadata::Audio { .. } => {
+                    let num_samples = data.size()[1];
+                    assert!(
+                        (num_samples - 96000).abs() <= 4800,
+                        "Expected ~96000 samples, got {num_samples}"
+                    );
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_webm_preallocation_is_bounded_by_seek_window() -> anyhow::Result<()> {
+        init_logger();
+
+        // WebM streams fall back to the container duration; the preallocated
+        // buffers must still be clamped to the requested window rather than
+        // sized for the whole file. Checked on the stream contexts directly
+        // because the decoded output is trimmed afterwards.
+        let webm = crate::util::test_utils::generate_test_webm_file(Duration::from_secs(10))?;
+        let input_format_context =
+            MediaSource::Uri(webm.path().to_str().unwrap().into()).open(None)?;
+        let video_request =
+            select_video_stream(&input_format_context, Some(VideoStreamRequest::default()))?
+                .unwrap();
+        let audio_request = select_audio_streams(
+            &input_format_context,
+            Some(vec![AudioStreamRequest::default()]),
+        )?
+        .unwrap()
+        .remove(0);
+
+        let window = Seek {
+            start_time: Some(2.0),
+            end_time: Some(3.0),
+        };
+        let video = init_video_stream_context(&input_format_context, &video_request, &window)?;
+        assert_eq!(video.frame_data.size(), vec![30, 240, 320, 3]);
+        let audio = init_audio_stream_context(&input_format_context, &audio_request, &window)?;
+        assert_eq!(audio.frame_data.size(), vec![2, 48000]);
+
+        // Without a window the buffers cover the whole file.
+        let full = Seek {
+            start_time: None,
+            end_time: None,
+        };
+        let video = init_video_stream_context(&input_format_context, &video_request, &full)?;
+        assert!(video.frame_data.size()[0] >= 300);
+        let audio = init_audio_stream_context(&input_format_context, &audio_request, &full)?;
+        assert!(audio.frame_data.size()[1] >= 480000);
 
         Ok(())
     }
