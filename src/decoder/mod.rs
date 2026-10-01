@@ -1080,11 +1080,6 @@ fn asset_duration(stream_duration: f64, seek: &Seek) -> Result<f64, anyhow::Erro
     })
 }
 
-/// Whether a frame starting at `pts_seconds` lies at or past the seek window's end.
-fn is_past_end(seek: &Seek, pts_seconds: f64) -> bool {
-    matches!(seek.end_time, Some(end_time) if pts_seconds >= end_time)
-}
-
 /// Utility function to filter `frames` with a presentation timestamp post the provided `end_time`.
 ///
 /// Arguments:
@@ -1493,14 +1488,6 @@ fn filter_frame(
                 );
                 continue;
             }
-        }
-        // Video only: the end-of-window packet cutoff only misses frames on
-        // reordered (B-frame) video, and audio keeps filling its buffer to
-        // the planned length.
-        let filtered_pts = pts_to_seconds(filtered_frame.pts, filtered_frame.time_base);
-        if stream_type == StreamType::Video && is_past_end(seek, filtered_pts) {
-            log::debug!("Filtered frame PTS {filtered_pts} is past the end time, dropping...");
-            continue;
         }
 
         // Fetch a slice of the destination Tensor to copy the decoded frames to.
@@ -1919,10 +1906,6 @@ fn direct_convert_frame(
             return Ok(None);
         }
     }
-    if is_past_end(seek, pts_seconds) {
-        log::debug!("Frame PTS {pts_seconds} is past the end time, dropping...");
-        return Ok(None);
-    }
 
     let capacity = frame_data.size().first().copied().unwrap_or(0);
     if *frame_data_ptr as i64 >= capacity {
@@ -2061,10 +2044,6 @@ fn direct_convert_cuda_frame(
             );
             return Ok(None);
         }
-    }
-    if is_past_end(seek, pts_seconds) {
-        log::debug!("Frame PTS {pts_seconds} is past the end time, dropping...");
-        return Ok(None);
     }
 
     let capacity = frame_data.size().first().copied().unwrap_or(0);
