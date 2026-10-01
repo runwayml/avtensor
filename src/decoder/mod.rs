@@ -1494,8 +1494,11 @@ fn filter_frame(
                 continue;
             }
         }
+        // Video only: the end-of-window packet cutoff only misses frames on
+        // reordered (B-frame) video, and audio keeps filling its buffer to
+        // the planned length.
         let filtered_pts = pts_to_seconds(filtered_frame.pts, filtered_frame.time_base);
-        if is_past_end(seek, filtered_pts) {
+        if stream_type == StreamType::Video && is_past_end(seek, filtered_pts) {
             log::debug!("Filtered frame PTS {filtered_pts} is past the end time, dropping...");
             continue;
         }
@@ -1971,10 +1974,6 @@ fn direct_convert_audio_frame(
             );
             return Ok(None);
         }
-    }
-    if is_past_end(seek, pts_seconds) {
-        log::debug!("Frame PTS {pts_seconds} is past the end time, dropping...");
-        return Ok(None);
     }
 
     let max_idx = frame_data.size().get(1).copied().unwrap_or(0) as usize;
