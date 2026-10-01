@@ -341,10 +341,19 @@ pub fn decode_media(
             }
 
             if let Some(end_time) = end_time {
-                if pts_seconds > end_time {
+                // Packets arrive in decode order, so with B-frames a packet
+                // past the end can precede in-window frames; dts is
+                // monotonic and never exceeds pts, so once it passes the end
+                // every in-window frame has been read.
+                let dts_seconds = if packet.dts != AV_NOPTS_VALUE {
+                    pts_to_seconds(packet.dts, pkt_timebase)
+                } else {
+                    pts_seconds
+                };
+                if dts_seconds > end_time {
                     log::debug!(
-                        "Packet pts {} exceeds end time {}, stopping decoding.",
-                        pts_seconds,
+                        "Packet dts {} exceeds end time {}, stopping decoding.",
+                        dts_seconds,
                         end_time
                     );
                     filter.finished = true; // Stop decoding for this stream once we exceed the end time.
@@ -5250,6 +5259,45 @@ mod tests {
         let anamorphic = crate::util::test_utils::make_anamorphic_video(source.path())?;
         let probed = probe_media(uri(&anamorphic), None)?;
         assert_eq!(probed.video_streams[0].sample_aspect_ratio, (4, 3));
+        Ok(())
+    }
+
+    /// libx264 emits B-frames, so packets past the end of the window precede
+    /// in-window frames in decode order. The window must hold exactly the
+    /// frames with start <= pts < end, contiguous.
+    #[test_case(None, 1.7, 51 ; "end only")]
+    #[test_case(Some(0.5), 1.7, 36 ; "start and end")]
+    fn test_decode_end_time_with_b_frames(
+        start_time: Option<f64>,
+        end_time: f64,
+        expected_frames: usize,
+    ) -> anyhow::Result<()> {
+        init_logger();
+        let params = TestVideoParameters::default();
+        let file = generate_test_video_file(&params)?;
+        let decoded = decode_media(
+            MediaDecodeRequest {
+                source: MediaSource::Uri(file.path().to_str().unwrap().into()),
+                start_time,
+                end_time: Some(end_time),
+                video_stream: Some(VideoStreamRequest::default()),
+                audio_streams: None,
+            },
+            None,
+        )?;
+        let stream = &decoded[0];
+        assert_eq!(
+            stream.data.as_ref().unwrap().size()[0] as usize,
+            expected_frames
+        );
+        let frame_indices: Vec<i64> = stream
+            .frame_pts
+            .iter()
+            .map(|pts| (pts * params.frame_rate).round() as i64)
+            .collect();
+        let first = (start_time.unwrap_or(0.0) * params.frame_rate).round() as i64;
+        let expected: Vec<i64> = (first..first + expected_frames as i64).collect();
+        assert_eq!(frame_indices, expected);
         Ok(())
     }
 }
