@@ -132,19 +132,58 @@ class MediaDecodeRequest:
         audio_streams: list[AudioStreamRequest] | None = None,
     ): ...
 
+DurationSource = Literal["stream", "container", "none"]
+
 class AudioStreamMetadata(TypedDict):
     index: int
     sample_rate: int
+    channels: int
+    codec_name: str
+    # Stream duration in seconds, falling back to the container's (Matroska/
+    # WebM streams report none).
+    duration_s: float | None
+    duration_source: DurationSource
 
 class VideoStreamMetadata(TypedDict):
     index: int
+    # Coded dimensions: what the decoder outputs unless a size is requested.
     width: int
     height: int
     fps: float
+    codec_name: str
+    duration_s: float | None
+    duration_source: DurationSource
+    # Frame count from the container header, if it stores one.
+    nb_frames: int | None
+    # Display-matrix rotation in degrees (counterclockwise, ffprobe's
+    # `rotation`). The decoder does not apply it.
+    rotation: float | None
+    # Sample aspect ratio (num, den), (0, 1) when unknown. The decoder does
+    # not apply it.
+    sample_aspect_ratio: tuple[int, int]
 
 class MediaMetadata(TypedDict):
+    # Demuxer name(s), e.g. "mov,mp4,m4a,3gp,3g2,mj2" or "matroska,webm".
+    format_name: str
+    duration_s: float | None
     video_streams: list[VideoStreamMetadata]
     audio_streams: list[AudioStreamMetadata]
+
+class PlannedStream(TypedDict):
+    stream_type: StreamType
+    stream_index: int
+    # Shape decode_asset allocates; the decoded tensor is trimmed to what was
+    # actually decoded, so this is an upper bound. Video is in the requested
+    # dimension_order; audio is [C, T].
+    shape: list[int]
+    dtype: Literal["uint8", "float32"]
+    # Only set for Video Streams
+    fps: NotRequired[float]
+    # Only set for Audio Streams
+    sample_rate: NotRequired[int]
+    # Duration being decoded after the seek window (None for a still image).
+    duration_s: float | None
+    duration_source: DurationSource
 
 class DecodeResult(TypedDict):
     # Decoded frame data
@@ -172,4 +211,12 @@ def probe_asset(
 ) -> MediaMetadata:
     """Probes the asset's stream layout (dimensions, frame rate, sample rate)
     without decoding it."""
+    ...
+
+def plan_asset(
+    request: MediaDecodeRequest, *, s3_config: S3Config | None = None
+) -> list[PlannedStream]:
+    """Returns the buffers decode_asset(request) would allocate, without
+    decoding: same stream selection, duration, seek window, fps and size
+    handling."""
     ...

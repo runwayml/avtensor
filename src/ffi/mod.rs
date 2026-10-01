@@ -524,6 +524,14 @@ pub struct AudioStreamMetadata {
     index: usize,
     /// The sample rate of the audio stream.
     sample_rate: usize,
+    /// The number of audio channels.
+    channels: usize,
+    /// FFmpeg codec name, e.g. "aac" or "opus".
+    codec_name: String,
+    /// Stream duration in seconds, falling back to the container's.
+    duration_s: Option<f64>,
+    /// "stream", "container" or "none".
+    duration_source: &'static str,
 }
 
 /// Metadata for a video stream.
@@ -531,20 +539,117 @@ pub struct AudioStreamMetadata {
 pub struct VideoStreamMetadata {
     /// The index of the video stream in the media container.
     index: usize,
-    /// The width of the video stream in pixels.
+    /// The coded width of the video stream in pixels.
     width: usize,
-    /// The height of the video stream in pixels.
+    /// The coded height of the video stream in pixels.
     height: usize,
     /// The average frame rate of the video stream.
     fps: f64,
+    /// FFmpeg codec name, e.g. "h264" or "vp9".
+    codec_name: String,
+    /// Stream duration in seconds, falling back to the container's.
+    duration_s: Option<f64>,
+    /// "stream", "container" or "none".
+    duration_source: &'static str,
+    /// Frame count from the container header, if it stores one.
+    nb_frames: Option<i64>,
+    /// Display-matrix rotation in degrees (counterclockwise, ffprobe's
+    /// `rotation`); not applied by the decoder.
+    rotation: Option<f64>,
+    /// Sample aspect ratio `(num, den)`, `(0, 1)` when unknown; not applied
+    /// by the decoder.
+    sample_aspect_ratio: (i32, i32),
 }
 
 #[derive(IntoPyObject, Debug, Clone)]
 pub struct MediaMetadata {
+    /// Demuxer name(s), e.g. "mov,mp4,m4a,3gp,3g2,mj2" or "matroska,webm".
+    format_name: String,
+    /// Container duration in seconds.
+    duration_s: Option<f64>,
     /// The video streams in the media container.
     video_streams: Vec<VideoStreamMetadata>,
     /// The audio streams in the media container.
     audio_streams: Vec<AudioStreamMetadata>,
+}
+
+fn duration_source_name(source: decoder::DurationSource) -> &'static str {
+    match source {
+        decoder::DurationSource::Stream => "stream",
+        decoder::DurationSource::Container => "container",
+        decoder::DurationSource::None => "none",
+    }
+}
+
+/// The output buffer `decode_asset` would allocate for one stream.
+#[derive(IntoPyObject)]
+pub enum PlannedStream {
+    Video {
+        stream_type: StreamType,
+        stream_index: usize,
+        /// Shape of the returned tensor if every planned frame decodes; the
+        /// decoded tensor is trimmed to what was decoded, so this is an
+        /// upper bound. In the requested `dimension_order`.
+        shape: Vec<i64>,
+        dtype: &'static str,
+        fps: f64,
+        duration_s: Option<f64>,
+        duration_source: &'static str,
+    },
+    Audio {
+        stream_type: StreamType,
+        stream_index: usize,
+        /// `[channels, samples]`; an upper bound like the video shape.
+        shape: Vec<i64>,
+        dtype: &'static str,
+        sample_rate: usize,
+        duration_s: Option<f64>,
+        duration_source: &'static str,
+    },
+}
+
+impl PlannedStream {
+    /// Maps a storage-order plan to the layout `decode_asset` returns (see
+    /// [`DecodeResult::from_stream`]).
+    fn from_plan(plan: decoder::StreamPlan, nhwc: bool) -> Self {
+        let stream_type = plan.stream_type().into();
+        let duration_source = duration_source_name(plan.duration_source);
+        match plan.metadata {
+            decoder::StreamMetadata::Video { frame_rate } => {
+                // Storage is [T, H, W, 3] for uint8 and [T, 3, H, W] for float32.
+                let s = &plan.shape;
+                let channels_first = plan.dtype == decoder::OutputDtype::Float32;
+                let (t, h, w) = if channels_first {
+                    (s[0], s[2], s[3])
+                } else {
+                    (s[0], s[1], s[2])
+                };
+                let shape = if nhwc {
+                    vec![t, h, w, 3]
+                } else {
+                    vec![t, 3, h, w]
+                };
+                PlannedStream::Video {
+                    stream_type,
+                    stream_index: plan.stream_index,
+                    shape,
+                    dtype: if channels_first { "float32" } else { "uint8" },
+                    fps: frame_rate,
+                    duration_s: plan.duration_seconds,
+                    duration_source,
+                }
+            }
+            decoder::StreamMetadata::Audio { sample_rate } => PlannedStream::Audio {
+                stream_type,
+                stream_index: plan.stream_index,
+                shape: plan.shape,
+                dtype: "float32",
+                sample_rate: sample_rate as usize,
+                duration_s: plan.duration_seconds,
+                duration_source,
+            },
+        }
+    }
 }
 
 /// Output of a decoding operation
@@ -673,6 +778,8 @@ fn probe_asset(
         .map_err(|e| PyValueError::new_err(format!("Failed to probe media: {:?}", e)))?;
 
     Ok(MediaMetadata {
+        format_name: probed.format_name,
+        duration_s: probed.duration_seconds,
         video_streams: probed
             .video_streams
             .into_iter()
@@ -681,6 +788,12 @@ fn probe_asset(
                 width: s.width.max(0) as usize,
                 height: s.height.max(0) as usize,
                 fps: s.fps,
+                codec_name: s.codec_name,
+                duration_s: s.duration_seconds,
+                duration_source: duration_source_name(s.duration_source),
+                nb_frames: s.nb_frames,
+                rotation: s.rotation,
+                sample_aspect_ratio: s.sample_aspect_ratio,
             })
             .collect(),
         audio_streams: probed
@@ -689,9 +802,46 @@ fn probe_asset(
             .map(|s| AudioStreamMetadata {
                 index: s.index,
                 sample_rate: s.sample_rate.max(0) as usize,
+                channels: s.channels.max(0) as usize,
+                codec_name: s.codec_name,
+                duration_s: s.duration_seconds,
+                duration_source: duration_source_name(s.duration_source),
             })
             .collect(),
     })
+}
+
+/// Returns the buffers `decode_asset(request)` would allocate, without
+/// decoding. Stream selection, durations, seek window, fps and size requests
+/// are resolved by the same code as `decode_asset`.
+#[pyfunction]
+#[pyo3(signature = (request, *, s3_config=None))]
+fn plan_asset(
+    py: Python<'_>,
+    request: PyRef<'_, MediaDecodeRequest>,
+    s3_config: Option<PyRef<'_, S3Config>>,
+) -> PyResult<Vec<PlannedStream>> {
+    let decoder_request = request
+        .to_decoder_request(py)
+        .map_err(|e| PyValueError::new_err(format!("Failed to convert request: {:?}", e)))?;
+    let s3_config = s3_config.map(|c| c.to_decoder_config());
+    let nhwc = match &request.video_stream {
+        Some(v) => v
+            .borrow(py)
+            .wants_nhwc()
+            .map_err(|e| PyValueError::new_err(format!("{e}")))?,
+        None => false,
+    };
+    drop(request);
+
+    // Release the GIL while planning (it may perform network I/O).
+    let plans = py
+        .allow_threads(move || decoder::plan_media(decoder_request, s3_config))
+        .map_err(|e| PyValueError::new_err(format!("Failed to plan media: {:?}", e)))?;
+    Ok(plans
+        .into_iter()
+        .map(|plan| PlannedStream::from_plan(plan, nhwc))
+        .collect())
 }
 
 #[pyfunction]
@@ -767,6 +917,7 @@ fn avtensor(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<StreamType>()?;
     m.add_class::<LoudnessNormalization>()?;
     m.add_function(wrap_pyfunction!(probe_asset, m)?)?;
+    m.add_function(wrap_pyfunction!(plan_asset, m)?)?;
     m.add_function(wrap_pyfunction!(decode_asset, m)?)?;
 
     // Configure FFmpeg to only log error messages to stderr

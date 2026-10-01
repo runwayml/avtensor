@@ -511,9 +511,23 @@ pub fn decode_media(
 #[derive(Debug, Clone)]
 pub struct ProbedVideoStream {
     pub index: usize,
+    /// Coded width; the decoder outputs this unless a width is requested.
     pub width: i32,
+    /// Coded height; the decoder outputs this unless a height is requested.
     pub height: i32,
     pub fps: f64,
+    pub codec_name: String,
+    pub duration_seconds: Option<f64>,
+    pub duration_source: DurationSource,
+    /// Frame count from the container header, if it stores one.
+    pub nb_frames: Option<i64>,
+    /// Display-matrix rotation in degrees, as reported by
+    /// `av_display_rotation_get` (counterclockwise; ffprobe's `rotation`).
+    /// The decoder does not apply it.
+    pub rotation: Option<f64>,
+    /// Sample (pixel) aspect ratio as `(num, den)`; `(0, 1)` when unknown.
+    /// The decoder does not apply it.
+    pub sample_aspect_ratio: (i32, i32),
 }
 
 /// Metadata for a probed audio stream.
@@ -521,11 +535,18 @@ pub struct ProbedVideoStream {
 pub struct ProbedAudioStream {
     pub index: usize,
     pub sample_rate: i32,
+    pub channels: i32,
+    pub codec_name: String,
+    pub duration_seconds: Option<f64>,
+    pub duration_source: DurationSource,
 }
 
 /// Container-level metadata returned by [`probe_media`].
 #[derive(Debug, Clone, Default)]
 pub struct ProbedMedia {
+    /// Demuxer name(s), e.g. `"mov,mp4,m4a,3gp,3g2,mj2"` or `"matroska,webm"`.
+    pub format_name: String,
+    pub duration_seconds: Option<f64>,
     pub video_streams: Vec<ProbedVideoStream>,
     pub audio_streams: Vec<ProbedAudioStream>,
 }
@@ -536,9 +557,19 @@ pub fn probe_media(
     s3_config: Option<S3Config>,
 ) -> Result<ProbedMedia, anyhow::Error> {
     let input_format_context = source.open(s3_config)?;
-    let mut probed = ProbedMedia::default();
+    let mut probed = ProbedMedia {
+        format_name: format_name(&input_format_context),
+        duration_seconds: container_duration_seconds(&input_format_context),
+        ..Default::default()
+    };
     for (index, stream) in input_format_context.streams().iter().enumerate() {
         let codecpar = stream.codecpar();
+        let (duration_seconds, duration_source) =
+            match stream_duration_seconds(&input_format_context, stream) {
+                Some((duration, source)) => (Some(duration), source),
+                None => (None, DurationSource::None),
+            };
+        let codec_name = codec_name(codecpar.codec_id);
         match codecpar.codec_type {
             ffi::AVMEDIA_TYPE_VIDEO => {
                 let fps = stream
@@ -550,18 +581,107 @@ pub fn probe_media(
                     width: codecpar.width,
                     height: codecpar.height,
                     fps,
+                    codec_name,
+                    duration_seconds,
+                    duration_source,
+                    nb_frames: (stream.nb_frames > 0).then_some(stream.nb_frames),
+                    rotation: display_rotation(&codecpar),
+                    sample_aspect_ratio: (
+                        codecpar.sample_aspect_ratio.num,
+                        codecpar.sample_aspect_ratio.den,
+                    ),
                 });
             }
             ffi::AVMEDIA_TYPE_AUDIO => {
                 probed.audio_streams.push(ProbedAudioStream {
                     index,
                     sample_rate: codecpar.sample_rate,
+                    channels: codecpar.ch_layout().nb_channels,
+                    codec_name,
+                    duration_seconds,
+                    duration_source,
                 });
             }
             _ => {}
         }
     }
     Ok(probed)
+}
+
+/// Plans a decode without decoding: opens the container, selects streams
+/// exactly as [`decode_media`] does, and returns the buffer each stream would
+/// preallocate (video first, then audio in request order). Decoders are not
+/// opened, so codec and hardware-acceleration errors only surface at decode.
+pub fn plan_media(
+    request: MediaDecodeRequest,
+    s3_config: Option<S3Config>,
+) -> Result<Vec<StreamPlan>, anyhow::Error> {
+    let MediaDecodeRequest {
+        source,
+        start_time,
+        end_time,
+        video_stream,
+        audio_streams,
+    } = request;
+    let input_format_context = source.open(s3_config)?;
+    let video_stream = select_video_stream(&input_format_context, video_stream)?;
+    let audio_streams = select_audio_streams(&input_format_context, audio_streams)?;
+    let seek = Seek {
+        start_time,
+        end_time,
+    };
+    let mut plans = Vec::new();
+    if let Some(video_stream) = &video_stream {
+        plans.push(plan_video_stream(
+            &input_format_context,
+            video_stream,
+            &seek,
+        )?);
+    }
+    for audio_stream in audio_streams.iter().flatten() {
+        plans.push(plan_audio_stream(
+            &input_format_context,
+            audio_stream,
+            &seek,
+        )?);
+    }
+    Ok(plans)
+}
+
+fn format_name(input_format_context: &AVFormatContextInput) -> String {
+    let iformat = input_format_context.iformat;
+    if iformat.is_null() {
+        return String::new();
+    }
+    unsafe { std::ffi::CStr::from_ptr((*iformat).name) }
+        .to_string_lossy()
+        .into_owned()
+}
+
+fn codec_name(codec_id: ffi::AVCodecID) -> String {
+    let name = unsafe { ffi::avcodec_get_name(codec_id) };
+    if name.is_null() {
+        return String::new();
+    }
+    unsafe { std::ffi::CStr::from_ptr(name) }
+        .to_string_lossy()
+        .into_owned()
+}
+
+/// The stream's display-matrix rotation (degrees, counterclockwise), if any.
+fn display_rotation(codecpar: &ffi::AVCodecParameters) -> Option<f64> {
+    let side_data = unsafe {
+        ffi::av_packet_side_data_get(
+            codecpar.coded_side_data,
+            codecpar.nb_coded_side_data,
+            ffi::AV_PKT_DATA_DISPLAYMATRIX,
+        )
+    };
+    if side_data.is_null() || unsafe { (*side_data).size } < 9 * 4 {
+        return None;
+    }
+    let rotation = unsafe { ffi::av_display_rotation_get((*side_data).data as *const i32) };
+    rotation.is_finite().then_some(rotation)
 }
 
 /// Selects video streams to decode
@@ -787,12 +907,9 @@ fn init_video_stream_context(
     }
 
     decode_context.set_pkt_timebase(video_stream.time_base);
-    let frame_rate = if let Some(frame_rate) = video_stream.guess_framerate() {
+    if let Some(frame_rate) = video_stream.guess_framerate() {
         decode_context.set_framerate(frame_rate);
-        frame_rate
-    } else {
-        video_stream.avg_frame_rate
-    };
+    }
 
     let num_threads = request.number_of_threads.unwrap_or(1);
     let mut opts = AVDictionary::new(
@@ -837,44 +954,130 @@ fn init_video_stream_context(
     video_filter.source_color = SourceColorInfo::from_codec_context(&decode_context);
     log::debug!("Source color info: {:?}", video_filter.source_color);
 
-    let (num_frames, frame_rate) = match stream_duration_seconds(input_format_context, video_stream)
-    {
-        None => {
-            // If neither the stream nor the container reports a duration, assume we are dealing with an image.
-            (1, 1.0)
-        }
-        Some(stream_duration) => {
-            // Estimate the duration of media we'll be decoding, this will be the minimum of the specified end time (if any), or duration of the stream.
-            let duration_seconds = asset_duration(stream_duration, seek)?;
-
-            // In order to allocate storage for the decoded frames, we need to know the frame rate.
-            let frame_rate = if let Some(frame_rate) = video_filter.frame_rate {
-                frame_rate
-            } else {
-                // Convert `frame_rate` to double.
-                match frame_rate {
-                    AVRational { num: 0, den: 1 } => {
-                        // If the frame rate is 0/1, we cannot determine the frame rate.
-                        // Try to calculate from nb_frames / duration instead.
-                        log::debug!(
-                            "Could not guess frame rate, falling back to nb_frames / duration"
-                        );
-                        let num_frames = video_stream.nb_frames;
-                        if num_frames > 0 && stream_duration > 0.0 {
-                            num_frames as f64 / stream_duration
-                        } else {
-                            // Err: could not determine framerate.
-                            return Err(anyhow!("Could not determine frame rate."));
-                        }
-                    }
-                    AVRational { .. } => av_q2d(frame_rate),
-                }
-            };
-            let epsilon = (1.0 / frame_rate) * 0.5; // Small epsilon to avoid floating point precision errors causing trailing black frames because we've allocated too many frames.
-            let num_frames = ((duration_seconds - epsilon) * frame_rate).ceil() as i64;
-            (num_frames, frame_rate)
-        }
+    let plan = plan_video_stream(input_format_context, request, seek)?;
+    log::debug!(
+        "Allocating Tensor with shape {:?} to decode video to.",
+        plan.shape
+    );
+    let kind = match request.dtype {
+        OutputDtype::Uint8 => tch::Kind::Uint8,
+        OutputDtype::Float32 => tch::Kind::Float,
     };
+    let device = request
+        .device
+        .map_or(tch::Device::Cpu, |d| tch::Device::Cuda(d as usize));
+    let dest =
+        tch::Tensor::f_empty(&plan.shape, (kind, device)).context("allocating output Tensor")?;
+
+    Ok(StreamContext {
+        stream_type: StreamType::Video,
+        stream_index: video_index,
+        dec_ctx: decode_context,
+        filter_config: FilterConfig::Video(video_filter),
+        frame_data: dest,
+        metadata: plan.metadata,
+    })
+}
+
+/// Where a stream's duration came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DurationSource {
+    /// The stream's own duration.
+    Stream,
+    /// The container duration (e.g. Matroska/WebM, whose streams report none).
+    Container,
+    /// Neither reports one; video is then treated as a single-frame image.
+    None,
+}
+
+/// The output buffer a decode preallocates for one stream, derived from
+/// container metadata and the request alone. [`decode_media`] allocates
+/// exactly `shape` and trims it to the frames/samples actually decoded, so
+/// `shape` is an upper bound on the returned tensor.
+#[derive(Debug, Clone)]
+pub struct StreamPlan {
+    pub stream_index: usize,
+    /// Preallocated shape in storage order: uint8 video `[T, H, W, 3]`,
+    /// float32 video `[T, 3, H, W]`, audio `[C, N]`.
+    pub shape: Vec<i64>,
+    /// Element type of the buffer (audio is always `Float32`).
+    pub dtype: OutputDtype,
+    pub metadata: StreamMetadata,
+    /// Duration being decoded (after the seek window), if known.
+    pub duration_seconds: Option<f64>,
+    pub duration_source: DurationSource,
+}
+
+impl StreamPlan {
+    pub fn stream_type(&self) -> StreamType {
+        match self.metadata {
+            StreamMetadata::Video { .. } => StreamType::Video,
+            StreamMetadata::Audio { .. } => StreamType::Audio,
+        }
+    }
+}
+
+/// Plans the decode of the video stream selected by `request.index`.
+fn plan_video_stream(
+    input_format_context: &AVFormatContextInput,
+    request: &VideoStreamRequest,
+    seek: &Seek,
+) -> Result<StreamPlan, anyhow::Error> {
+    let video_index = request
+        .index
+        .ok_or(anyhow!("No video stream index specified"))?;
+    let video_stream = input_format_context
+        .streams()
+        .get(video_index)
+        .context("Failed to get video stream")?;
+    let codecpar = video_stream.codecpar();
+    let source_frame_rate = video_stream
+        .guess_framerate()
+        .unwrap_or(video_stream.avg_frame_rate);
+
+    let (num_frames, frame_rate, duration_seconds, duration_source) =
+        match stream_duration_seconds(input_format_context, video_stream) {
+            None => {
+                // If neither the stream nor the container reports a duration, assume we are dealing with an image.
+                (1, 1.0, None, DurationSource::None)
+            }
+            Some((stream_duration, duration_source)) => {
+                // Estimate the duration of media we'll be decoding, this will be the minimum of the specified end time (if any), or duration of the stream.
+                let duration_seconds = asset_duration(stream_duration, seek)?;
+
+                // In order to allocate storage for the decoded frames, we need to know the frame rate.
+                let frame_rate = if let Some(frame_rate) = request.frame_rate {
+                    frame_rate
+                } else {
+                    // Convert `frame_rate` to double.
+                    match source_frame_rate {
+                        AVRational { num: 0, den: 1 } => {
+                            // If the frame rate is 0/1, we cannot determine the frame rate.
+                            // Try to calculate from nb_frames / duration instead.
+                            log::debug!(
+                                "Could not guess frame rate, falling back to nb_frames / duration"
+                            );
+                            let num_frames = video_stream.nb_frames;
+                            if num_frames > 0 && stream_duration > 0.0 {
+                                num_frames as f64 / stream_duration
+                            } else {
+                                // Err: could not determine framerate.
+                                return Err(anyhow!("Could not determine frame rate."));
+                            }
+                        }
+                        AVRational { .. } => av_q2d(source_frame_rate),
+                    }
+                };
+                let epsilon = (1.0 / frame_rate) * 0.5; // Small epsilon to avoid floating point precision errors causing trailing black frames because we've allocated too many frames.
+                let num_frames = ((duration_seconds - epsilon) * frame_rate).ceil() as i64;
+                (
+                    num_frames,
+                    frame_rate,
+                    Some(duration_seconds),
+                    duration_source,
+                )
+            }
+        };
 
     let out_height = request
         .height
@@ -886,32 +1089,83 @@ fn init_video_stream_context(
         .unwrap_or(codecpar.width as i64);
     // uint8 decodes to packed rgb24 ([T, H, W, C]); float32 decodes to
     // planar float ([T, C, H, W], contiguous channels-first).
-    let storage_size = match request.dtype {
-        OutputDtype::Uint8 => vec![num_frames, out_height, out_width, 3],
-        OutputDtype::Float32 => vec![num_frames, 3, out_height, out_width],
+    let (shape, element_size) = match request.dtype {
+        OutputDtype::Uint8 => (
+            vec![num_frames, out_height, out_width, 3],
+            std::mem::size_of::<u8>(),
+        ),
+        OutputDtype::Float32 => (
+            vec![num_frames, 3, out_height, out_width],
+            std::mem::size_of::<f32>(),
+        ),
     };
-    log::debug!(
-        "Allocating Tensor with shape {:?} to decode video to.",
-        storage_size
-    );
-    let (kind, element_size) = match request.dtype {
-        OutputDtype::Uint8 => (tch::Kind::Uint8, std::mem::size_of::<u8>()),
-        OutputDtype::Float32 => (tch::Kind::Float, std::mem::size_of::<f32>()),
-    };
-    check_output_tensor_size(&storage_size, element_size)?;
-    let device = request
-        .device
-        .map_or(tch::Device::Cpu, |d| tch::Device::Cuda(d as usize));
-    let dest =
-        tch::Tensor::f_empty(storage_size, (kind, device)).context("allocating output Tensor")?;
+    check_output_tensor_size(&shape, element_size)?;
 
-    Ok(StreamContext {
-        stream_type: StreamType::Video,
+    Ok(StreamPlan {
         stream_index: video_index,
-        dec_ctx: decode_context,
-        filter_config: FilterConfig::Video(video_filter),
-        frame_data: dest,
+        shape,
+        dtype: request.dtype,
         metadata: StreamMetadata::Video { frame_rate },
+        duration_seconds,
+        duration_source,
+    })
+}
+
+/// Plans the decode of the audio stream selected by `request.index`.
+fn plan_audio_stream(
+    input_format_context: &AVFormatContextInput,
+    request: &AudioStreamRequest,
+    seek: &Seek,
+) -> Result<StreamPlan, anyhow::Error> {
+    let audio_index = request
+        .index
+        .ok_or(anyhow!("No audio stream index specified"))?;
+    let audio_stream = input_format_context
+        .streams()
+        .get(audio_index)
+        .context("Failed to get audio stream")?;
+    let codecpar = audio_stream.codecpar();
+
+    // Without a duration from either the stream or the container we cannot
+    // tell how much to preallocate, so fail with a clear error.
+    let (stream_duration, duration_source) =
+        stream_duration_seconds(input_format_context, audio_stream).ok_or_else(|| {
+            anyhow!(
+                "Audio stream #{audio_index} does not report a duration; cannot preallocate the output buffer"
+            )
+        })?;
+
+    // Estimate the duration of media we'll be decoding, this will be the minimum of the specified end time (if any), or duration of the stream.
+    let duration_seconds = asset_duration(stream_duration, seek)?;
+
+    // The sample rate will either be the source sample rate, or the sample rate that we're targeting.
+    let sample_rate = if let Some(sample_rate) = request.sample_rate {
+        sample_rate as i32
+    } else {
+        codecpar.sample_rate
+    };
+
+    // The number of channels should be equal to the source.
+    let num_channels = codecpar.ch_layout().nb_channels;
+
+    let num_samples = (duration_seconds * (sample_rate as f64)).ceil();
+    if !num_samples.is_finite() || num_samples < 0.0 {
+        return Err(anyhow!(
+            "Computed an invalid sample count ({num_samples}) for audio stream #{audio_index}"
+        ));
+    }
+    let shape = vec![num_channels as i64, num_samples as i64];
+    check_output_tensor_size(&shape, std::mem::size_of::<f32>())?;
+
+    Ok(StreamPlan {
+        stream_index: audio_index,
+        shape,
+        dtype: OutputDtype::Float32,
+        metadata: StreamMetadata::Audio {
+            sample_rate: sample_rate as u32,
+        },
+        duration_seconds: Some(duration_seconds),
+        duration_source,
     })
 }
 
@@ -941,43 +1195,14 @@ fn init_audio_stream_context(
         .open(None) // TODO (rikheijdens): here we need to pass options such as number of threads
         .context("Failed to open audio codec")?;
 
-    // Without a duration from either the stream or the container we cannot
-    // tell how much to preallocate, so fail with a clear error.
-    let stream_duration = stream_duration_seconds(input_format_context, audio_stream)
-        .ok_or_else(|| {
-            anyhow!(
-                "Audio stream #{audio_index} does not report a duration; cannot preallocate the output buffer"
-            )
-        })?;
-
-    // Estimate the duration of media we'll be decoding, this will be the minimum of the specified end time (if any), or duration of the stream.
-    let duration_seconds = asset_duration(stream_duration, seek)?;
-
-    // The sample rate will either be the source sample rate, or the sample rate that we're targeting.
     let filter_config = AudioFilterConfig::try_from(request)?;
-    let sample_rate = if let Some(sample_rate) = filter_config.sample_rate {
-        sample_rate as i32
-    } else {
-        codecpar.sample_rate
-    };
-
-    // The number of channels should be equal to the source.
-    let num_channels = codecpar.ch_layout().nb_channels;
-
-    let num_samples = (duration_seconds * (sample_rate as f64)).ceil();
-    if !num_samples.is_finite() || num_samples < 0.0 {
-        return Err(anyhow!(
-            "Computed an invalid sample count ({num_samples}) for audio stream #{audio_index}"
-        ));
-    }
-    let shape = vec![num_channels as i64, num_samples as i64];
+    let plan = plan_audio_stream(input_format_context, request, seek)?;
     log::debug!(
         "Allocating Tensor with shape {:?} to decode audio to for stream #{}.",
-        shape,
+        plan.shape,
         audio_index
     );
-    check_output_tensor_size(&shape, std::mem::size_of::<f32>())?;
-    let dest = tch::Tensor::f_empty(shape, (tch::Kind::Float, tch::Device::Cpu))
+    let dest = tch::Tensor::f_empty(&plan.shape, (tch::Kind::Float, tch::Device::Cpu))
         .context("allocating audio output Tensor")?;
 
     Ok(StreamContext {
@@ -986,9 +1211,7 @@ fn init_audio_stream_context(
         dec_ctx: decode_context,
         filter_config: FilterConfig::Audio(filter_config),
         frame_data: dest,
-        metadata: StreamMetadata::Audio {
-            sample_rate: sample_rate as u32,
-        },
+        metadata: plan.metadata,
     })
 }
 
@@ -1025,19 +1248,25 @@ fn check_output_tensor_size(shape: &[i64], element_size: usize) -> Result<(), an
 fn stream_duration_seconds(
     input_format_context: &AVFormatContextInput,
     stream: &AVStreamRef,
-) -> Option<f64> {
+) -> Option<(f64, DurationSource)> {
     if stream.duration != AV_NOPTS_VALUE {
-        return Some(stream.duration as f64 * av_q2d(stream.time_base));
+        return Some((
+            stream.duration as f64 * av_q2d(stream.time_base),
+            DurationSource::Stream,
+        ));
     }
-    let container_duration = input_format_context.duration;
-    if container_duration != AV_NOPTS_VALUE && container_duration > 0 {
-        log::debug!(
-            "Stream #{} does not report a duration, using the container duration",
-            stream.index
-        );
-        return Some(container_duration as f64 * av_q2d(ffi::AV_TIME_BASE_Q));
-    }
-    None
+    let container_duration = container_duration_seconds(input_format_context)?;
+    log::debug!(
+        "Stream #{} does not report a duration, using the container duration",
+        stream.index
+    );
+    Some((container_duration, DurationSource::Container))
+}
+
+fn container_duration_seconds(input_format_context: &AVFormatContextInput) -> Option<f64> {
+    let duration = input_format_context.duration;
+    (duration != AV_NOPTS_VALUE && duration > 0)
+        .then(|| duration as f64 * av_q2d(ffi::AV_TIME_BASE_Q))
 }
 
 fn asset_duration(stream_duration: f64, seek: &Seek) -> Result<f64, anyhow::Error> {
@@ -4792,6 +5021,244 @@ mod tests {
         let probed_bytes = probe_media(MediaSource::Bytes(bytes), None)?;
         assert_eq!(probed_bytes.video_streams.len(), 1);
         assert_eq!(probed_bytes.audio_streams.len(), 1);
+        Ok(())
+    }
+
+    fn uri(file: &tempfile::NamedTempFile) -> MediaSource {
+        MediaSource::Uri(file.path().to_str().unwrap().into())
+    }
+
+    /// Decodes `request` and checks every stream against `plan_media`: same
+    /// streams in the same order, same non-time dims, and the decoded length
+    /// within the planned (preallocated) length, equal when `exact`.
+    fn assert_plan_bounds_decode(
+        make_request: impl Fn() -> MediaDecodeRequest,
+        exact: bool,
+    ) -> anyhow::Result<Vec<StreamPlan>> {
+        let plans = plan_media(make_request(), None)?;
+        let decoded = decode_media(make_request(), None)?;
+        assert_eq!(plans.len(), decoded.len());
+        for (plan, stream) in plans.iter().zip(&decoded) {
+            assert_eq!(plan.stream_index, stream.src_stream_index);
+            assert_eq!(plan.metadata, stream.metadata);
+            let data = stream.data.as_ref().unwrap();
+            let size = data.size();
+            let time_dim = match plan.stream_type() {
+                StreamType::Video => 0,
+                StreamType::Audio => 1,
+            };
+            for (dim, (&planned, &got)) in plan.shape.iter().zip(&size).enumerate() {
+                if dim == time_dim {
+                    assert!(
+                        got <= planned,
+                        "decoded {size:?} exceeds plan {:?}",
+                        plan.shape
+                    );
+                    if exact {
+                        assert_eq!(got, planned, "decoded {size:?} != plan {:?}", plan.shape);
+                    }
+                } else {
+                    assert_eq!(got, planned, "decoded {size:?} != plan {:?}", plan.shape);
+                }
+            }
+        }
+        Ok(plans)
+    }
+
+    #[test_case(None, None, None, None, OutputDtype::Uint8 ; "defaults")]
+    #[test_case(Some(1.0), Some(3.5), None, None, OutputDtype::Uint8 ; "seek window")]
+    #[test_case(Some(2.0), None, None, None, OutputDtype::Uint8 ; "start only")]
+    #[test_case(None, Some(9.0), None, None, OutputDtype::Uint8 ; "end past duration")]
+    #[test_case(None, Some(3.0), Some(24.0), None, OutputDtype::Uint8 ; "fps resample")]
+    #[test_case(None, Some(2.0), None, Some((97, 65)), OutputDtype::Uint8 ; "odd resize")]
+    #[test_case(None, Some(2.0), None, Some((96, 64)), OutputDtype::Float32 ; "float32")]
+    fn test_plan_media_matches_decode(
+        start_time: Option<f64>,
+        end_time: Option<f64>,
+        frame_rate: Option<f64>,
+        size: Option<(u32, u32)>,
+        dtype: OutputDtype,
+    ) -> anyhow::Result<()> {
+        init_logger();
+        let file = generate_test_video_file(&TestVideoParameters::default())?;
+        let make_request = || MediaDecodeRequest {
+            source: uri(&file),
+            start_time,
+            end_time,
+            video_stream: Some(VideoStreamRequest {
+                frame_rate,
+                width: size.map(|(w, _)| w),
+                height: size.map(|(_, h)| h),
+                dtype,
+                ..Default::default()
+            }),
+            audio_streams: Some(vec![AudioStreamRequest {
+                sample_rate: Some(16000),
+                ..Default::default()
+            }]),
+        };
+        // CFR video lands exactly on the plan; AAC frame padding makes the
+        // audio tail slightly short of it.
+        let plans = assert_plan_bounds_decode(make_request, false)?;
+        let video = &plans[0];
+        let decoded = decode_media(make_request(), None)?;
+        assert_eq!(decoded[0].data.as_ref().unwrap().size()[0], video.shape[0]);
+        assert_eq!(video.duration_source, DurationSource::Stream);
+        let audio_planned = plans[1].shape[1];
+        let audio_decoded = decoded[1].data.as_ref().unwrap().size()[1];
+        assert!(
+            audio_planned - audio_decoded <= 1600,
+            "{audio_planned} vs {audio_decoded}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_plan_media_webm_uses_container_duration() -> anyhow::Result<()> {
+        init_logger();
+        let webm = crate::util::test_utils::generate_test_webm_file(Duration::from_secs(4))?;
+        let make_request = || MediaDecodeRequest {
+            source: uri(&webm),
+            start_time: Some(1.0),
+            end_time: Some(3.0),
+            video_stream: Some(VideoStreamRequest::default()),
+            audio_streams: Some(vec![AudioStreamRequest::default()]),
+        };
+        let plans = assert_plan_bounds_decode(make_request, false)?;
+        for plan in &plans {
+            assert_eq!(plan.duration_source, DurationSource::Container);
+            assert_eq!(plan.duration_seconds, Some(2.0));
+        }
+        assert_eq!(plans[0].shape, vec![60, 240, 320, 3]);
+        Ok(())
+    }
+
+    #[test]
+    fn test_plan_media_audio_only() -> anyhow::Result<()> {
+        init_logger();
+        let flac = crate::util::test_utils::generate_test_flac_file(48000, Duration::from_secs(3))?;
+        let make_request = || MediaDecodeRequest {
+            source: uri(&flac),
+            start_time: None,
+            end_time: Some(2.0),
+            video_stream: None,
+            audio_streams: Some(vec![AudioStreamRequest::default()]),
+        };
+        let plans = assert_plan_bounds_decode(make_request, true)?;
+        assert_eq!(plans[0].shape, vec![1, 96000]);
+        Ok(())
+    }
+
+    #[test]
+    fn test_plan_media_audio_shorter_than_video() -> anyhow::Result<()> {
+        init_logger();
+        let source = generate_test_video_file(&TestVideoParameters::default())?;
+        let offset = crate::util::test_utils::make_av_offset_video(source.path(), 1.0)?;
+        let make_request = || MediaDecodeRequest {
+            source: uri(&offset),
+            start_time: None,
+            end_time: None,
+            video_stream: Some(VideoStreamRequest::default()),
+            audio_streams: Some(vec![AudioStreamRequest::default()]),
+        };
+        assert_plan_bounds_decode(make_request, false)?;
+        Ok(())
+    }
+
+    #[test]
+    fn test_plan_media_errors_match_decode() -> anyhow::Result<()> {
+        init_logger();
+        let file = generate_test_video_file(&TestVideoParameters::default())?;
+        let make_request = || MediaDecodeRequest {
+            source: uri(&file),
+            start_time: Some(3.0),
+            end_time: Some(2.0),
+            video_stream: Some(VideoStreamRequest::default()),
+            audio_streams: None,
+        };
+        let plan_err = plan_media(make_request(), None).unwrap_err();
+        let decode_err = decode_media(make_request(), None).err().unwrap();
+        assert!(format!("{plan_err:?}").contains("End time must be greater"));
+        assert!(format!("{decode_err:?}").contains("End time must be greater"));
+        Ok(())
+    }
+
+    #[test]
+    fn test_probe_media_durations_and_names() -> anyhow::Result<()> {
+        init_logger();
+        let mp4 = generate_test_video_file(&TestVideoParameters::default())?;
+        let probed = probe_media(uri(&mp4), None)?;
+        assert!(probed.format_name.contains("mp4"), "{}", probed.format_name);
+        assert!((probed.duration_seconds.unwrap() - 5.0).abs() < 0.1);
+        let video = &probed.video_streams[0];
+        assert_eq!(video.codec_name, "h264");
+        assert_eq!(video.duration_source, DurationSource::Stream);
+        assert!((video.duration_seconds.unwrap() - 5.0).abs() < 0.05);
+        assert_eq!(video.nb_frames, Some(150));
+        assert_eq!(video.rotation, None);
+        let audio = &probed.audio_streams[0];
+        assert_eq!(audio.codec_name, "aac");
+        assert_eq!(audio.channels, 1);
+        assert_eq!(audio.duration_source, DurationSource::Stream);
+
+        let webm = crate::util::test_utils::generate_test_webm_file(Duration::from_secs(4))?;
+        let probed = probe_media(uri(&webm), None)?;
+        assert_eq!(probed.format_name, "matroska,webm");
+        let video = &probed.video_streams[0];
+        assert_eq!(video.codec_name, "vp9");
+        assert_eq!(video.duration_source, DurationSource::Container);
+        assert_eq!(video.nb_frames, None);
+        let audio = &probed.audio_streams[0];
+        assert_eq!(audio.codec_name, "opus");
+        assert_eq!(audio.channels, 2);
+        assert_eq!(audio.duration_source, DurationSource::Container);
+        Ok(())
+    }
+
+    #[test_case(90 ; "90")]
+    #[test_case(180 ; "180")]
+    #[test_case(-90 ; "minus 90")]
+    fn test_probe_media_rotation_is_reported_not_applied(degrees: i32) -> anyhow::Result<()> {
+        init_logger();
+        let params = TestVideoParameters {
+            duration: Duration::from_secs(1),
+            ..Default::default()
+        };
+        let source = generate_test_video_file(&params)?;
+        let rotated = crate::util::test_utils::make_rotated_video(source.path(), degrees)?;
+        let probed = probe_media(uri(&rotated), None)?;
+        let video = &probed.video_streams[0];
+        let rotation = video.rotation.expect("display matrix");
+        let diff = (rotation - degrees as f64).rem_euclid(360.0);
+        assert!(
+            diff < 1e-6 || (360.0 - diff) < 1e-6,
+            "{rotation} vs {degrees}"
+        );
+        // Coded dims, and the decoder does not rotate.
+        assert_eq!((video.width, video.height), (640, 480));
+        let make_request = || MediaDecodeRequest {
+            source: uri(&rotated),
+            start_time: None,
+            end_time: None,
+            video_stream: Some(VideoStreamRequest::default()),
+            audio_streams: None,
+        };
+        let plans = assert_plan_bounds_decode(make_request, true)?;
+        assert_eq!(plans[0].shape[1..], [480, 640, 3]);
+        Ok(())
+    }
+
+    #[test]
+    fn test_probe_media_sample_aspect_ratio() -> anyhow::Result<()> {
+        init_logger();
+        let params = TestVideoParameters {
+            duration: Duration::from_secs(1),
+            ..Default::default()
+        };
+        let source = generate_test_video_file(&params)?;
+        let anamorphic = crate::util::test_utils::make_anamorphic_video(source.path())?;
+        let probed = probe_media(uri(&anamorphic), None)?;
+        assert_eq!(probed.video_streams[0].sample_aspect_ratio, (4, 3));
         Ok(())
     }
 
