@@ -302,6 +302,37 @@ pub fn make_av_offset_video(
     Ok(file)
 }
 
+/// Remuxes `input` with a display-matrix rotation of `degrees`
+/// (counterclockwise, ffprobe's `rotation`).
+pub fn make_rotated_video(input: &Path, degrees: i32) -> Result<NamedTempFile, anyhow::Error> {
+    let file = NamedTempFile::with_suffix(".mp4")?;
+    run_ffmpeg(&[
+        "-display_rotation",
+        &degrees.to_string(),
+        "-i",
+        input.to_str().context("input path")?,
+        "-c",
+        "copy",
+        file.path().to_str().context("temp path")?,
+    ])?;
+    Ok(file)
+}
+
+/// Remuxes an H.264 `input` with a 4:3 sample aspect ratio.
+pub fn make_anamorphic_video(input: &Path) -> Result<NamedTempFile, anyhow::Error> {
+    let file = NamedTempFile::with_suffix(".mp4")?;
+    run_ffmpeg(&[
+        "-i",
+        input.to_str().context("input path")?,
+        "-c",
+        "copy",
+        "-bsf:v",
+        "h264_metadata=sample_aspect_ratio=4/3",
+        file.path().to_str().context("temp path")?,
+    ])?;
+    Ok(file)
+}
+
 /// Serves `path` over HTTP on an ephemeral localhost port, returning the URL.
 ///
 /// Minimal single-file server for exercising FFmpeg's http protocol in

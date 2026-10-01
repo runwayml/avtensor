@@ -268,9 +268,26 @@ The GIL is released for the duration of the decode.
 ### `probe_asset(input: str | bytes) -> MediaMetadata`
 
 Returns the asset's stream layout without decoding it: a dict with
-`video_streams` (each with `index`, `width`, `height`, `fps`) and
-`audio_streams` (each with `index`, `sample_rate`). Accepts the same inputs
-as `MediaDecodeRequest`. The GIL is released while probing.
+`format_name`, `duration_s`, `video_streams` (each with `index`, coded
+`width`/`height`, `fps`, `codec_name`, `duration_s`, `duration_source`,
+`nb_frames`, `rotation`, `sample_aspect_ratio`) and `audio_streams` (each with
+`index`, `sample_rate`, `channels`, `codec_name`, `duration_s`,
+`duration_source`). Stream durations fall back to the container duration
+(`duration_source="container"`, e.g. Matroska/WebM). `rotation` (display
+matrix, counterclockwise degrees) and `sample_aspect_ratio` are reported but
+not applied by the decoder. Accepts the same inputs as `MediaDecodeRequest`.
+The GIL is released while probing.
+
+### `plan_asset(request: MediaDecodeRequest) -> list[PlannedStream]`
+
+Returns, per stream, the buffer `decode_asset(request)` would allocate,
+without decoding: `stream_type`, `stream_index`, `shape` (in the returned
+layout), `dtype`, `fps` or `sample_rate`, and the `duration_s` /
+`duration_source` being decoded. Stream selection, the seek window, `fps`,
+`width`/`height` and `dtype` resolve through the same code as
+`decode_asset`. The decoded tensor is trimmed to what was actually decoded, so
+`shape` is an upper bound on its length. Decoders are not opened, so codec
+and hardware errors only surface at decode time.
 
 ### `MediaDecodeRequest(input: str | bytes)`
 
