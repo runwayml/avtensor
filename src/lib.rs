@@ -7,6 +7,7 @@ use google_cloud_storage::client::Storage;
 use google_cloud_storage::retry_policy::RetryableErrors;
 use tokio::runtime::Runtime;
 
+mod alloc;
 mod conversion;
 mod decoder;
 mod ffi;

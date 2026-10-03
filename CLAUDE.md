@@ -12,7 +12,13 @@ generated locally with FFmpeg; end-to-end cloud-storage tests live in the
 consuming project.
 
 `tch` comes from crates.io; its version maps 1:1 to a libtorch version
-(0.24.0 ↔ torch 2.11), so bump them together.
+(0.24.0 ↔ torch 2.11), so bump them together, along with the `torch-sys`
+pin (same version as `tch`).
+
+`build.rs` compiles `csrc/tensor_from_blob.cpp` against the libtorch headers
+(located the same way torch-sys locates them); `src/alloc.rs` uses it to give
+decoded-output buffers to torch via `from_blob` with a deleter instead of
+`at::empty`. Keep the two in sync if the C API changes.
 
 ## Git
 

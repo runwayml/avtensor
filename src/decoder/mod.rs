@@ -967,7 +967,7 @@ fn init_video_stream_context(
         .device
         .map_or(tch::Device::Cpu, |d| tch::Device::Cuda(d as usize));
     let dest =
-        tch::Tensor::f_empty(&plan.shape, (kind, device)).context("allocating output Tensor")?;
+        crate::alloc::empty(&plan.shape, kind, device).context("allocating output Tensor")?;
 
     Ok(StreamContext {
         stream_type: StreamType::Video,
@@ -1202,7 +1202,7 @@ fn init_audio_stream_context(
         plan.shape,
         audio_index
     );
-    let dest = tch::Tensor::f_empty(&plan.shape, (tch::Kind::Float, tch::Device::Cpu))
+    let dest = crate::alloc::empty(&plan.shape, tch::Kind::Float, tch::Device::Cpu)
         .context("allocating audio output Tensor")?;
 
     Ok(StreamContext {
