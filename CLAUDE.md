@@ -12,8 +12,11 @@ generated locally with FFmpeg; end-to-end cloud-storage tests live in the
 consuming project.
 
 `tch` comes from crates.io; its version maps 1:1 to a libtorch version
-(0.24.0 ↔ torch 2.11), so bump them together, along with the `torch-sys`
-pin (same version as `tch`).
+(0.24.0 ↔ torch 2.11, 0.26.0 ↔ torch 2.13). `Cargo.toml` accepts a range
+so one source tree builds against either torch; `Cargo.lock` holds the
+default. To build against another torch, run
+`cargo update -p tch -p torch-sys --precise <version>` (keep `tch` and
+`torch-sys` on the same version).
 
 `build.rs` compiles `csrc/tensor_from_blob.cpp` against the libtorch headers
 (located the same way torch-sys locates them); `src/alloc.rs` uses it to give
