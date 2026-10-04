@@ -23,6 +23,9 @@ pub struct TestVideoParameters {
     pub color_trc: Option<String>,
     /// FFmpeg color range tag (e.g. "tv", "pc").
     pub color_range: Option<String>,
+    /// Number of consecutive B-frames between reference frames. None keeps the
+    /// encoder default; set it when a test depends on B-frames being present.
+    pub b_frames: Option<u32>,
 }
 
 impl Default for TestVideoParameters {
@@ -41,6 +44,7 @@ impl Default for TestVideoParameters {
             color_primaries: None,
             color_trc: None,
             color_range: None,
+            b_frames: None,
         }
     }
 }
@@ -129,6 +133,9 @@ pub fn generate_test_video(
     if let Some(ref cr) = parameters.color_range {
         cmd.args(["-color_range", cr]);
     }
+    if let Some(b_frames) = parameters.b_frames {
+        cmd.args(["-bf", &b_frames.to_string()]);
+    }
 
     // libx264 does not propagate ffmpeg's -color_primaries/-color_trc flags
     // into the bitstream VUI (decoders would see them as "unknown"), so write
@@ -143,6 +150,11 @@ pub fn generate_test_video(
         }
         if let Some(ref ct) = parameters.color_trc {
             x264_params.push(format!("transfer={ct}"));
+        }
+        // -bf only caps the B-frame run; with adaptive placement libx264 can
+        // still choose fewer (or none) per GOP. Pin the pattern.
+        if parameters.b_frames.is_some() {
+            x264_params.push("b-adapt=0".to_string());
         }
         if !x264_params.is_empty() {
             cmd.args(["-x264-params", &x264_params.join(":")]);

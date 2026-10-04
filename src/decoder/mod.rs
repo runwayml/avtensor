@@ -5262,9 +5262,9 @@ mod tests {
         Ok(())
     }
 
-    /// libx264 emits B-frames, so packets past the end of the window precede
-    /// in-window frames in decode order. The window must hold exactly the
-    /// frames with start <= pts < end, contiguous.
+    /// With B-frames, packets past the end of the window precede in-window
+    /// frames in decode order. The window must hold exactly the frames with
+    /// start <= pts < end, contiguous.
     #[test_case(None, 1.7, 51 ; "end only")]
     #[test_case(Some(0.5), 1.7, 36 ; "start and end")]
     fn test_decode_end_time_with_b_frames(
@@ -5273,7 +5273,10 @@ mod tests {
         expected_frames: usize,
     ) -> anyhow::Result<()> {
         init_logger();
-        let params = TestVideoParameters::default();
+        let params = TestVideoParameters {
+            b_frames: Some(3),
+            ..Default::default()
+        };
         let file = generate_test_video_file(&params)?;
         let decoded = decode_media(
             MediaDecodeRequest {
