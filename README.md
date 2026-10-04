@@ -423,8 +423,7 @@ provider-specific support — the URL is handed to FFmpeg's http protocol.
   exits). avtensor therefore allocates its output buffers with the system
   allocator and hands them to torch via `from_blob` with a deleter, so a free
   is an immediate `munmap` on any thread. `AVTENSOR_OUTPUT_ALLOCATOR=torch`
-  switches back to `torch.empty`-style allocation;
-  `benchmarks/cross_thread_retention.py` measures the difference.
+  switches back to `torch.empty`-style allocation.
 
 ## Contributing
 

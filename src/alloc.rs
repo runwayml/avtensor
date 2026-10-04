@@ -14,8 +14,7 @@
 //! every decode left its whole output buffer (hundreds of MiB to GiBs) in
 //! resident memory for the lifetime of the worker. glibc releases large blocks
 //! with `munmap` on `free` regardless of the calling thread, so the deleter
-//! path returns the memory immediately. See `benchmarks/cross_thread_retention.py`
-//! for a reproduction.
+//! path returns the memory immediately.
 //!
 //! `AVTENSOR_OUTPUT_ALLOCATOR=torch` restores `at::empty` for comparison.
 
