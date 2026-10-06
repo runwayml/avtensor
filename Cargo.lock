@@ -146,6 +146,7 @@ dependencies = [
  "aws-runtime",
  "aws-sdk-s3",
  "bytes",
+ "cc",
  "derive_builder",
  "env_logger",
  "google-cloud-gax",
@@ -164,6 +165,7 @@ dependencies = [
  "test-case",
  "thiserror 2.0.15",
  "tokio",
+ "torch-sys",
 ]
 
 [[package]]

@@ -416,6 +416,14 @@ provider-specific support — the URL is handed to FFmpeg's http protocol.
 - **`s3://` works with AWS but not with your S3-compatible store** — check
   whether the store requires path-style addressing
   (`AVTENSOR_S3_FORCE_PATH_STYLE=1`) and that `AWS_ENDPOINT_URL_S3` is set.
+- **Resident memory grows when decoded tensors are freed on a different
+  thread than the one that decoded them** — torch's CPU allocator is not
+  always plain malloc (the aarch64 Linux wheels embed mimalloc, which keeps
+  blocks freed cross-thread mapped and resident until the allocating thread
+  exits). avtensor therefore allocates its output buffers with the system
+  allocator and hands them to torch via `from_blob` with a deleter, so a free
+  is an immediate `munmap` on any thread. `AVTENSOR_OUTPUT_ALLOCATOR=torch`
+  switches back to `torch.empty`-style allocation.
 
 ## Contributing
 
@@ -423,9 +431,11 @@ Issues and pull requests are welcome. Project layout:
 
 ```
 src/
+  alloc.rs       output-buffer allocation (system allocator + torch from_blob)
   decoder/       demuxing, decoding, filter graphs (mod.rs), cloud AVIO reader (io.rs)
   ffi/           PyO3 bindings: request/response types, decode_asset
   util/          gcs/s3 URI handling, memory, test media generation
+csrc/            C++ shim for the one libtorch call tch-rs does not wrap (built by build.rs)
 avtensor.pyi     Python type stubs, shipped with the wheel
 ```
 

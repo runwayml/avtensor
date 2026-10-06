@@ -36,7 +36,7 @@ auditwheel = "skip"
 
 # Include some directives to instruct uv to recompile on changes to Rust files.
 [tool.uv]
-cache-keys = [{file = "pyproject.toml"}, {file = "Cargo.toml"}, {file = "**/*.rs"}]
+cache-keys = [{file = "pyproject.toml"}, {file = "Cargo.toml"}, {file = "**/*.rs"}, {file = "csrc/*.cpp"}]
 
 [tool.ruff]
 line-length = 88
