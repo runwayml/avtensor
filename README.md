@@ -66,7 +66,7 @@ Requirements:
 | dependency | version | notes |
 | --- | --- | --- |
 | Python | >= 3.8 (CPython) | wheel is built per Python minor version |
-| PyTorch | matches the `tch` pin in `Cargo.toml` (0.24.x ↔ torch 2.11) | linked dynamically at build time |
+| PyTorch | 2.13 by default (`tch` 0.26 in `Cargo.lock`); 2.11 via `tch` 0.24 | linked dynamically at build time |
 | FFmpeg | >= 7.1, shared libraries | needs `zscale`/`tonemap` filters (libzimg) for HDR input |
 | Rust | stable toolchain | build-time only |
 
