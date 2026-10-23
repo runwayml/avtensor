@@ -38,6 +38,11 @@ class VideoStreamRequest:
     # "raw" when you need the actual HDR signal, e.g. training on PQ
     # masters or colorimetric measurement.
     hdr_mode: Literal["tonemap", "raw"] | None
+    # How `fps` resampling builds each output frame: "nearest" (default)
+    # keeps the nearest source frame (uneven spacing for e.g. 30 -> 24 fps);
+    # "blend" cross-fades neighbouring frames; "motion" interpolates along
+    # estimated block motion (about 1.2-1.6x the cost of "nearest").
+    fps_conversion: Literal["nearest", "blend", "motion"] | None
 
     def __init__(
         self,
@@ -52,6 +57,7 @@ class VideoStreamRequest:
         device: str | None = None,
         dtype: str | None = None,
         hdr_mode: Literal["tonemap", "raw"] | None = None,
+        fps_conversion: Literal["nearest", "blend", "motion"] | None = None,
     ): ...
 
 class LoudnessNormalization:

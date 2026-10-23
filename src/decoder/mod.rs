@@ -3,7 +3,10 @@ use rsmpeg::{
     avcodec::{AVCodec, AVCodecContext, AVPacket},
     avfilter::{AVFilter, AVFilterContextMut, AVFilterGraph, AVFilterInOut},
     avformat::{AVFormatContextInput, AVStreamRef},
-    avutil::{av_q2d, get_sample_fmt_name, AVChannelLayout, AVDictionary, AVFrame, AVRational},
+    avutil::{
+        av_d2q, av_inv_q, av_q2d, get_sample_fmt_name, AVChannelLayout, AVDictionary, AVFrame,
+        AVRational,
+    },
     error::RsmpegError,
     ffi::{self, AVPixelFormat, AV_NOPTS_VALUE},
 };
@@ -21,6 +24,7 @@ use crate::conversion;
 
 mod cuda;
 mod io;
+mod motion;
 
 struct StreamContext {
     stream_type: StreamType,
@@ -43,6 +47,8 @@ struct FilteringContext<'graph> {
     /// How decoded frames reach `frame_data`: through the filter graph, or
     /// directly when the graph would add nothing but copies.
     direct_path: DirectPath,
+    /// Motion-interpolating frame-rate conversion, fed by the filter graph.
+    motion: Option<MotionStage<'graph>>,
     /// A Tensor, allocated at the start of the media decoding process, to which
     /// filtered frames will be written.
     frame_data: tch::Tensor,
@@ -58,6 +64,15 @@ struct FilteringContext<'graph> {
 struct FilterContext<'graph> {
     buffersrc_ctx: AVFilterContextMut<'graph>,
     buffersink_ctx: AVFilterContextMut<'graph>,
+}
+
+/// Frame-rate conversion by motion interpolation ([`FpsConversion::Motion`]).
+/// The stream's filter graph resizes/tone maps into 8-bit planar YUV; the
+/// resampler retimes and interpolates; a second small graph converts the
+/// result to the output pixel format.
+struct MotionStage<'graph> {
+    resampler: motion::Resampler,
+    output: FilterContext<'graph>,
 }
 
 /// Direct (graph-bypassing) processing mode for a stream. When a stream's
@@ -153,6 +168,9 @@ pub struct VideoStreamRequest {
     /// HDR handling: `Tonemap` (default, SDR BT.709 preview) or `Raw`
     /// (preserve PQ/HLG code values; matrix/range conversion only).
     pub hdr_mode: HdrMode,
+    /// How `frame_rate` resampling builds each output frame. Ignored when
+    /// `frame_rate` is unset.
+    pub fps_conversion: FpsConversion,
 }
 
 #[derive(Default, Debug, Clone)]
@@ -257,7 +275,7 @@ pub fn decode_media(
     // widths libswscale can't vectorize.
     log::debug!("Setting up filter graphs for the streams.");
     let mut filter_graphs: Vec<_> = (0..stream_ctx.len())
-        .map(|_| AVFilterGraph::new())
+        .map(|_| (AVFilterGraph::new(), AVFilterGraph::new()))
         .collect();
     let mut filter_ctx = init_filters(&mut filter_graphs, stream_ctx)?;
 
@@ -393,6 +411,7 @@ pub fn decode_media(
             buffersrc_ctx,
             buffersink_ctx,
             direct_path,
+            motion,
             frame_data,
             frame_data_ptr,
             frame_pts,
@@ -414,6 +433,7 @@ pub fn decode_media(
             buffersrc_ctx,
             buffersink_ctx,
             direct_path,
+            motion,
             frame_data,
             frame_data_ptr,
             frame_pts,
@@ -447,6 +467,7 @@ pub fn decode_media(
             buffersink_ctx
                 .as_mut()
                 .context("filter graph missing for graph-path stream")?,
+            motion.as_mut(),
             frame_data,
             frame_data_ptr,
             frame_pts,
@@ -953,6 +974,21 @@ fn init_video_stream_context(
     let mut video_filter = VideoFilterConfig::try_from(request)?;
     video_filter.source_color = SourceColorInfo::from_codec_context(&decode_context);
     log::debug!("Source color info: {:?}", video_filter.source_color);
+    if let (Some(target), Some(source)) = (request.frame_rate, video_stream.guess_framerate()) {
+        // Interpolation adds nothing when every output frame lands on a
+        // source frame (48 -> 24), and for NTSC rate pairs (23.976 -> 24) it
+        // would re-synthesize nearly every frame to fix a 0.1% drift.
+        if video_filter.fps_conversion != FpsConversion::Nearest
+            && is_integer_downsample(av_q2d(source), target)
+        {
+            log::debug!(
+                "Source frame rate {} is an integer multiple of {target}, \
+                 using nearest-frame conversion",
+                av_q2d(source)
+            );
+            video_filter.fps_conversion = FpsConversion::Nearest;
+        }
+    }
 
     let plan = plan_video_stream(input_format_context, request, seek)?;
     log::debug!(
@@ -1360,6 +1396,7 @@ fn decode_packet(
         buffersrc_ctx,
         buffersink_ctx,
         direct_path,
+        motion,
         frame_data,
         frame_data_ptr,
         frame_pts,
@@ -1382,6 +1419,7 @@ fn decode_packet(
                     buffersrc_ctx,
                     buffersink_ctx,
                     direct_path,
+                    motion,
                     frame_data,
                     frame_data_ptr,
                     frame_pts,
@@ -1429,6 +1467,7 @@ fn decode_packet(
             buffersrc_ctx,
             buffersink_ctx,
             direct_path,
+            motion,
             frame_data,
             frame_data_ptr,
             frame_pts,
@@ -1523,6 +1562,7 @@ fn receive_and_filter_frames(
     buffersrc_ctx: &mut Option<AVFilterContextMut<'_>>,
     buffersink_ctx: &mut Option<AVFilterContextMut<'_>>,
     direct_path: &mut DirectPath,
+    motion: &mut Option<MotionStage<'_>>,
     frame_data: &mut tch::Tensor,
     frame_data_ptr: &mut usize,
     frame_pts: &mut Vec<f64>,
@@ -1627,6 +1667,7 @@ fn receive_and_filter_frames(
             buffersink_ctx
                 .as_mut()
                 .context("filter graph missing for graph-path stream")?,
+            motion.as_mut(),
             frame_data,
             frame_data_ptr,
             frame_pts,
@@ -1666,40 +1707,114 @@ enum FilterFrameError {
     Unexpected(anyhow::Error),
 }
 
-/// Apply FFmpeg filter graph to a decoded frame.
+/// Apply FFmpeg filter graph to a decoded frame (`None` flushes it), then
+/// the stream's [`MotionStage`] if it has one.
 #[allow(clippy::too_many_arguments)]
 fn filter_frame(
     stream_type: StreamType,
     frame: Option<AVFrame>,
     buffersrc_ctx: &mut AVFilterContextMut,
     buffersink_ctx: &mut AVFilterContextMut,
+    motion: Option<&mut MotionStage>,
     frame_data: &mut tch::Tensor,
     frame_data_ptr: &mut usize,
     frame_pts: &mut Vec<f64>,
     seek: &Seek,
 ) -> Result<Vec<Frame>, FilterFrameError> {
-    // Send the frame to the filter source.
-    buffersrc_ctx
-        .buffersrc_add_frame(frame, None)
-        .map_err(|e| {
-            FilterFrameError::Unexpected(
-                anyhow!(e).context("Error submitting the frame to the filtergraph"),
-            )
-        })?;
+    let flush = frame.is_none();
+    submit_frame(buffersrc_ctx, frame)?;
+    let Some(stage) = motion else {
+        return drain_sink(
+            stream_type,
+            buffersink_ctx,
+            frame_data,
+            frame_data_ptr,
+            frame_pts,
+            seek,
+        );
+    };
 
+    let MotionStage {
+        resampler,
+        output:
+            FilterContext {
+                buffersrc_ctx: output_src,
+                buffersink_ctx: output_sink,
+            },
+    } = stage;
+    let mut filtered_frames = Vec::new();
+    let mut emit = |frames: Vec<AVFrame>, filtered_frames: &mut Vec<Frame>| {
+        for frame in frames {
+            submit_frame(output_src, Some(frame))?;
+            filtered_frames.extend(drain_sink(
+                stream_type,
+                output_sink,
+                frame_data,
+                frame_data_ptr,
+                frame_pts,
+                seek,
+            )?);
+        }
+        Ok::<_, FilterFrameError>(())
+    };
+    while let Some(mut frame) = receive_filtered(buffersink_ctx)? {
+        frame.set_time_base(buffersink_ctx.get_time_base());
+        let frames = resampler
+            .push(frame)
+            .map_err(|e| FilterFrameError::Unexpected(e.context("Motion interpolation failed")))?;
+        emit(frames, &mut filtered_frames)?;
+    }
+    if flush {
+        emit(resampler.finish(), &mut filtered_frames)?;
+        submit_frame(output_src, None)?;
+        filtered_frames.extend(drain_sink(
+            stream_type,
+            output_sink,
+            frame_data,
+            frame_data_ptr,
+            frame_pts,
+            seek,
+        )?);
+    }
+    Ok(filtered_frames)
+}
+
+/// Sends a frame (or, with `None`, end of stream) to a graph's source.
+fn submit_frame(
+    buffersrc_ctx: &mut AVFilterContextMut,
+    frame: Option<AVFrame>,
+) -> Result<(), FilterFrameError> {
+    buffersrc_ctx.buffersrc_add_frame(frame, None).map_err(|e| {
+        FilterFrameError::Unexpected(
+            anyhow!(e).context("Error submitting the frame to the filtergraph"),
+        )
+    })
+}
+
+/// The next frame waiting in a graph's sink, if any.
+fn receive_filtered(
+    buffersink_ctx: &mut AVFilterContextMut,
+) -> Result<Option<AVFrame>, FilterFrameError> {
+    match buffersink_ctx.buffersink_get_frame(None) {
+        Ok(frame) => Ok(Some(frame)),
+        Err(RsmpegError::BufferSinkDrainError) | Err(RsmpegError::BufferSinkEofError) => Ok(None),
+        Err(_) => Err(FilterFrameError::Unexpected(anyhow!(
+            "Get frame from buffersink failed"
+        ))),
+    }
+}
+
+/// Writes every frame waiting in `buffersink_ctx` to `frame_data`.
+fn drain_sink(
+    stream_type: StreamType,
+    buffersink_ctx: &mut AVFilterContextMut,
+    frame_data: &mut tch::Tensor,
+    frame_data_ptr: &mut usize,
+    frame_pts: &mut Vec<f64>,
+    seek: &Seek,
+) -> Result<Vec<Frame>, FilterFrameError> {
     let mut filtered_frames: Vec<Frame> = Vec::new();
-    loop {
-        // Get the filtered frames from the buffersink.
-        let mut filtered_frame = match buffersink_ctx.buffersink_get_frame(None) {
-            Ok(frame) => frame,
-            Err(RsmpegError::BufferSinkDrainError) | Err(RsmpegError::BufferSinkEofError) => break,
-            Err(_) => {
-                return Err(FilterFrameError::Unexpected(anyhow!(
-                    "Get frame from buffersink failed"
-                )))
-            }
-        };
-
+    while let Some(mut filtered_frame) = receive_filtered(buffersink_ctx)? {
         filtered_frame.set_time_base(buffersink_ctx.get_time_base());
         filtered_frame.set_pict_type(ffi::AV_PICTURE_TYPE_NONE);
 
@@ -2482,7 +2597,57 @@ impl TryFrom<Option<&str>> for HdrMode {
     }
 }
 
-#[derive(Debug)]
+/// Whether `source` fps reaches `target` by keeping every n-th frame,
+/// allowing for NTSC's 1000/1001 rate offset (23.976 vs 24).
+fn is_integer_downsample(source: f64, target: f64) -> bool {
+    if !(source > 0.0 && target > 0.0) {
+        return false;
+    }
+    let ratio = source / target;
+    let n = ratio.round();
+    n >= 1.0 && (ratio / n - 1.0).abs() < 2e-3
+}
+
+/// How frame-rate resampling builds each output frame.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum FpsConversion {
+    /// Keep the source frame nearest each output timestamp (FFmpeg `fps`),
+    /// dropping or repeating whole frames. Fast, but a non-integer ratio
+    /// gives uneven frame spacing (30 -> 24 fps keeps 4 of every 5 frames,
+    /// so motion steps go 1x, 1x, 1x, 2x).
+    #[default]
+    Nearest,
+    /// Cross-fade the two source frames around each output timestamp
+    /// (FFmpeg `framerate`). Even timing at near-`Nearest` cost, but moving
+    /// edges show as double images.
+    Blend,
+    /// Motion-compensated interpolation (block matching with overlapped
+    /// block motion compensation; the model of FFmpeg's `minterpolate`
+    /// defaults, implemented in [`motion`] for speed). Even timing without
+    /// double images, at about 1.2-1.6x `Nearest`'s cost. Falls back to the
+    /// nearest frame at detected scene changes; works on 8-bit YUV, so
+    /// deeper sources are reduced to 8 bits before interpolation.
+    Motion,
+    // `Blend` and `Motion` fall back to `Nearest` when the source rate is an
+    // integer multiple of the target (see `is_integer_downsample`).
+}
+
+impl TryFrom<Option<&str>> for FpsConversion {
+    type Error = anyhow::Error;
+
+    fn try_from(value: Option<&str>) -> Result<Self, Self::Error> {
+        match value {
+            None | Some("nearest") => Ok(Self::Nearest),
+            Some("blend") => Ok(Self::Blend),
+            Some("motion") => Ok(Self::Motion),
+            Some(other) => Err(anyhow::anyhow!(
+                "fps_conversion must be \"nearest\", \"blend\" or \"motion\", got {other:?}"
+            )),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
 pub struct VideoFilterConfig {
     /// Desired frame rate for the video.
     frame_rate: Option<f64>,
@@ -2498,12 +2663,18 @@ pub struct VideoFilterConfig {
     device: Option<i32>,
     /// How HDR sources are converted (tone-mapped SDR vs raw code values).
     hdr_mode: HdrMode,
+    /// How `frame_rate` resampling builds each output frame.
+    fps_conversion: FpsConversion,
 }
 
 impl Display for VideoFilterConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let mut filters = Vec::new();
-        if let Some(frame_rate) = self.frame_rate {
+        // Nearest-frame selection runs first so dropped frames are never
+        // scaled. The interpolating modes need every source frame and their
+        // cost grows with pixel count, so they run after the resize;
+        // `Motion` runs outside the graph (see `MotionStage`).
+        if let (Some(frame_rate), FpsConversion::Nearest) = (self.frame_rate, self.fps_conversion) {
             filters.push(format!("fps={}", frame_rate));
         }
 
@@ -2539,11 +2710,36 @@ impl Display for VideoFilterConfig {
             filters.push("zscale=p=bt709:t=bt709:m=bt709:range=tv".to_string());
         }
 
+        // After tone mapping: `framerate` takes YUV only, and 8-bit PQ/HLG
+        // code values would band once linearized.
+        if let (Some(frame_rate), FpsConversion::Blend) = (self.frame_rate, self.fps_conversion) {
+            filters.push(format!("framerate=fps={}", frame_rate));
+        }
+
         filters.push(format!("format=pix_fmts={}", self.pixel_format));
         if !filters.is_empty() {
             write!(f, "{}", filters.join(","))
         } else {
             Ok(())
+        }
+    }
+}
+
+impl VideoFilterConfig {
+    /// Whether frame-rate conversion runs in a [`MotionStage`] after the
+    /// filter graph rather than inside it.
+    fn uses_motion_stage(&self) -> bool {
+        self.frame_rate.is_some() && self.fps_conversion == FpsConversion::Motion
+    }
+
+    /// Graph feeding a [`MotionStage`]: this config's resize and tone
+    /// mapping, without frame-rate conversion, ending in the 8-bit planar
+    /// YUV format `working_format` that motion interpolation works in.
+    fn motion_input(&self, working_format: &str) -> Self {
+        Self {
+            frame_rate: None,
+            pixel_format: working_format.to_string(),
+            ..self.clone()
         }
     }
 }
@@ -2558,6 +2754,7 @@ impl Default for VideoFilterConfig {
             source_color: Default::default(),
             device: Default::default(),
             hdr_mode: Default::default(),
+            fps_conversion: Default::default(),
         }
     }
 }
@@ -2576,6 +2773,7 @@ impl TryFrom<&VideoStreamRequest> for VideoFilterConfig {
                 OutputDtype::Float32 => "gbrpf32le".to_string(),
             },
             hdr_mode: req.hdr_mode,
+            fps_conversion: req.fps_conversion,
             ..Default::default()
         })
     }
@@ -2703,13 +2901,17 @@ impl Default for LoudnessNormalization {
 /// Create transcoding context corresponding to the given `stream_contexts`, the
 /// added filter contexts is mutable reference to objects stored in
 /// `filter_graphs`.
+/// Builds each stream's processing. Every stream gets a pair of graphs: the
+/// first is its filter graph, the second is only used by a [`MotionStage`].
 fn init_filters(
-    filter_graphs: &mut [AVFilterGraph],
+    filter_graphs: &mut [(AVFilterGraph, AVFilterGraph)],
     stream_contexts: Vec<StreamContext>,
 ) -> Result<Vec<FilteringContext<'_>>, anyhow::Error> {
     let mut filter_ctx = Vec::with_capacity(stream_contexts.len());
 
-    for (filter_graph, stream_context) in filter_graphs.iter_mut().zip(stream_contexts) {
+    for ((filter_graph, motion_graph), stream_context) in
+        filter_graphs.iter_mut().zip(stream_contexts)
+    {
         let StreamContext {
             mut dec_ctx,
             stream_index,
@@ -2774,16 +2976,33 @@ fn init_filters(
         // Only build the filter graph when it will actually process frames:
         // configuring a graph spins up its slice-threading worker pool, which
         // is pure overhead for direct-path streams.
-        let (buffersrc_ctx, buffersink_ctx) = if matches!(direct_path, DirectPath::Disabled) {
-            let FilterContext {
-                buffersrc_ctx,
-                buffersink_ctx,
-            } = init_filter(filter_graph, &mut dec_ctx, &filter_config)
-                .context("Failed to initialize filter")?;
-            log::debug!("Initialized filter for stream {stream_index} of type {stream_type:?}");
-            (Some(buffersrc_ctx), Some(buffersink_ctx))
-        } else {
-            (None, None)
+        let mut motion = None;
+        let (buffersrc_ctx, buffersink_ctx) = match &filter_config {
+            _ if !matches!(direct_path, DirectPath::Disabled) => (None, None),
+            FilterConfig::Video(config) if config.uses_motion_stage() => {
+                let working_format = motion_working_format(config, &dec_ctx);
+                let input_config = FilterConfig::Video(config.motion_input(working_format));
+                let FilterContext {
+                    buffersrc_ctx,
+                    buffersink_ctx,
+                } = init_filter(filter_graph, &mut dec_ctx, &input_config)
+                    .context("Failed to initialize filter")?;
+                motion = Some(
+                    init_motion_stage(motion_graph, &buffersink_ctx, config)
+                        .context("Failed to initialize motion interpolation")?,
+                );
+                log::debug!("Initialized motion interpolation for stream {stream_index}");
+                (Some(buffersrc_ctx), Some(buffersink_ctx))
+            }
+            _ => {
+                let FilterContext {
+                    buffersrc_ctx,
+                    buffersink_ctx,
+                } = init_filter(filter_graph, &mut dec_ctx, &filter_config)
+                    .context("Failed to initialize filter")?;
+                log::debug!("Initialized filter for stream {stream_index} of type {stream_type:?}");
+                (Some(buffersrc_ctx), Some(buffersink_ctx))
+            }
         };
 
         filter_ctx.push(FilteringContext {
@@ -2794,6 +3013,7 @@ fn init_filters(
             buffersrc_ctx,
             buffersink_ctx,
             direct_path,
+            motion,
             frame_data,
             frame_data_ptr: 0,
             frame_pts: Vec::new(),
@@ -2804,22 +3024,108 @@ fn init_filters(
     Ok(filter_ctx)
 }
 
-fn init_filter<'graph>(
-    filter_graph: &'graph mut AVFilterGraph,
-    dec_ctx: &mut AVCodecContext,
-    filter_spec: &FilterConfig,
-) -> Result<FilterContext<'graph>, anyhow::Error> {
-    // Cap the graph's slice-threading pool. FFmpeg's default (0 = one worker
-    // per core) builds a large thread pool for every decode on many-core
-    // machines, which oversubscribes badly when many decodes run
-    // concurrently. Slice threading cannot use more workers than there are
-    // output rows/slices anyway, so a small pool preserves single-decode
-    // filter performance.
+/// Caps a graph's slice-threading pool. FFmpeg's default (0 = one worker per
+/// core) builds a large thread pool for every decode on many-core machines,
+/// which oversubscribes badly when many decodes run concurrently. Slice
+/// threading cannot use more workers than there are output rows/slices
+/// anyway, so a small pool preserves single-decode filter performance.
+fn cap_graph_threads(filter_graph: &mut AVFilterGraph) {
     let graph_threads = std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(16)
         .min(16) as i32;
     unsafe { (*filter_graph.as_mut_ptr()).nb_threads = graph_threads };
+}
+
+/// The 8-bit planar YUV format a [`MotionStage`] interpolates in. Keeps the
+/// source's chroma subsampling when frames keep their size, so nothing is
+/// resampled. A resize or HDR tone mapping already resamples chroma, and
+/// subsampling at the output size would leave less chroma detail than the
+/// other conversions (which upsample the source chroma straight to the
+/// output size), so those use 4:4:4.
+fn motion_working_format(config: &VideoFilterConfig, dec_ctx: &AVCodecContext) -> &'static str {
+    let resized = config.width.is_some_and(|w| w != dec_ctx.width as usize)
+        || config.height.is_some_and(|h| h != dec_ctx.height as usize);
+    let tonemapped = config.source_color.is_hdr() && config.hdr_mode == HdrMode::Tonemap;
+    let source = buffersrc_pixel_format(dec_ctx);
+    match motion::working_pixel_format(source) {
+        "yuvj420p" | "yuvj422p" | "yuvj444p" if resized || tonemapped => "yuvj444p",
+        _ if resized || tonemapped => "yuv444p",
+        format => format,
+    }
+}
+
+/// Builds the [`MotionStage`] that resamples the frames leaving `input_sink`
+/// (the stream's filter graph, configured by [`VideoFilterConfig::motion_input`])
+/// to `config`'s frame rate and converts them to its pixel format.
+fn init_motion_stage<'graph>(
+    filter_graph: &'graph mut AVFilterGraph,
+    input_sink: &AVFilterContextMut,
+    config: &VideoFilterConfig,
+) -> Result<MotionStage<'graph>, anyhow::Error> {
+    let frame_rate = config
+        .frame_rate
+        .context("motion interpolation needs a frame rate")?;
+    // The `fps` filter's rate and time base for the same value, so output
+    // timestamps match `Nearest`'s.
+    let out_tb = av_inv_q(av_d2q(frame_rate, i32::MAX));
+    let (width, height, format) = (
+        input_sink.get_w(),
+        input_sink.get_h(),
+        input_sink.get_format(),
+    );
+    let resampler = motion::Resampler::new(
+        motion::Layout::new(width, height, format)?,
+        input_sink.get_time_base(),
+        out_tb,
+    );
+
+    let sar = input_sink.get_sample_aspect_ratio();
+    let mut args = format!(
+        "video_size={width}x{height}:pix_fmt={format}:time_base={}/{}:pixel_aspect={}/{}",
+        out_tb.num, out_tb.den, sar.num, sar.den,
+    );
+    let (colorspace, range) = unsafe {
+        (
+            ffi::av_buffersink_get_colorspace(input_sink.as_ptr()),
+            ffi::av_buffersink_get_color_range(input_sink.as_ptr()),
+        )
+    };
+    if let Some(name) = ffi_color_name(unsafe { ffi::av_color_space_name(colorspace) }) {
+        args.push_str(&format!(":colorspace={name}"));
+    }
+    if let Some(name) = ffi_color_name(unsafe { ffi::av_color_range_name(range) }) {
+        args.push_str(&format!(":range={name}"));
+    }
+    let output_config = VideoFilterConfig {
+        pixel_format: config.pixel_format.clone(),
+        ..Default::default()
+    };
+
+    cap_graph_threads(filter_graph);
+    let (mut buffersrc_ctx, mut buffersink_ctx) =
+        create_video_endpoints(filter_graph, &args, &output_config)?;
+    link_graph(
+        filter_graph,
+        &mut buffersrc_ctx,
+        &mut buffersink_ctx,
+        &output_config.to_filter_spec()?,
+    )?;
+    Ok(MotionStage {
+        resampler,
+        output: FilterContext {
+            buffersrc_ctx,
+            buffersink_ctx,
+        },
+    })
+}
+
+fn init_filter<'graph>(
+    filter_graph: &'graph mut AVFilterGraph,
+    dec_ctx: &mut AVCodecContext,
+    filter_spec: &FilterConfig,
+) -> Result<FilterContext<'graph>, anyhow::Error> {
+    cap_graph_threads(filter_graph);
 
     let (mut buffersrc_ctx, mut buffersink_ctx, filter_spec) = {
         match (dec_ctx.codec_type, &filter_spec) {
@@ -2847,19 +3153,36 @@ fn init_filter<'graph>(
         }
     };
 
-    // Endpoints for the filter graph
-    //
-    // Yes the outputs' name is `in`, this is in alignment with upstream samples in ffmpeg / rsmpeg which may confuse you when debugging this.
-    let outputs = AVFilterInOut::new(c"in", &mut buffersrc_ctx, 0);
-    let inputs = AVFilterInOut::new(c"out", &mut buffersink_ctx, 0);
-
-    let (_inputs, _outputs) = filter_graph.parse_ptr(&filter_spec, Some(inputs), Some(outputs))?;
-    filter_graph.config()?;
+    link_graph(
+        filter_graph,
+        &mut buffersrc_ctx,
+        &mut buffersink_ctx,
+        &filter_spec,
+    )?;
 
     Ok(FilterContext {
         buffersrc_ctx,
         buffersink_ctx,
     })
+}
+
+/// Parses `filter_spec` between the graph's source and sink and configures
+/// the graph.
+fn link_graph(
+    filter_graph: &AVFilterGraph,
+    buffersrc_ctx: &mut AVFilterContextMut,
+    buffersink_ctx: &mut AVFilterContextMut,
+    filter_spec: &std::ffi::CStr,
+) -> Result<(), anyhow::Error> {
+    // Endpoints for the filter graph
+    //
+    // Yes the outputs' name is `in`, this is in alignment with upstream samples in ffmpeg / rsmpeg which may confuse you when debugging this.
+    let outputs = AVFilterInOut::new(c"in", buffersrc_ctx, 0);
+    let inputs = AVFilterInOut::new(c"out", buffersink_ctx, 0);
+
+    let (_inputs, _outputs) = filter_graph.parse_ptr(filter_spec, Some(inputs), Some(outputs))?;
+    filter_graph.config()?;
+    Ok(())
 }
 
 /// Initializes the video filter graph according to the provided `filter_spec`.
@@ -2873,26 +3196,7 @@ fn init_video_filter<'graph, F: VideoFilterSpec>(
     dec_ctx: &mut AVCodecContext,
     filter_spec: &F,
 ) -> Result<(AVFilterContextMut<'graph>, AVFilterContextMut<'graph>), anyhow::Error> {
-    log::debug!("Creating buffer/buffersink filters for video stream.");
-    let buffersrc =
-        AVFilter::get_by_name(c"buffer").context("filtering source element not found")?;
-    let buffersink =
-        AVFilter::get_by_name(c"buffersink").context("filtering sink element not found")?;
-
-    // Hardware decoders report a GPU pixel format (e.g. AV_PIX_FMT_CUDA), but
-    // frames are downloaded to system memory before filtering — declare the
-    // underlying software format to the filter graph instead.
-    let buffersrc_pix_fmt = if dec_ctx.pix_fmt == ffi::AV_PIX_FMT_CUDA {
-        if dec_ctx.sw_pix_fmt != ffi::AV_PIX_FMT_NONE {
-            dec_ctx.sw_pix_fmt
-        } else {
-            // NVDEC emits NV12 for 8-bit content.
-            ffi::AV_PIX_FMT_NV12
-        }
-    } else {
-        dec_ctx.pix_fmt
-    };
-
+    let buffersrc_pix_fmt = buffersrc_pixel_format(dec_ctx);
     let mut args = format!(
         "video_size={}x{}:pix_fmt={}:time_base={}/{}:pixel_aspect={}/{}",
         dec_ctx.width,
@@ -2913,7 +3217,47 @@ fn init_video_filter<'graph, F: VideoFilterSpec>(
     if let Some(name) = ffi_color_name(unsafe { ffi::av_color_range_name(dec_ctx.color_range) }) {
         args.push_str(&format!(":range={name}"));
     }
+    // Filters that synthesize frames (e.g. `tpad`) size them from the link's
+    // frame rate; without it they compute a 1/0 duration.
+    if dec_ctx.framerate.num > 0 && dec_ctx.framerate.den > 0 {
+        args.push_str(&format!(
+            ":frame_rate={}/{}",
+            dec_ctx.framerate.num, dec_ctx.framerate.den
+        ));
+    }
 
+    create_video_endpoints(filter_graph, &args, filter_spec)
+}
+
+/// The pixel format decoded frames enter the filter graph in. Hardware
+/// decoders report a GPU pixel format (e.g. AV_PIX_FMT_CUDA), but frames are
+/// downloaded to system memory before filtering, so this is the underlying
+/// software format.
+fn buffersrc_pixel_format(dec_ctx: &AVCodecContext) -> AVPixelFormat {
+    if dec_ctx.pix_fmt == ffi::AV_PIX_FMT_CUDA {
+        if dec_ctx.sw_pix_fmt != ffi::AV_PIX_FMT_NONE {
+            dec_ctx.sw_pix_fmt
+        } else {
+            // NVDEC emits NV12 for 8-bit content.
+            ffi::AV_PIX_FMT_NV12
+        }
+    } else {
+        dec_ctx.pix_fmt
+    }
+}
+
+/// Creates a video graph's `buffer` source (with `args`) and a `buffersink`
+/// accepting `filter_spec`'s pixel format.
+fn create_video_endpoints<'graph, F: VideoFilterSpec>(
+    filter_graph: &'graph AVFilterGraph,
+    args: &str,
+    filter_spec: &F,
+) -> Result<(AVFilterContextMut<'graph>, AVFilterContextMut<'graph>), anyhow::Error> {
+    log::debug!("Creating buffer/buffersink filters for video stream.");
+    let buffersrc =
+        AVFilter::get_by_name(c"buffer").context("filtering source element not found")?;
+    let buffersink =
+        AVFilter::get_by_name(c"buffersink").context("filtering sink element not found")?;
     let args = &CString::new(args).unwrap();
 
     let buffer_src_context = filter_graph
@@ -3045,6 +3389,11 @@ impl VideoFilterSpec for VideoFilterConfig {
             "rgb24" => Some(ffi::AV_PIX_FMT_RGB24),
             "gbrpf32le" => Some(ffi::AV_PIX_FMT_GBRPF32LE),
             "yuv420p" => Some(ffi::AV_PIX_FMT_YUV420P),
+            "yuv422p" => Some(ffi::AV_PIX_FMT_YUV422P),
+            "yuv444p" => Some(ffi::AV_PIX_FMT_YUV444P),
+            "yuvj420p" => Some(ffi::AV_PIX_FMT_YUVJ420P),
+            "yuvj422p" => Some(ffi::AV_PIX_FMT_YUVJ422P),
+            "yuvj444p" => Some(ffi::AV_PIX_FMT_YUVJ444P),
             _ => None, // Default to None if no pixel format is specified
         }
     }
@@ -3074,7 +3423,10 @@ mod tests {
 
     use crate::util::{
         mel::{create_mel_spectrogram, MelSpectrogramConfig},
-        test_utils::{generate_test_video_file, init_logger, ChannelLayout, TestVideoParameters},
+        test_utils::{
+            generate_moving_bar_video, generate_test_video_file, init_logger, ChannelLayout,
+            TestVideoParameters,
+        },
     };
 
     use super::*;
@@ -3294,6 +3646,238 @@ mod tests {
         }
 
         Ok(())
+    }
+
+    /// Horizontal centroid of the white bar in each decoded frame.
+    fn bar_centroids(frames: &tch::Tensor) -> Vec<f64> {
+        // [T, H, W, C] uint8 -> mean brightness per column, [T, W].
+        let columns = frames.to_kind(tch::Kind::Float).mean_dim(
+            [1i64, 3].as_slice(),
+            false,
+            tch::Kind::Float,
+        );
+        let x = tch::Tensor::arange(columns.size()[1], (tch::Kind::Float, tch::Device::Cpu));
+        let centroids = (&columns * &x).sum_dim_intlist(1, false, tch::Kind::Float)
+            / columns.sum_dim_intlist(1, false, tch::Kind::Float);
+        Vec::<f64>::try_from(centroids.to_kind(tch::Kind::Double)).unwrap()
+    }
+
+    #[test_case(FpsConversion::Nearest ; "nearest")]
+    #[test_case(FpsConversion::Blend ; "blend")]
+    #[test_case(FpsConversion::Motion ; "motion")]
+    fn test_fps_conversion_motion_spacing(fps_conversion: FpsConversion) -> anyhow::Result<()> {
+        init_logger();
+        // 120 px/s at 30 fps is 4 px per source frame; an evenly spaced 24
+        // fps output moves 5 px per frame. Nearest keeps 4 of every 5 source
+        // frames, so its steps go 4, 8, 4, 4, 4, 8, ...
+        let video = generate_moving_bar_video(30, 120, Duration::from_secs(2))?;
+        let decoded = decode_media(
+            MediaDecodeRequest {
+                source: MediaSource::Uri(video.path().to_str().unwrap().into()),
+                start_time: None,
+                end_time: None,
+                video_stream: Some(VideoStreamRequest {
+                    frame_rate: Some(24.0),
+                    fps_conversion,
+                    ..Default::default()
+                }),
+                audio_streams: None,
+            },
+            None,
+        )?;
+        let stream = &decoded[0];
+        let frames = stream.data.as_ref().unwrap();
+        // Every mode fills the planned buffer exactly.
+        assert_eq!(frames.size()[0], 48);
+        assert_eq!(stream.frame_pts.len(), 48);
+        for (i, pts) in stream.frame_pts.iter().enumerate() {
+            assert!((pts - i as f64 / 24.0).abs() < 1e-6, "frame {i} pts {pts}");
+        }
+
+        let centroids = bar_centroids(frames);
+        let steps: Vec<f64> = centroids.windows(2).map(|w| w[1] - w[0]).collect();
+        let max_step = steps.iter().cloned().fold(f64::MIN, f64::max);
+        let min_step = steps.iter().cloned().fold(f64::MAX, f64::min);
+        log::info!("{fps_conversion:?}: steps {min_step:.2}..{max_step:.2}");
+        match fps_conversion {
+            FpsConversion::Nearest => {
+                assert!(min_step < 4.5 && max_step > 7.5, "{steps:?}");
+            }
+            FpsConversion::Blend | FpsConversion::Motion => {
+                assert!(min_step > 4.5 && max_step < 5.5, "{steps:?}");
+            }
+        }
+        Ok(())
+    }
+
+    /// Motion interpolation works for every source chroma layout and HDR
+    /// tone mapping, with any output size and dtype, and keeps `Nearest`'s
+    /// frame count and timestamps.
+    #[test_case("yuv420p", None, OutputDtype::Uint8 ; "yuv420p")]
+    #[test_case("yuv422p10le", None, OutputDtype::Uint8 ; "yuv422p10le")]
+    #[test_case("yuv444p", Some((150, 98)), OutputDtype::Uint8 ; "yuv444p resized odd width")]
+    #[test_case("yuvj420p", Some((96, 64)), OutputDtype::Float32 ; "yuvj420p float32")]
+    #[test_case("yuv420p10le", Some((96, 64)), OutputDtype::Uint8 ; "hdr tone mapped")]
+    #[test_case("yuv420p", Some((101, 67)), OutputDtype::Uint8 ; "yuv420p resized odd width and height")]
+    #[test_case("yuv422p", Some((77, 33)), OutputDtype::Uint8 ; "yuv422p resized odd width and height")]
+    #[test_case("yuv420p", Some((17, 15)), OutputDtype::Uint8 ; "frames smaller than one block")]
+    fn test_fps_conversion_motion_formats(
+        pixel_format: &str,
+        size: Option<(u32, u32)>,
+        dtype: OutputDtype,
+    ) -> anyhow::Result<()> {
+        init_logger();
+        let hdr = pixel_format == "yuv420p10le";
+        let params = TestVideoParameters {
+            width: 160,
+            height: 120,
+            frame_rate: 25.0,
+            duration: Duration::from_secs(2),
+            video_codec: if pixel_format == "yuvj420p" {
+                "mjpeg".to_string()
+            } else {
+                "libx264".to_string()
+            },
+            pixel_format: Some(pixel_format.to_string()),
+            color_primaries: hdr.then(|| "bt2020".to_string()),
+            color_trc: hdr.then(|| "smpte2084".to_string()),
+            colorspace: hdr.then(|| "bt2020nc".to_string()),
+            ..Default::default()
+        };
+        let video = generate_test_video_file(&params)?;
+        let decode = |fps_conversion| {
+            decode_media(
+                MediaDecodeRequest {
+                    source: MediaSource::Uri(video.path().to_str().unwrap().into()),
+                    start_time: None,
+                    end_time: None,
+                    video_stream: Some(VideoStreamRequest {
+                        frame_rate: Some(24.0),
+                        width: size.map(|s| s.0),
+                        height: size.map(|s| s.1),
+                        dtype,
+                        fps_conversion,
+                        ..Default::default()
+                    }),
+                    audio_streams: None,
+                },
+                None,
+            )
+            .map(|mut streams| streams.remove(0))
+        };
+        let nearest = decode(FpsConversion::Nearest)?;
+        let motion = decode(FpsConversion::Motion)?;
+        let (n, m) = (nearest.data.unwrap(), motion.data.unwrap());
+        assert_eq!(m.size(), n.size());
+        assert_eq!(motion.frame_pts, nearest.frame_pts);
+        // The first frame lands on a source frame and passes through; later
+        // ones are interpolated but stay close to the nearest source frame
+        // (testsrc moves only a little per frame).
+        let diff = |i: i64| -> f64 {
+            (m.get(i).to_kind(tch::Kind::Float) - n.get(i).to_kind(tch::Kind::Float))
+                .abs()
+                .mean(tch::Kind::Float)
+                .double_value(&[])
+        };
+        let scale = if dtype == OutputDtype::Float32 {
+            1.0 / 255.0
+        } else {
+            1.0
+        };
+        // 10-bit sources pass through 8 bits, so allow a quantization step.
+        assert!(diff(0) < 1.0 * scale, "first frame differs by {}", diff(0));
+        for i in 1..m.size()[0] {
+            assert!(diff(i) < 20.0 * scale, "frame {i} differs by {}", diff(i));
+        }
+        Ok(())
+    }
+
+    #[test_case(48.0, 24.0, true ; "exact 2x")]
+    #[test_case(24000.0 / 1001.0, 24.0, true ; "ntsc 23.976")]
+    #[test_case(120000.0 / 1001.0, 24.0, true ; "ntsc 119.88")]
+    #[test_case(24.0, 24.0, true ; "same rate")]
+    #[test_case(30.0, 24.0, false ; "30 to 24")]
+    #[test_case(25.0, 24.0, false ; "25 to 24")]
+    #[test_case(60000.0 / 1001.0, 24.0, false ; "59.94 to 24")]
+    #[test_case(12.0, 24.0, false ; "upsample")]
+    fn test_is_integer_downsample(source: f64, target: f64, expected: bool) {
+        assert_eq!(is_integer_downsample(source, target), expected);
+    }
+
+    #[test]
+    fn test_fps_conversion_ntsc_source_matches_nearest() -> anyhow::Result<()> {
+        init_logger();
+        let video = crate::util::test_utils::generate_fractional_fps_video(48)?;
+        let decode = |fps_conversion| {
+            decode_media(
+                MediaDecodeRequest {
+                    source: MediaSource::Uri(video.path().to_str().unwrap().into()),
+                    start_time: None,
+                    end_time: None,
+                    video_stream: Some(VideoStreamRequest {
+                        frame_rate: Some(24.0),
+                        fps_conversion,
+                        ..Default::default()
+                    }),
+                    audio_streams: None,
+                },
+                None,
+            )
+            .map(|mut streams| streams.remove(0).data.unwrap())
+        };
+        let nearest = decode(FpsConversion::Nearest)?;
+        assert!(nearest.equal(&decode(FpsConversion::Motion)?));
+        assert!(nearest.equal(&decode(FpsConversion::Blend)?));
+        Ok(())
+    }
+
+    #[test_case(FpsConversion::Blend ; "blend")]
+    #[test_case(FpsConversion::Motion ; "motion")]
+    fn test_fps_conversion_seek_window_matches_nearest_timing(
+        fps_conversion: FpsConversion,
+    ) -> anyhow::Result<()> {
+        init_logger();
+        let video = generate_moving_bar_video(30, 60, Duration::from_secs(4))?;
+        let decode = |fps_conversion| {
+            decode_media(
+                MediaDecodeRequest {
+                    source: MediaSource::Uri(video.path().to_str().unwrap().into()),
+                    start_time: Some(1.1),
+                    end_time: Some(3.3),
+                    video_stream: Some(VideoStreamRequest {
+                        frame_rate: Some(24.0),
+                        fps_conversion,
+                        ..Default::default()
+                    }),
+                    audio_streams: None,
+                },
+                None,
+            )
+            .map(|mut streams| streams.remove(0))
+        };
+        let nearest = decode(FpsConversion::Nearest)?;
+        let converted = decode(fps_conversion)?;
+        assert_eq!(converted.data.unwrap().size(), nearest.data.unwrap().size());
+        // Same timestamps; `framerate` keeps the source time base, so they
+        // can differ from `fps`'s 1/24 time base in the last bit.
+        assert_eq!(converted.frame_pts.len(), nearest.frame_pts.len());
+        for (a, b) in converted.frame_pts.iter().zip(&nearest.frame_pts) {
+            assert!((a - b).abs() < 1e-9, "{a} vs {b}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn test_fps_conversion_parse() {
+        assert_eq!(
+            FpsConversion::try_from(None).unwrap(),
+            FpsConversion::Nearest
+        );
+        assert_eq!(
+            FpsConversion::try_from(Some("motion")).unwrap(),
+            FpsConversion::Motion
+        );
+        assert!(FpsConversion::try_from(Some("minterpolate")).is_err());
     }
 
     #[test]
@@ -3853,9 +4437,40 @@ mod tests {
                 ..Default::default()
             },
             hdr_mode: HdrMode::Tonemap,
+            fps_conversion: FpsConversion::Nearest,
         },
         "fps=24,scale=width=1920:height=1080,zscale=t=linear:npl=100,format=gbrpf32le,tonemap=hable:desat=0,zscale=p=bt709:t=bt709:m=bt709:range=tv,format=pix_fmts=rgb24";
         "HDR with fps and scale options"
+    )]
+    #[test_case(
+        VideoFilterConfig {
+            frame_rate: Some(24.0),
+            width: Some(640),
+            height: Some(360),
+            fps_conversion: FpsConversion::Blend,
+            ..Default::default()
+        },
+        "scale=width=640:height=360,framerate=fps=24,format=pix_fmts=rgb24";
+        "blend fps conversion runs after the resize"
+    )]
+    #[test_case(
+        VideoFilterConfig {
+            frame_rate: Some(24.0),
+            width: Some(640),
+            height: Some(360),
+            fps_conversion: FpsConversion::Motion,
+            ..Default::default()
+        },
+        "scale=width=640:height=360,format=pix_fmts=rgb24";
+        "motion fps conversion runs outside the graph"
+    )]
+    #[test_case(
+        VideoFilterConfig {
+            fps_conversion: FpsConversion::Motion,
+            ..Default::default()
+        },
+        "format=pix_fmts=rgb24";
+        "fps conversion without a frame rate adds no filters"
     )]
     fn test_video_filter_display(filter: VideoFilterConfig, expected: &str) {
         assert_eq!(filter.to_string(), expected);
@@ -3864,6 +4479,57 @@ mod tests {
             filter.to_filter_spec().unwrap(),
             CString::new(expected).unwrap()
         );
+    }
+
+    /// The graph feeding motion interpolation keeps the resize and tone
+    /// mapping, drops the frame-rate conversion, and ends in the working
+    /// YUV format.
+    #[test_case(
+        VideoFilterConfig {
+            frame_rate: Some(24.0),
+            width: Some(640),
+            height: Some(360),
+            fps_conversion: FpsConversion::Motion,
+            ..Default::default()
+        },
+        "yuv420p",
+        "scale=width=640:height=360,format=pix_fmts=yuv420p";
+        "resize"
+    )]
+    #[test_case(
+        VideoFilterConfig {
+            frame_rate: Some(24.0),
+            source_color: SourceColorInfo {
+                color_trc: Some("smpte2084".to_string()),
+                color_primaries: Some("bt2020".to_string()),
+                ..Default::default()
+            },
+            fps_conversion: FpsConversion::Motion,
+            ..Default::default()
+        },
+        "yuv422p",
+        "zscale=t=linear:npl=100,format=gbrpf32le,tonemap=hable:desat=0,zscale=p=bt709:t=bt709:m=bt709:range=tv,format=pix_fmts=yuv422p";
+        "after HDR tone mapping"
+    )]
+    fn test_motion_input_filter(filter: VideoFilterConfig, working_format: &str, expected: &str) {
+        assert!(filter.uses_motion_stage());
+        let input = filter.motion_input(working_format);
+        assert!(!input.uses_motion_stage());
+        assert_eq!(input.to_string(), expected);
+        assert!(input.pix_fmt().is_some());
+    }
+
+    #[test_case(ffi::AV_PIX_FMT_YUV420P, "yuv420p")]
+    #[test_case(ffi::AV_PIX_FMT_YUV420P10LE, "yuv420p")]
+    #[test_case(ffi::AV_PIX_FMT_NV12, "yuv420p")]
+    #[test_case(ffi::AV_PIX_FMT_YUVJ420P, "yuvj420p")]
+    #[test_case(ffi::AV_PIX_FMT_YUV422P10LE, "yuv422p")]
+    #[test_case(ffi::AV_PIX_FMT_YUVJ422P, "yuvj422p")]
+    #[test_case(ffi::AV_PIX_FMT_YUV444P, "yuv444p")]
+    #[test_case(ffi::AV_PIX_FMT_RGB24, "yuv444p")]
+    #[test_case(ffi::AV_PIX_FMT_YUV411P, "yuv420p")]
+    fn test_motion_working_pixel_format(source: AVPixelFormat, expected: &str) {
+        assert_eq!(motion::working_pixel_format(source), expected);
     }
 
     #[test_case(
