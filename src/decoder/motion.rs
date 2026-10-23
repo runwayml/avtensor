@@ -529,35 +529,71 @@ fn plane_size(layout: &Layout, index: usize) -> (usize, usize) {
     }
 }
 
-/// Borrows the three planes of a planar 8-bit YUV `frame`.
-fn frame_planes<'f>(frame: &'f AVFrame, layout: &Layout) -> Result<[Plane<'f>; 3], anyhow::Error> {
-    let plane = |i: usize| {
-        let (rows, width) = plane_size(layout, i);
-        let stride = frame.linesize[i];
-        if frame.data[i].is_null() || stride < width as i32 {
+/// Checks that `frame` has exactly `layout`'s geometry and three non-null
+/// planes with `stride >= width`, and returns the plane strides.
+///
+/// [`Layout::new`] only accepts 8-bit, fully planar YUV formats with 3
+/// components, so for a frame that passes this check every plane `i` is a
+/// separate array of [`plane_size`]`(layout, i)` rows, `stride` bytes apart,
+/// each row starting with `width` one-byte samples. FFmpeg allocates video
+/// frame buffers (`av_frame_get_buffer`, decoder and filter-graph pools) for
+/// at least the frame's full height, so such a plane spans at least
+/// `stride * (rows - 1) + width` bytes from `data[i]`.
+fn plane_strides(frame: &AVFrame, layout: &Layout) -> Result<[usize; 3], anyhow::Error> {
+    if frame_layout(frame)? != *layout {
+        bail!("Frame geometry does not match the motion interpolation layout: {frame:?}");
+    }
+    let mut strides = [0; 3];
+    for (i, stride) in strides.iter_mut().enumerate() {
+        let (_, width) = plane_size(layout, i);
+        let linesize = frame.linesize[i];
+        if frame.data[i].is_null() || linesize < 0 || (linesize as usize) < width {
             bail!("Unexpected plane {i} layout for motion interpolation: {frame:?}");
         }
-        let stride = stride as usize;
-        // SAFETY: an allocated frame holds `rows` rows of `stride` bytes
-        // per plane; the last row only needs `width` of them.
-        let data =
-            unsafe { std::slice::from_raw_parts(frame.data[i], stride * (rows - 1) + width) };
-        Ok(Plane { data, stride })
-    };
-    Ok([plane(0)?, plane(1)?, plane(2)?])
+        *stride = linesize as usize;
+    }
+    Ok(strides)
 }
 
-fn frame_planes_mut<'f>(frame: &'f mut AVFrame, layout: &Layout) -> [PlaneMut<'f>; 3] {
-    let (data, linesize) = (frame.data, frame.linesize);
-    [0, 1, 2].map(|i| {
+/// Borrows the three planes of a planar 8-bit YUV `frame`.
+fn frame_planes<'f>(frame: &'f AVFrame, layout: &Layout) -> Result<[Plane<'f>; 3], anyhow::Error> {
+    let strides = plane_strides(frame, layout)?;
+    Ok([0, 1, 2].map(|i| {
         let (rows, width) = plane_size(layout, i);
-        let stride = linesize[i] as usize;
-        // SAFETY: the frame was just allocated by `av_frame_get_buffer` with
-        // this layout, so every plane holds `rows` rows of `stride >= width`
-        // bytes and nothing else references its buffers.
+        let stride = strides[i];
+        // SAFETY: `plane_strides` checked that `frame` has `layout`'s
+        // geometry and a non-null plane `i` with `stride >= width`, so the
+        // plane spans at least `stride * (rows - 1) + width` initialized
+        // bytes (see `plane_strides`). The slice borrows `frame`, which
+        // holds a reference to the buffer for its lifetime.
+        let data =
+            unsafe { std::slice::from_raw_parts(frame.data[i], stride * (rows - 1) + width) };
+        Plane { data, stride }
+    }))
+}
+
+/// Mutably borrows the three planes of a planar 8-bit YUV `frame`. Fails
+/// unless the frame's buffers are writable (not shared with another frame).
+fn frame_planes_mut<'f>(
+    frame: &'f mut AVFrame,
+    layout: &Layout,
+) -> Result<[PlaneMut<'f>; 3], anyhow::Error> {
+    let strides = plane_strides(frame, layout)?;
+    if !frame.is_writable().context("Checking frame writability")? {
+        bail!("Motion interpolation output frame is not writable");
+    }
+    let data = frame.data;
+    Ok([0, 1, 2].map(|i| {
+        let (rows, width) = plane_size(layout, i);
+        let stride = strides[i];
+        // SAFETY: as in `frame_planes`, plane `i` spans at least
+        // `stride * (rows - 1) + width` bytes. The frame is writable, so no
+        // other frame references its buffers, and the three planes are
+        // disjoint arrays (fully planar format), so the mutable slices do
+        // not alias. They borrow `frame` mutably for their lifetime.
         let data = unsafe { std::slice::from_raw_parts_mut(data[i], stride * (rows - 1) + width) };
         PlaneMut { data, stride }
-    })
+    }))
 }
 
 /// A source frame with its timestamp on the resampler's exact time grid.
@@ -740,7 +776,7 @@ impl Resampler {
         let layout = self.layout;
         let [(a, _), (b, _)] = &self.padded;
         self.interp
-            .interpolate(a, b, alpha, frame_planes_mut(&mut out, &layout));
+            .interpolate(a, b, alpha, frame_planes_mut(&mut out, &layout)?);
         out.set_pts(pts);
         out.set_time_base(self.out_tb);
         unsafe { (*out.as_mut_ptr()).duration = 1 };
@@ -871,7 +907,11 @@ mod tests {
         frame.set_height(layout.height as i32);
         frame.alloc_buffer().unwrap();
         let (cw, _) = layout.chroma_size();
-        for (p, src) in frame_planes_mut(&mut frame, layout).into_iter().zip(&data) {
+        for (p, src) in frame_planes_mut(&mut frame, layout)
+            .unwrap()
+            .into_iter()
+            .zip(&data)
+        {
             let w = if src.len() == layout.width * layout.height {
                 layout.width
             } else {
@@ -1055,6 +1095,45 @@ mod tests {
         let out = run(layout, &prev, &next, 100);
         let (cw, ch) = layout.chroma_size();
         assert_eq!(out.map(|p| p.len()), [width * height, cw * ch, cw * ch]);
+    }
+
+    #[test]
+    fn test_frame_planes_reject_mismatched_frames() {
+        let layout = Layout {
+            width: 64,
+            height: 32,
+            chroma_shift: (1, 1),
+        };
+        let frame = av_frame(&layout, 0, 1, |x, y, _| pattern(x, y));
+        assert!(frame_planes(&frame, &layout).is_ok());
+        // A larger layout than the frame was allocated for must not be
+        // borrowed: its planes would extend past the frame's buffers.
+        let taller = Layout {
+            height: 64,
+            ..layout
+        };
+        assert!(frame_planes(&frame, &taller).is_err());
+        let wider_chroma = Layout {
+            chroma_shift: (0, 0),
+            ..layout
+        };
+        assert!(frame_planes(&frame, &wider_chroma).is_err());
+
+        // A frame that shares its buffers with another is read-only.
+        let mut shared = frame.clone();
+        assert!(frame_planes(&shared, &layout).is_ok());
+        assert!(frame_planes_mut(&mut shared, &layout).is_err());
+        drop(frame);
+        assert!(frame_planes_mut(&mut shared, &layout).is_ok());
+
+        // Packed formats are rejected before any plane is borrowed.
+        let mut packed = AVFrame::new();
+        packed.set_format(ffi::AV_PIX_FMT_RGB24);
+        packed.set_width(64);
+        packed.set_height(32);
+        packed.alloc_buffer().unwrap();
+        assert!(frame_planes(&packed, &layout).is_err());
+        assert!(frame_planes_mut(&mut packed, &layout).is_err());
     }
 
     #[test]

@@ -3718,6 +3718,9 @@ mod tests {
     #[test_case("yuv444p", Some((150, 98)), OutputDtype::Uint8 ; "yuv444p resized odd width")]
     #[test_case("yuvj420p", Some((96, 64)), OutputDtype::Float32 ; "yuvj420p float32")]
     #[test_case("yuv420p10le", Some((96, 64)), OutputDtype::Uint8 ; "hdr tone mapped")]
+    #[test_case("yuv420p", Some((101, 67)), OutputDtype::Uint8 ; "yuv420p resized odd width and height")]
+    #[test_case("yuv422p", Some((77, 33)), OutputDtype::Uint8 ; "yuv422p resized odd width and height")]
+    #[test_case("yuv420p", Some((17, 15)), OutputDtype::Uint8 ; "frames smaller than one block")]
     fn test_fps_conversion_motion_formats(
         pixel_format: &str,
         size: Option<(u32, u32)>,
