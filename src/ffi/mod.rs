@@ -98,6 +98,15 @@ pub struct VideoStreamRequest {
     /// oriented and substantially alters both luminance and chroma.
     #[pyo3(get, set)]
     hdr_mode: Option<String>,
+    /// How `fps` resampling builds each output frame: "nearest" (the
+    /// default) keeps the nearest source frame, dropping or repeating
+    /// whole frames; "blend" cross-fades the two neighbouring frames;
+    /// "motion" interpolates along estimated block motion (the model of
+    /// FFmpeg's `minterpolate`). Nearest gives uneven frame spacing for
+    /// non-integer ratios (e.g. 30 -> 24 fps); blend and motion keep it
+    /// even. Motion costs about 1.2-1.6x nearest's decode time.
+    #[pyo3(get, set)]
+    fps_conversion: Option<String>,
 }
 
 impl VideoStreamRequest {
@@ -117,7 +126,7 @@ impl VideoStreamRequest {
 #[pymethods]
 impl VideoStreamRequest {
     #[new]
-    #[pyo3(signature = (*, index=None, width=None, height=None, fps=None, number_of_threads=None, hardware_acceleration=None, dimension_order=None, device=None, dtype=None, hdr_mode=None))]
+    #[pyo3(signature = (*, index=None, width=None, height=None, fps=None, number_of_threads=None, hardware_acceleration=None, dimension_order=None, device=None, dtype=None, hdr_mode=None, fps_conversion=None))]
     #[allow(clippy::too_many_arguments)]
     pub fn py_new(
         index: Option<usize>,
@@ -130,6 +139,7 @@ impl VideoStreamRequest {
         device: Option<String>,
         dtype: Option<String>,
         hdr_mode: Option<String>,
+        fps_conversion: Option<String>,
     ) -> Self {
         VideoStreamRequest {
             index,
@@ -142,6 +152,7 @@ impl VideoStreamRequest {
             device,
             dtype,
             hdr_mode,
+            fps_conversion,
         }
     }
 }
@@ -183,6 +194,7 @@ impl VideoStreamRequest {
             device: self.device_ordinal()?,
             dtype: self.dtype_parsed()?,
             hdr_mode: decoder::HdrMode::try_from(self.hdr_mode.as_deref())?,
+            fps_conversion: decoder::FpsConversion::try_from(self.fps_conversion.as_deref())?,
         })
     }
 }
