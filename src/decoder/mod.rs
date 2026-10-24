@@ -153,6 +153,10 @@ pub struct VideoStreamRequest {
     /// HDR handling: `Tonemap` (default, SDR BT.709 preview) or `Raw`
     /// (preserve PQ/HLG code values; matrix/range conversion only).
     pub hdr_mode: HdrMode,
+    /// YUV->RGB conversion: `None` resolves to [`ColorConversion::Fast`] for
+    /// `Uint8` (bit-identical to earlier releases) and
+    /// [`ColorConversion::Accurate`] for `Float32`.
+    pub color_conversion: Option<ColorConversion>,
 }
 
 #[derive(Default, Debug, Clone)]
@@ -2001,6 +2005,7 @@ impl DirectVideoScaler {
             && config.width.is_none()
             && config.height.is_none()
             && !config.source_color.is_hdr()
+            && config.color_conversion == ColorConversion::Fast
             && config.pixel_format == "rgb24"
             && dst_width % 32 == 0
             && direct_paths_enabled()
@@ -2415,9 +2420,8 @@ fn ffi_color_name(ptr: *const std::os::raw::c_char) -> Option<String> {
 #[derive(Debug, Clone, Default)]
 struct SourceColorInfo {
     /// YUV colorspace matrix (e.g. "bt709", "bt2020nc", "smpte170m").
-    /// Surfaced via the Debug log; the buffersrc filter reads it from the
-    /// decoder context directly.
-    #[allow(dead_code)]
+    /// The buffersrc filter reads it from the decoder context directly; the
+    /// accurate conversion path checks whether it is tagged at all.
     colorspace: Option<String>,
     /// Color range: "tv"/"mpeg" (limited) or "pc"/"jpeg" (full).
     #[allow(dead_code)]
@@ -2482,6 +2486,38 @@ impl TryFrom<Option<&str>> for HdrMode {
     }
 }
 
+/// How decoded YUV frames are converted to RGB.
+///
+/// libswscale's default YUV->RGB path (FFmpeg 7.1) has two measurable errors:
+/// its 8-bit packed `rgb24` output is biased low by ~0.5-1.4 code values per
+/// channel on 4:2:0 sources (chroma handling and truncation without
+/// `SWS_ACCURATE_RND | SWS_FULL_CHR_H_INT`), and its float `gbrpf32le` output
+/// is scaled by 255/256 (white decodes to 0.99615, not 1.0). `Accurate`
+/// converts with zimg (`zscale`), which is exact in float and rounds to
+/// nearest for 8-bit output, at a comparable cost to swscale's fast path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ColorConversion {
+    /// libswscale's default conversion (historical behaviour).
+    #[default]
+    Fast,
+    /// zimg conversion: exact float output and round-to-nearest 8-bit output.
+    Accurate,
+}
+
+impl TryFrom<&str> for ColorConversion {
+    type Error = anyhow::Error;
+
+    fn try_from(value: &str) -> Result<Self, Self::Error> {
+        match value {
+            "fast" => Ok(Self::Fast),
+            "accurate" => Ok(Self::Accurate),
+            other => Err(anyhow::anyhow!(
+                "color_conversion must be \"fast\" or \"accurate\", got {other:?}"
+            )),
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct VideoFilterConfig {
     /// Desired frame rate for the video.
@@ -2498,6 +2534,8 @@ pub struct VideoFilterConfig {
     device: Option<i32>,
     /// How HDR sources are converted (tone-mapped SDR vs raw code values).
     hdr_mode: HdrMode,
+    /// YUV->RGB conversion backend (resolved; see [`ColorConversion`]).
+    color_conversion: ColorConversion,
 }
 
 impl Display for VideoFilterConfig {
@@ -2523,7 +2561,8 @@ impl Display for VideoFilterConfig {
         // With `HdrMode::Raw` the block is skipped entirely: the plain
         // format conversion below honors the tagged matrix/range but leaves
         // the transfer function (PQ/HLG code values) untouched.
-        if self.source_color.is_hdr() && self.hdr_mode == HdrMode::Tonemap {
+        let tonemap = self.source_color.is_hdr() && self.hdr_mode == HdrMode::Tonemap;
+        if tonemap {
             log::debug!(
                 "HDR source detected (trc={:?}, primaries={:?}), inserting tone mapping pipeline",
                 self.source_color.color_trc,
@@ -2537,6 +2576,24 @@ impl Display for VideoFilterConfig {
             filters.push("tonemap=hable:desat=0".to_string());
             // 4. Convert primaries, transfer, and matrix to BT.709 (sRGB)
             filters.push("zscale=p=bt709:t=bt709:m=bt709:range=tv".to_string());
+        }
+
+        if self.color_conversion == ColorConversion::Accurate {
+            // Convert to RGB with zscale instead of letting the final
+            // `format` auto-insert swscale. zimg refuses a YUV source with an
+            // unspecified matrix, so default it to BT.601 like swscale does
+            // (ignored for RGB/gray sources; tone-mapped frames are tagged
+            // BT.709 by the chain above).
+            let mut zscale = "zscale=f=bicubic".to_string();
+            if !tonemap && self.source_color.colorspace.is_none() {
+                zscale.push_str(":min=170m");
+            }
+            filters.push(zscale);
+            // zscale cannot emit packed rgb24; have it quantize to planar
+            // gbrp (round to nearest) so the final step is a lossless repack.
+            if self.pixel_format == "rgb24" {
+                filters.push("format=gbrp".to_string());
+            }
         }
 
         filters.push(format!("format=pix_fmts={}", self.pixel_format));
@@ -2558,6 +2615,7 @@ impl Default for VideoFilterConfig {
             source_color: Default::default(),
             device: Default::default(),
             hdr_mode: Default::default(),
+            color_conversion: Default::default(),
         }
     }
 }
@@ -2576,6 +2634,10 @@ impl TryFrom<&VideoStreamRequest> for VideoFilterConfig {
                 OutputDtype::Float32 => "gbrpf32le".to_string(),
             },
             hdr_mode: req.hdr_mode,
+            color_conversion: req.color_conversion.unwrap_or(match req.dtype {
+                OutputDtype::Uint8 => ColorConversion::Fast,
+                OutputDtype::Float32 => ColorConversion::Accurate,
+            }),
             ..Default::default()
         })
     }
@@ -3074,7 +3136,10 @@ mod tests {
 
     use crate::util::{
         mel::{create_mel_spectrogram, MelSpectrogramConfig},
-        test_utils::{generate_test_video_file, init_logger, ChannelLayout, TestVideoParameters},
+        test_utils::{
+            generate_limited_range_luma_ramp, generate_test_video_file, init_logger, ChannelLayout,
+            TestVideoParameters,
+        },
     };
 
     use super::*;
@@ -3853,9 +3918,44 @@ mod tests {
                 ..Default::default()
             },
             hdr_mode: HdrMode::Tonemap,
+            color_conversion: ColorConversion::Fast,
         },
         "fps=24,scale=width=1920:height=1080,zscale=t=linear:npl=100,format=gbrpf32le,tonemap=hable:desat=0,zscale=p=bt709:t=bt709:m=bt709:range=tv,format=pix_fmts=rgb24";
         "HDR with fps and scale options"
+    )]
+    #[test_case(
+        VideoFilterConfig {
+            color_conversion: ColorConversion::Accurate,
+            source_color: SourceColorInfo {
+                colorspace: Some("bt709".to_string()),
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+        "zscale=f=bicubic,format=gbrp,format=pix_fmts=rgb24";
+        "accurate conversion of a tagged source quantizes in zscale"
+    )]
+    #[test_case(
+        VideoFilterConfig {
+            color_conversion: ColorConversion::Accurate,
+            width: Some(320),
+            ..Default::default()
+        },
+        "scale=width=320,zscale=f=bicubic:min=170m,format=gbrp,format=pix_fmts=rgb24";
+        "accurate conversion of an untagged source defaults the matrix to BT.601"
+    )]
+    #[test_case(
+        VideoFilterConfig {
+            color_conversion: ColorConversion::Accurate,
+            source_color: SourceColorInfo {
+                color_trc: Some("smpte2084".to_string()),
+                color_primaries: Some("bt2020".to_string()),
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+        "zscale=t=linear:npl=100,format=gbrpf32le,tonemap=hable:desat=0,zscale=p=bt709:t=bt709:m=bt709:range=tv,zscale=f=bicubic,format=gbrp,format=pix_fmts=rgb24";
+        "accurate conversion after tone mapping"
     )]
     fn test_video_filter_display(filter: VideoFilterConfig, expected: &str) {
         assert_eq!(filter.to_string(), expected);
@@ -4814,6 +4914,111 @@ mod tests {
             max_diff, 0.0,
             "direct swscale output must be identical to the filter graph"
         );
+        Ok(())
+    }
+
+    /// Decodes the video stream of `path` with the given dtype and
+    /// conversion, returning the tensor as float64 in [T, C, H, W] layout and
+    /// [0, 1] scale.
+    fn decode_rgb_unit(
+        path: &str,
+        dtype: OutputDtype,
+        color_conversion: Option<ColorConversion>,
+    ) -> anyhow::Result<tch::Tensor> {
+        let mut streams = decode_media(
+            MediaDecodeRequest {
+                source: MediaSource::Uri(path.to_string()),
+                start_time: None,
+                end_time: None,
+                video_stream: Some(VideoStreamRequest {
+                    dtype,
+                    color_conversion,
+                    ..Default::default()
+                }),
+                audio_streams: None,
+            },
+            None,
+        )?;
+        let data = streams
+            .remove(0)
+            .data
+            .context("video stream should have data")?;
+        Ok(match dtype {
+            OutputDtype::Uint8 => data
+                .permute([0, 3, 1, 2])
+                .to_kind(tch::Kind::Double)
+                .f_div_scalar(255.0)?,
+            OutputDtype::Float32 => data.to_kind(tch::Kind::Double),
+        })
+    }
+
+    /// A limited-range luma ramp has an exact RGB answer (column x ->
+    /// x / 219). The accurate path must hit it: exactly in float32 (swscale's
+    /// fast path scales by 255/256 here: white decodes to 0.99615), and to
+    /// the nearest code value in uint8.
+    #[test_case(false; "8bit")]
+    #[test_case(true; "10bit")]
+    fn test_accurate_conversion_matches_exact_ramp(ten_bit: bool) -> anyhow::Result<()> {
+        init_logger();
+        let ramp = generate_limited_range_luma_ramp(ten_bit)?;
+        let path = ramp.path().to_str().unwrap();
+
+        let width = 224;
+        let expected = tch::Tensor::arange(width, (tch::Kind::Double, tch::Device::Cpu))
+            .clamp_max(219)
+            .f_div_scalar(219.0)?;
+
+        let float = decode_rgb_unit(path, OutputDtype::Float32, None)?;
+        let float_err: f64 = float.f_sub(&expected)?.abs().max().try_into()?;
+        assert!(
+            float_err < 1e-5,
+            "float32 ramp decode is off by up to {float_err} (white = {})",
+            f64::try_from(float.max())?
+        );
+
+        let uint8 = decode_rgb_unit(path, OutputDtype::Uint8, Some(ColorConversion::Accurate))?;
+        let rounded = expected.f_mul_scalar(255.0)?.round().f_div_scalar(255.0)?;
+        let uint8_err: f64 = uint8.f_sub(&rounded)?.abs().max().try_into()?;
+        assert_eq!(uint8_err, 0.0, "accurate uint8 must round to nearest");
+        Ok(())
+    }
+
+    /// On 4:2:0 content with chroma, accurate uint8 output must be the
+    /// float32 output rounded to the nearest code value (no bias), while the
+    /// default fast path stays bit-identical to earlier releases.
+    #[test]
+    fn test_accurate_uint8_is_unbiased_on_420() -> anyhow::Result<()> {
+        init_logger();
+        let test_video = generate_test_video_file(&TestVideoParameters {
+            pixel_format: Some("yuv420p".to_string()),
+            colorspace: Some("bt709".to_string()),
+            color_range: Some("tv".to_string()),
+            duration: Duration::from_secs(1),
+            ..Default::default()
+        })?;
+        let path = test_video.path().to_str().unwrap();
+
+        let reference = decode_rgb_unit(path, OutputDtype::Float32, None)?;
+        let accurate = decode_rgb_unit(path, OutputDtype::Uint8, Some(ColorConversion::Accurate))?;
+        assert_eq!(accurate.size(), reference.size());
+        let diff = accurate.f_sub(&reference)?.f_mul_scalar(255.0)?;
+        let max_err: f64 = diff.abs().max().try_into()?;
+        assert!(
+            max_err <= 0.5 + 1e-3,
+            "accurate uint8 max error {max_err} code values"
+        );
+        for c in 0..3 {
+            let bias: f64 = diff.select(1, c).mean(tch::Kind::Double).try_into()?;
+            assert!(
+                bias.abs() < 0.05,
+                "accurate uint8 channel {c} bias {bias} code values"
+            );
+        }
+
+        // The default stays on the fast path, unchanged.
+        let default = decode_rgb_unit(path, OutputDtype::Uint8, None)?;
+        let fast = decode_rgb_unit(path, OutputDtype::Uint8, Some(ColorConversion::Fast))?;
+        assert!(default.equal(&fast));
         Ok(())
     }
 

@@ -126,7 +126,15 @@ pub fn convert_gbrpf32_frame_to_tensor(
             unsafe {
                 let src_row =
                     frame.data[plane].add(row * frame.linesize[plane] as usize) as *const f32;
-                std::ptr::copy_nonoverlapping(src_row, dst_plane.add(row * width), width);
+                let dst_row = dst_plane.add(row * width);
+                std::ptr::copy_nonoverlapping(src_row, dst_row, width);
+                // zimg (the accurate conversion path) does not clip
+                // out-of-gamut YUV; keep the documented [0, 1] contract
+                // (swscale's output is already in range, so this is a no-op
+                // there).
+                for v in std::slice::from_raw_parts_mut(dst_row, width) {
+                    *v = v.clamp(0.0, 1.0);
+                }
             }
         }
     }

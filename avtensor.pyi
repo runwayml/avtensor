@@ -38,6 +38,12 @@ class VideoStreamRequest:
     # "raw" when you need the actual HDR signal, e.g. training on PQ
     # masters or colorimetric measurement.
     hdr_mode: Literal["tonemap", "raw"] | None
+    # YUV->RGB conversion: "fast" (libswscale's default path) or "accurate"
+    # (zimg: exact float output, round-to-nearest uint8). Defaults to "fast"
+    # for uint8 (bit-identical to earlier releases) and "accurate" for
+    # float32. The fast path biases uint8 low by ~0.5-1.4 code values per
+    # channel on 4:2:0 sources and scales float32 by 255/256.
+    color_conversion: Literal["fast", "accurate"] | None
 
     def __init__(
         self,
@@ -52,6 +58,7 @@ class VideoStreamRequest:
         device: str | None = None,
         dtype: str | None = None,
         hdr_mode: Literal["tonemap", "raw"] | None = None,
+        color_conversion: Literal["fast", "accurate"] | None = None,
     ): ...
 
 class LoudnessNormalization:

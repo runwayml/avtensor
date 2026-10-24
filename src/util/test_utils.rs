@@ -244,6 +244,38 @@ pub fn generate_test_audio_file(
     Ok(file)
 }
 
+/// Generates a lossless (FFV1) BT.709 limited-range gray ramp: 220 columns
+/// whose luma steps through every legal code value (16..=235 at 8 bits, or
+/// 64..=940 in steps of 4 at 10 bits) with neutral chroma, so the exact RGB
+/// value of column `x` is `x / 219`.
+pub fn generate_limited_range_luma_ramp(ten_bit: bool) -> Result<NamedTempFile, anyhow::Error> {
+    let file = NamedTempFile::with_suffix(".mkv")?;
+    let (pix_fmt, lum, chroma) = if ten_bit {
+        ("yuv444p10le", "64+4*X", "512")
+    } else {
+        ("yuv444p", "16+X", "128")
+    };
+    run_ffmpeg(&[
+        "-f",
+        "lavfi",
+        "-i",
+        &format!("nullsrc=s=224x16:r=24:d=0.25,format={pix_fmt},geq=lum='min({lum},{max})':cb={chroma}:cr={chroma}",
+            max = if ten_bit { 940 } else { 235 }),
+        "-c:v",
+        "ffv1",
+        "-colorspace",
+        "bt709",
+        "-color_primaries",
+        "bt709",
+        "-color_trc",
+        "bt709",
+        "-color_range",
+        "tv",
+        file.path().to_str().context("temp path")?,
+    ])?;
+    Ok(file)
+}
+
 /// Generates a video with exactly `num_frames` frames at 24000/1001
 /// (23.976...) fps. `duration * frame_rate` for such streams lands just above
 /// the integer frame count, which historically produced a phantom trailing

@@ -98,6 +98,14 @@ pub struct VideoStreamRequest {
     /// oriented and substantially alters both luminance and chroma.
     #[pyo3(get, set)]
     hdr_mode: Option<String>,
+    /// YUV->RGB conversion: "fast" (libswscale's default path) or
+    /// "accurate" (zimg: exact float output, round-to-nearest uint8).
+    /// Defaults to "fast" for uint8 (bit-identical to earlier releases) and
+    /// "accurate" for float32. swscale's fast path biases uint8 output low
+    /// by ~0.5-1.4 code values per channel on 4:2:0 sources and scales
+    /// float32 output by 255/256 (white decodes to 0.99615).
+    #[pyo3(get, set)]
+    color_conversion: Option<String>,
 }
 
 impl VideoStreamRequest {
@@ -117,7 +125,7 @@ impl VideoStreamRequest {
 #[pymethods]
 impl VideoStreamRequest {
     #[new]
-    #[pyo3(signature = (*, index=None, width=None, height=None, fps=None, number_of_threads=None, hardware_acceleration=None, dimension_order=None, device=None, dtype=None, hdr_mode=None))]
+    #[pyo3(signature = (*, index=None, width=None, height=None, fps=None, number_of_threads=None, hardware_acceleration=None, dimension_order=None, device=None, dtype=None, hdr_mode=None, color_conversion=None))]
     #[allow(clippy::too_many_arguments)]
     pub fn py_new(
         index: Option<usize>,
@@ -130,6 +138,7 @@ impl VideoStreamRequest {
         device: Option<String>,
         dtype: Option<String>,
         hdr_mode: Option<String>,
+        color_conversion: Option<String>,
     ) -> Self {
         VideoStreamRequest {
             index,
@@ -142,6 +151,7 @@ impl VideoStreamRequest {
             device,
             dtype,
             hdr_mode,
+            color_conversion,
         }
     }
 }
@@ -183,6 +193,11 @@ impl VideoStreamRequest {
             device: self.device_ordinal()?,
             dtype: self.dtype_parsed()?,
             hdr_mode: decoder::HdrMode::try_from(self.hdr_mode.as_deref())?,
+            color_conversion: self
+                .color_conversion
+                .as_deref()
+                .map(decoder::ColorConversion::try_from)
+                .transpose()?,
         })
     }
 }
