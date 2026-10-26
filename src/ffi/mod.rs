@@ -101,9 +101,11 @@ pub struct VideoStreamRequest {
     /// YUV->RGB conversion: "fast" (libswscale's default path) or
     /// "accurate" (zimg: exact float output, round-to-nearest uint8).
     /// Defaults to "fast" for uint8 (bit-identical to earlier releases) and
-    /// "accurate" for float32. swscale's fast path biases uint8 output low
-    /// by ~0.5-1.4 code values per channel on 4:2:0 sources and scales
-    /// float32 output by 255/256 (white decodes to 0.99615).
+    /// "accurate" for float32 ("fast" with a warning when FFmpeg lacks
+    /// zscale/libzimg). Not supported with device="cuda". swscale's fast
+    /// path biases uint8 output low by ~0.5-1.4 code values per channel on
+    /// 4:2:0 sources and scales float32 output by 255/256 (white decodes to
+    /// 0.99615).
     #[pyo3(get, set)]
     color_conversion: Option<String>,
 }

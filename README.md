@@ -67,7 +67,7 @@ Requirements:
 | --- | --- | --- |
 | Python | >= 3.8 (CPython) | wheel is built per Python minor version |
 | PyTorch | 2.13 by default (`tch` 0.26 in `Cargo.lock`); 2.11 via `tch` 0.24 | linked dynamically at build time |
-| FFmpeg | >= 7.1, shared libraries | needs `zscale`/`tonemap` filters (libzimg) for HDR input |
+| FFmpeg | >= 7.1, shared libraries | needs `zscale`/`tonemap` filters (libzimg) for HDR input and for `color_conversion="accurate"` (the `float32` default; without libzimg, `float32` falls back to `"fast"` with a warning) |
 | Rust | stable toolchain | build-time only |
 
 ## Quickstart
@@ -318,7 +318,7 @@ All attributes default to `None`, meaning "keep the source value".
 | `dimension_order` | `str \| None` | `"NCHW"` (default, `[T, C, H, W]`, a non-contiguous view) or `"NHWC"` (`[T, H, W, C]`, contiguous) |
 | `device` | `str \| None` | `"cuda"` / `"cuda:N"`: keep frames on the GPU, implies `hardware_acceleration` (see [GPU-accelerated decoding](#gpu-accelerated-decoding-nvdec)) |
 | `dtype` | `str \| None` | `"uint8"` (default) or `"float32"` (`[0, 1]`, NCHW-contiguous, preserves 10/12-bit source depth) |
-| `color_conversion` | `str \| None` | `"fast"` (libswscale default; default for `uint8`) or `"accurate"` (zimg: exact `float32`, round-to-nearest `uint8`; default for `float32`) |
+| `color_conversion` | `str \| None` | `"fast"` (libswscale default; default for `uint8`) or `"accurate"` (zimg: exact `float32`, round-to-nearest `uint8`, resizes after the RGB conversion; default for `float32` when FFmpeg has libzimg). Not supported with `device="cuda"` |
 
 ### `AudioStreamRequest`
 
@@ -397,6 +397,11 @@ provider-specific support — the URL is handed to FFmpeg's http protocol.
   primaries — are automatically tone-mapped
   (`zscale` → `tonemap=hable` → `zscale`) so the returned RGB tensors are
   sRGB/BT.709, consistent with SDR sources.
+- `float32` output is clamped to `[0, 1]`. zimg does not clip out-of-gamut
+  YUV, and tone-mapped HDR can exceed 1.0 (in either `color_conversion` mode).
+- `color_conversion="accurate"` converts with zimg and resizes after the
+  conversion to RGB. Odd-size 4:2:0/4:2:2 frames are upsampled to 4:4:4 first,
+  because zimg rejects them otherwise.
 
 ## Troubleshooting
 
@@ -414,6 +419,10 @@ provider-specific support — the URL is handed to FFmpeg's http protocol.
   supported (4:4:4 will not decode).
 - **HDR decode fails with a filter error** — your FFmpeg lacks the `zscale`
   filter (libzimg); use a build that includes it.
+- **`color_conversion="accurate"` needs FFmpeg's zscale filter** — same
+  cause: use an FFmpeg built with libzimg, or pass
+  `color_conversion="fast"`. Without libzimg, `float32` decodes fall back to
+  `"fast"` (swscale, scaled by 255/256) and log a warning.
 - **`s3://` works with AWS but not with your S3-compatible store** — check
   whether the store requires path-style addressing
   (`AVTENSOR_S3_FORCE_PATH_STYLE=1`) and that `AWS_ENDPOINT_URL_S3` is set.

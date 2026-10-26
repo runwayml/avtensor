@@ -276,6 +276,50 @@ pub fn generate_limited_range_luma_ramp(ten_bit: bool) -> Result<NamedTempFile, 
     Ok(file)
 }
 
+/// Generates a short lossless (FFV1) BT.709 limited-range video at any size
+/// and pixel format, including sizes that are not divisible by the chroma
+/// subsampling factor (e.g. 4:2:0 at 321x241).
+pub fn generate_bt709_ffv1_video(
+    width: usize,
+    height: usize,
+    pixel_format: &str,
+) -> Result<NamedTempFile, anyhow::Error> {
+    let file = NamedTempFile::with_suffix(".mkv")?;
+    run_ffmpeg(&[
+        "-f",
+        "lavfi",
+        "-i",
+        &format!("testsrc=s={width}x{height}:r=24:d=0.25"),
+        "-pix_fmt",
+        pixel_format,
+        "-c:v",
+        "ffv1",
+        "-colorspace",
+        "bt709",
+        "-color_range",
+        "tv",
+        file.path().to_str().context("temp path")?,
+    ])?;
+    Ok(file)
+}
+
+/// Generates a uniform 8-bit gray PNG (FFmpeg tags it `gbr`).
+pub fn generate_gray_png(level: u8) -> Result<NamedTempFile, anyhow::Error> {
+    let file = NamedTempFile::with_suffix(".png")?;
+    run_ffmpeg(&[
+        "-f",
+        "lavfi",
+        "-i",
+        &format!("color=c=0x{level:02x}{level:02x}{level:02x}:s=64x64"),
+        "-frames:v",
+        "1",
+        "-pix_fmt",
+        "gray",
+        file.path().to_str().context("temp path")?,
+    ])?;
+    Ok(file)
+}
+
 /// Generates a video with exactly `num_frames` frames at 24000/1001
 /// (23.976...) fps. `duration * frame_rate` for such streams lands just above
 /// the integer frame count, which historically produced a phantom trailing
