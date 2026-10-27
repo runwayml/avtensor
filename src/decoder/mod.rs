@@ -2465,6 +2465,23 @@ impl SourceColorInfo {
         let wide_gamut = matches!(self.color_primaries.as_deref(), Some("bt2020"));
         hdr_transfer || wide_gamut
     }
+
+    /// `setparams` options that tag HDR frames missing a matrix or primaries
+    /// tag as BT.2020 (NCL), the HDR standard. Without a matrix zimg cannot
+    /// linearize ("no path between colorspaces") and swscale guesses BT.601;
+    /// without primaries the conversion to BT.709 has nothing to convert from.
+    fn hdr_defaults(&self) -> Vec<&'static str> {
+        let mut defaults = Vec::new();
+        if self.is_hdr() {
+            if self.colorspace.is_none() {
+                defaults.push("colorspace=bt2020nc");
+            }
+            if self.color_primaries.is_none() {
+                defaults.push("color_primaries=bt2020");
+            }
+        }
+        defaults
+    }
 }
 
 /// How HDR/wide-gamut sources are handled during decode.
@@ -2669,6 +2686,10 @@ pub struct VideoFilterConfig {
 impl Display for VideoFilterConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let mut filters = Vec::new();
+        let hdr_defaults = self.source_color.hdr_defaults();
+        if !hdr_defaults.is_empty() {
+            filters.push(format!("setparams={}", hdr_defaults.join(":")));
+        }
         if let Some(frame_rate) = self.frame_rate {
             filters.push(format!("fps={}", frame_rate));
         }
@@ -2729,14 +2750,11 @@ impl Display for VideoFilterConfig {
                 filters.push(format!("format={yuv444}"));
             }
             // 1. Linearize the transfer function (npl=100 for HLG nominal
-            // peak luminance). zimg needs the YUV matrix; HDR without a
-            // matrix tag is BT.2020 non-constant luminance in practice.
+            // peak luminance). Untagged matrix/primaries were set by the
+            // `setparams` above.
             let mut linearize = "zscale=t=linear:npl=100".to_string();
             if accurate {
                 linearize.push_str(&format!(":f=bicubic{}", zscale_size()));
-            }
-            if self.source_color.colorspace.is_none() {
-                linearize.push_str(":min=2020_ncl");
             }
             filters.push(linearize);
             // 2. Convert to float for precision during tone mapping
@@ -2766,7 +2784,10 @@ impl Display for VideoFilterConfig {
             if !tonemap {
                 zscale.push_str(&zscale_size());
             }
-            if !tonemap && (self.source_color.colorspace.is_none() || source.gray) {
+            // (`min` overrides frame tags, so it must not undo the HDR
+            // default set by `setparams`.)
+            let untagged = self.source_color.colorspace.is_none() && !self.source_color.is_hdr();
+            if !tonemap && (untagged || source.gray) {
                 zscale.push_str(":min=170m");
             }
             filters.push(zscale);
@@ -3323,7 +3344,7 @@ mod tests {
         mel::{create_mel_spectrogram, MelSpectrogramConfig},
         test_utils::{
             generate_bt709_ffv1_video, generate_gray_png, generate_limited_range_luma_ramp,
-            generate_pq_hevc_video, generate_test_video_file, init_logger, ChannelLayout,
+            generate_pq_ffv1_video, generate_test_video_file, init_logger, ChannelLayout,
             TestVideoParameters,
         },
     };
@@ -4093,6 +4114,18 @@ mod tests {
     )]
     #[test_case(
         VideoFilterConfig {
+            source_color: SourceColorInfo {
+                color_trc: Some("smpte2084".to_string()),
+                ..Default::default()
+            },
+            hdr_mode: HdrMode::Raw,
+            ..Default::default()
+        },
+        "setparams=colorspace=bt2020nc:color_primaries=bt2020,format=pix_fmts=rgb24";
+        "untagged PQ source with raw hdr_mode is tagged BT.2020"
+    )]
+    #[test_case(
+        VideoFilterConfig {
             frame_rate: Some(24.0),
             width: Some(1920),
             height: Some(1080),
@@ -4107,7 +4140,7 @@ mod tests {
             color_conversion: ColorConversion::Fast,
             source_format: SourceFormat::default(),
         },
-        "fps=24,scale=width=1920:height=1080,zscale=t=linear:npl=100:min=2020_ncl,format=gbrpf32le,tonemap=hable:desat=0,zscale=p=bt709:t=bt709:m=bt709:range=tv,format=pix_fmts=rgb24";
+        "setparams=colorspace=bt2020nc,fps=24,scale=width=1920:height=1080,zscale=t=linear:npl=100,format=gbrpf32le,tonemap=hable:desat=0,zscale=p=bt709:t=bt709:m=bt709:range=tv,format=pix_fmts=rgb24";
         "HDR with fps and scale options"
     )]
     #[test_case(
@@ -4190,7 +4223,7 @@ mod tests {
             },
             ..Default::default()
         },
-        "zscale=t=linear:npl=100:f=bicubic:w=853:h=480:min=2020_ncl,format=gbrpf32le,tonemap=hable:desat=0,zscale=p=bt709:t=bt709:m=bt709:range=tv,zscale=f=bicubic,format=gbrp,format=pix_fmts=rgb24";
+        "setparams=colorspace=bt2020nc,zscale=t=linear:npl=100:f=bicubic:w=853:h=480,format=gbrpf32le,tonemap=hable:desat=0,zscale=p=bt709:t=bt709:m=bt709:range=tv,zscale=f=bicubic,format=gbrp,format=pix_fmts=rgb24";
         "accurate conversion of a tone-mapped source resizes in the linearizing zscale"
     )]
     #[test_case(
@@ -4225,7 +4258,7 @@ mod tests {
             },
             ..Default::default()
         },
-        "zscale=t=linear:npl=100:f=bicubic:min=2020_ncl,format=gbrpf32le,tonemap=hable:desat=0,zscale=p=bt709:t=bt709:m=bt709:range=tv,zscale=f=bicubic,format=gbrp,format=pix_fmts=rgb24";
+        "setparams=colorspace=bt2020nc,zscale=t=linear:npl=100:f=bicubic,format=gbrpf32le,tonemap=hable:desat=0,zscale=p=bt709:t=bt709:m=bt709:range=tv,zscale=f=bicubic,format=gbrp,format=pix_fmts=rgb24";
         "accurate conversion after tone mapping"
     )]
     fn test_video_filter_display(filter: VideoFilterConfig, expected: &str) {
@@ -5358,39 +5391,76 @@ mod tests {
         Ok(())
     }
 
-    /// HDR sources resized to sizes that are not divisible by the chroma
-    /// subsampling (853x480, 427x241) must tone map in both modes, and
-    /// a PQ/BT.2020 source without a matrix tag must decode as BT.2020 NCL.
-    #[test_case(640, 360, Some("bt2020nc"), Some((853, 480)), None; "resized 853x480 default")]
-    #[test_case(640, 360, Some("bt2020nc"), Some((853, 480)), Some(ColorConversion::Fast); "resized 853x480 fast")]
-    #[test_case(640, 360, Some("bt2020nc"), Some((427, 241)), None; "resized 427x241 default")]
-    #[test_case(640, 360, Some("bt2020nc"), Some((427, 241)), Some(ColorConversion::Fast); "resized 427x241 fast")]
-    #[test_case(640, 360, None, None, None; "untagged matrix default")]
-    #[test_case(640, 360, None, None, Some(ColorConversion::Fast); "untagged matrix fast")]
-    fn test_hdr_odd_sizes_and_untagged_matrix(
+    /// HDR sources whose size (native, or after the resize) is not
+    /// divisible by the chroma subsampling must tone map in both modes.
+    #[test_case(640, 360, Some((853, 480)), None; "resized 853x480 default")]
+    #[test_case(640, 360, Some((853, 480)), Some(ColorConversion::Fast); "resized 853x480 fast")]
+    #[test_case(640, 360, Some((427, 241)), None; "resized 427x241 default")]
+    #[test_case(640, 360, Some((427, 241)), Some(ColorConversion::Fast); "resized 427x241 fast")]
+    #[test_case(321, 241, None, None; "odd native default")]
+    #[test_case(321, 241, None, Some(ColorConversion::Fast); "odd native fast")]
+    #[test_case(321, 241, Some((160, 120)), None; "odd source resized default")]
+    fn test_hdr_odd_sizes(
         width: usize,
         height: usize,
-        colorspace: Option<&str>,
         size: Option<(u32, u32)>,
         color_conversion: Option<ColorConversion>,
     ) -> anyhow::Result<()> {
         init_logger();
-        let test_video = generate_pq_hevc_video(width, height, colorspace)?;
-        let path = test_video.path().to_str().unwrap();
-        let float = decode_float_sized(path, size, color_conversion)?;
+        let test_video = generate_pq_ffv1_video(width, height, true, true)?;
+        let float =
+            decode_float_sized(test_video.path().to_str().unwrap(), size, color_conversion)?;
         let (w, h) = size.unwrap_or((width as u32, height as u32));
         assert_eq!(&float.size()[1..], &[3, h as i64, w as i64]);
-        // Untagged must match the explicitly tagged BT.2020 NCL decode.
-        if colorspace.is_none() {
-            let tagged = generate_pq_hevc_video(width, height, Some("bt2020nc"))?;
-            let reference =
-                decode_float_sized(tagged.path().to_str().unwrap(), size, color_conversion)?;
-            let max_diff: f64 = float.f_sub(&reference)?.abs().max().try_into()?;
-            assert!(
-                max_diff < 1e-6,
-                "untagged differs from bt2020nc by {max_diff}"
-            );
-        }
+        Ok(())
+    }
+
+    /// A PQ stream missing its matrix and/or primaries tag must decode as
+    /// BT.2020 (NCL), the same as the fully tagged stream, in both
+    /// conversion modes and in both HDR modes.
+    #[test_case(false, true, HdrMode::Tonemap, None; "no matrix tonemap default")]
+    #[test_case(false, true, HdrMode::Tonemap, Some(ColorConversion::Fast); "no matrix tonemap fast")]
+    #[test_case(false, false, HdrMode::Tonemap, None; "transfer only tonemap default")]
+    #[test_case(false, false, HdrMode::Tonemap, Some(ColorConversion::Fast); "transfer only tonemap fast")]
+    #[test_case(false, true, HdrMode::Raw, None; "no matrix raw default")]
+    #[test_case(false, true, HdrMode::Raw, Some(ColorConversion::Fast); "no matrix raw fast")]
+    fn test_hdr_untagged_defaults_to_bt2020(
+        tag_matrix: bool,
+        tag_primaries: bool,
+        hdr_mode: HdrMode,
+        color_conversion: Option<ColorConversion>,
+    ) -> anyhow::Result<()> {
+        init_logger();
+        let decode = |path: &str| -> anyhow::Result<tch::Tensor> {
+            let mut streams = decode_media(
+                MediaDecodeRequest {
+                    source: MediaSource::Uri(path.to_string()),
+                    start_time: None,
+                    end_time: None,
+                    video_stream: Some(VideoStreamRequest {
+                        dtype: OutputDtype::Float32,
+                        hdr_mode,
+                        color_conversion,
+                        ..Default::default()
+                    }),
+                    audio_streams: None,
+                },
+                None,
+            )?;
+            streams
+                .remove(0)
+                .data
+                .context("video stream should have data")
+        };
+        let untagged = generate_pq_ffv1_video(64, 48, tag_matrix, tag_primaries)?;
+        let tagged = generate_pq_ffv1_video(64, 48, true, true)?;
+        let output = decode(untagged.path().to_str().unwrap())?;
+        let reference = decode(tagged.path().to_str().unwrap())?;
+        let max_diff: f64 = output.f_sub(&reference)?.abs().max().try_into()?;
+        assert!(
+            max_diff < 1e-6,
+            "untagged differs from bt2020 by {max_diff}"
+        );
         Ok(())
     }
 

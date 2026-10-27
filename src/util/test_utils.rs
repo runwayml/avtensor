@@ -303,33 +303,32 @@ pub fn generate_bt709_ffv1_video(
     Ok(file)
 }
 
-/// Generates a short 10-bit 4:2:0 PQ / BT.2020 HEVC video at any even size,
-/// with the matrix tagged as `colorspace` (or left untagged). The tags are
-/// written into the bitstream VUI, which FFV1/Matroska would drop.
-pub fn generate_pq_hevc_video(
+/// Generates a short lossless (FFV1) 10-bit 4:2:0 PQ video at any size
+/// (odd sizes included). The transfer is always tagged PQ; the matrix and
+/// primaries are tagged BT.2020 only when requested, to exercise untagged
+/// HDR. The tags are set on the frames with `setparams`, because Matroska
+/// does not keep FFmpeg's `-color_*` output options for FFV1.
+pub fn generate_pq_ffv1_video(
     width: usize,
     height: usize,
-    colorspace: Option<&str>,
+    tag_matrix: bool,
+    tag_primaries: bool,
 ) -> Result<NamedTempFile, anyhow::Error> {
-    let file = NamedTempFile::with_suffix(".mp4")?;
+    let file = NamedTempFile::with_suffix(".mkv")?;
+    // `testsrc` (unlike `testsrc2`) keeps odd sizes through the 4:2:0
+    // conversion.
     let source = format!("testsrc=s={width}x{height}:r=24:d=0.25");
-    let mut x265 = "log-level=none:colorprim=bt2020:transfer=smpte2084".to_string();
-    if let Some(colorspace) = colorspace {
-        x265.push_str(&format!(":colormatrix={colorspace}"));
+    let mut params = vec!["color_trc=smpte2084", "range=tv"];
+    if tag_matrix {
+        params.push("colorspace=bt2020nc");
     }
+    if tag_primaries {
+        params.push("color_primaries=bt2020");
+    }
+    let filter = format!("format=yuv420p10le,setparams={}", params.join(":"));
     let path = file.path().to_str().context("temp path")?.to_string();
     run_ffmpeg(&[
-        "-f",
-        "lavfi",
-        "-i",
-        &source,
-        "-pix_fmt",
-        "yuv420p10le",
-        "-c:v",
-        "libx265",
-        "-x265-params",
-        &x265,
-        &path,
+        "-f", "lavfi", "-i", &source, "-vf", &filter, "-c:v", "ffv1", &path,
     ])?;
     Ok(file)
 }
