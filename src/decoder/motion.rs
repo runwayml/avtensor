@@ -556,7 +556,10 @@ fn plane_strides(frame: &AVFrame, layout: &Layout) -> Result<[usize; 3], anyhow:
 }
 
 /// Borrows the three planes of a planar 8-bit YUV `frame`.
-fn frame_planes<'f>(frame: &'f AVFrame, layout: &Layout) -> Result<[Plane<'f>; 3], anyhow::Error> {
+pub(crate) fn frame_planes<'f>(
+    frame: &'f AVFrame,
+    layout: &Layout,
+) -> Result<[Plane<'f>; 3], anyhow::Error> {
     let strides = plane_strides(frame, layout)?;
     Ok([0, 1, 2].map(|i| {
         let (rows, width) = plane_size(layout, i);
@@ -574,7 +577,7 @@ fn frame_planes<'f>(frame: &'f AVFrame, layout: &Layout) -> Result<[Plane<'f>; 3
 
 /// Mutably borrows the three planes of a planar 8-bit YUV `frame`. Fails
 /// unless the frame's buffers are writable (not shared with another frame).
-fn frame_planes_mut<'f>(
+pub(crate) fn frame_planes_mut<'f>(
     frame: &'f mut AVFrame,
     layout: &Layout,
 ) -> Result<[PlaneMut<'f>; 3], anyhow::Error> {

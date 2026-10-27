@@ -25,6 +25,9 @@ use crate::conversion;
 mod cuda;
 mod io;
 mod motion;
+mod pairwise;
+
+pub use pairwise::interpolate_rgb_pair;
 
 struct StreamContext {
     stream_type: StreamType,

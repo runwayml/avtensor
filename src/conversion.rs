@@ -138,7 +138,6 @@ pub fn convert_gbrpf32_frame_to_tensor(
 ///
 /// Arguments:
 /// * `tensor`: A 3D [H, W, C] Tensor containing a single frame.
-#[allow(dead_code)]
 pub fn convert_rgb24_tensor_to_avframe(tensor: &tch::Tensor) -> Result<AVFrame, anyhow::Error> {
     if tensor.kind() != tch::Kind::Uint8 {
         return Err(anyhow::anyhow!(

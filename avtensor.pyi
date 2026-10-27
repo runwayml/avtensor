@@ -226,3 +226,18 @@ def plan_asset(
     decoding: same stream selection, duration, seek window, fps and size
     handling."""
     ...
+
+def interpolate_frames(
+    prev: torch.Tensor, next: torch.Tensor, alphas: list[float]
+) -> torch.Tensor:
+    """Frames at phases ``alphas`` (each strictly between 0 and 1; 0 = prev,
+    1 = next) between two RGB frames, by the motion-compensated
+    interpolation behind ``VideoStreamRequest(fps_conversion="motion")``.
+
+    ``prev`` / ``next``: uint8 CPU tensors of one shape, ``[3, H, W]`` or
+    ``[H, W, 3]``. Returns uint8 ``[len(alphas), 3, H, W]``. Motion is
+    estimated once per pair. Frames pass through BT.709 limited-range
+    yuv444p and back, so only rounding is lost; frames that need no
+    interpolation (a phase of exactly 0 or 1) should be taken from the
+    inputs directly rather than passed here."""
+    ...

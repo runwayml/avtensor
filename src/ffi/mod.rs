@@ -10,7 +10,7 @@ use pyo3_log::Logger;
 use rsmpeg::ffi::{self, av_log_set_level};
 pub use tensor::PyTensor;
 
-use crate::decoder::{self, decode_media, DecodedStream, Frame};
+use crate::decoder::{self, decode_media, interpolate_rgb_pair, DecodedStream, Frame};
 
 /// Different stream types that can be decoded.
 #[pyclass(eq, eq_int)]
@@ -908,6 +908,25 @@ fn decode_asset(
     })
 }
 
+/// Frames at phases `alphas` between two RGB frames (uint8 CPU tensors of
+/// one shape, `[3, H, W]` or `[H, W, 3]`), by the motion-compensated
+/// interpolation of `fps_conversion="motion"`; returns uint8 `[N, 3, H, W]`.
+#[pyfunction]
+#[pyo3(signature = (prev, next, alphas))]
+fn interpolate_frames(
+    py: Python<'_>,
+    prev: PyTensor,
+    next: PyTensor,
+    alphas: Vec<f64>,
+) -> PyResult<PyTensor> {
+    let (prev, next) = (prev.0, next.0);
+    // Release the GIL: the work is pure CPU on tensors we own references to.
+    let out = py
+        .allow_threads(move || interpolate_rgb_pair(&prev, &next, &alphas))
+        .map_err(|e| PyValueError::new_err(format!("Failed to interpolate frames: {:?}", e)))?;
+    Ok(PyTensor(out))
+}
+
 /// A Python module implemented in Rust.
 #[pymodule]
 fn avtensor(m: &Bound<'_, PyModule>) -> PyResult<()> {
@@ -931,6 +950,7 @@ fn avtensor(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(probe_asset, m)?)?;
     m.add_function(wrap_pyfunction!(plan_asset, m)?)?;
     m.add_function(wrap_pyfunction!(decode_asset, m)?)?;
+    m.add_function(wrap_pyfunction!(interpolate_frames, m)?)?;
 
     // Configure FFmpeg to only log error messages to stderr
     // to avoid unwanted output when this is being used from Python.
