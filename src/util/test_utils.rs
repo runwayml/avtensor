@@ -303,6 +303,37 @@ pub fn generate_bt709_ffv1_video(
     Ok(file)
 }
 
+/// Generates a short 10-bit 4:2:0 PQ / BT.2020 HEVC video at any even size,
+/// with the matrix tagged as `colorspace` (or left untagged). The tags are
+/// written into the bitstream VUI, which FFV1/Matroska would drop.
+pub fn generate_pq_hevc_video(
+    width: usize,
+    height: usize,
+    colorspace: Option<&str>,
+) -> Result<NamedTempFile, anyhow::Error> {
+    let file = NamedTempFile::with_suffix(".mp4")?;
+    let source = format!("testsrc=s={width}x{height}:r=24:d=0.25");
+    let mut x265 = "log-level=none:colorprim=bt2020:transfer=smpte2084".to_string();
+    if let Some(colorspace) = colorspace {
+        x265.push_str(&format!(":colormatrix={colorspace}"));
+    }
+    let path = file.path().to_str().context("temp path")?.to_string();
+    run_ffmpeg(&[
+        "-f",
+        "lavfi",
+        "-i",
+        &source,
+        "-pix_fmt",
+        "yuv420p10le",
+        "-c:v",
+        "libx265",
+        "-x265-params",
+        &x265,
+        &path,
+    ])?;
+    Ok(file)
+}
+
 /// Generates a uniform 8-bit gray PNG (FFmpeg tags it `gbr`).
 pub fn generate_gray_png(level: u8) -> Result<NamedTempFile, anyhow::Error> {
     let file = NamedTempFile::with_suffix(".png")?;

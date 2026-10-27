@@ -311,7 +311,7 @@ All attributes default to `None`, meaning "keep the source value".
 | attribute | type | meaning |
 | --- | --- | --- |
 | `index` | `int \| None` | select a specific video stream |
-| `width`, `height` | `int \| None` | rescale output frames |
+| `width`, `height` | `int \| None` | rescale output frames (a lone `width` or `height` keeps the source aspect ratio) |
 | `fps` | `float \| None` | resample to this frame rate |
 | `number_of_threads` | `int \| None` | FFmpeg decoder threads (default: 1; `0` = FFmpeg auto) |
 | `hardware_acceleration` | `bool \| None` | decode on the GPU's NVDEC engine (see [GPU-accelerated decoding](#gpu-accelerated-decoding-nvdec)) |
@@ -396,7 +396,8 @@ provider-specific support — the URL is handed to FFmpeg's http protocol.
 - HDR sources — HLG (`arib-std-b67`) or PQ (`smpte2084`) transfer or BT.2020
   primaries — are automatically tone-mapped
   (`zscale` → `tonemap=hable` → `zscale`) so the returned RGB tensors are
-  sRGB/BT.709, consistent with SDR sources.
+  sRGB/BT.709, consistent with SDR sources. HDR streams with no matrix tag
+  are decoded as BT.2020 non-constant luminance.
 - `float32` output is clamped to `[0, 1]`. zimg does not clip out-of-gamut
   YUV, and tone-mapped HDR can exceed 1.0 (in either `color_conversion` mode).
 - `color_conversion="accurate"` converts with zimg and resizes after the
