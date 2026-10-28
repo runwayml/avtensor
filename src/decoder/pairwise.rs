@@ -53,6 +53,9 @@ fn rgb_geometry(t: &tch::Tensor, what: &str) -> Result<(i64, i64, [i64; 3]), any
         bail!("{what}: expected a CPU tensor, got {:?}", t.device());
     }
     let (shape, st) = (t.size(), t.stride());
+    if st.iter().any(|&s| s < 0) {
+        bail!("{what}: expected non-negative strides, got {st:?}");
+    }
     match shape.as_slice() {
         [3, h, w] => Ok((*h, *w, [st[0], st[1], st[2]])),
         [h, w, 3] => Ok((*h, *w, [st[2], st[0], st[1]])),
@@ -60,31 +63,87 @@ fn rgb_geometry(t: &tch::Tensor, what: &str) -> Result<(i64, i64, [i64; 3]), any
     }
 }
 
+/// Checks that `frame` is a non-empty `rgb24` frame with a non-null plane
+/// whose `linesize` covers a row, and returns `(byte span, stride)` of that
+/// plane: FFmpeg allocates video frame buffers for at least the full height,
+/// so the plane spans at least `stride * (height - 1) + 3 * width` bytes.
+fn rgb24_span(frame: &AVFrame) -> Result<(usize, usize), anyhow::Error> {
+    let (width, height, linesize) = (frame.width, frame.height, frame.linesize[0]);
+    if frame.format != ffi::AV_PIX_FMT_RGB24
+        || width <= 0
+        || height <= 0
+        || frame.data[0].is_null()
+        || linesize < 0
+        || (linesize as usize) < 3 * width as usize
+    {
+        bail!("Unexpected rgb24 frame layout: {frame:?}");
+    }
+    let (width, height, stride) = (width as usize, height as usize, linesize as usize);
+    Ok((stride * (height - 1) + 3 * width, stride))
+}
+
+/// Borrows the pixel plane of an `rgb24` `frame` as `(bytes, stride)`.
+fn rgb24_plane(frame: &AVFrame) -> Result<(&[u8], usize), anyhow::Error> {
+    let (len, stride) = rgb24_span(frame)?;
+    // SAFETY: `rgb24_span` checked that the plane is non-null and spans at
+    // least `len` initialized bytes. The slice borrows `frame`, which holds
+    // a reference to the buffer for its lifetime.
+    let data = unsafe { std::slice::from_raw_parts(frame.data[0], len) };
+    Ok((data, stride))
+}
+
+/// Mutably borrows the pixel plane of a writable `rgb24` `frame` as
+/// `(bytes, stride)`.
+fn rgb24_plane_mut(frame: &mut AVFrame) -> Result<(&mut [u8], usize), anyhow::Error> {
+    let (len, stride) = rgb24_span(frame)?;
+    if !frame.is_writable().context("Checking frame writability")? {
+        bail!("rgb24 frame is not writable");
+    }
+    let ptr = frame.data[0];
+    // SAFETY: as in `rgb24_plane`, the plane spans at least `len` bytes. The
+    // frame is writable, so no other frame references its buffer, and the
+    // slice borrows `frame` mutably for its lifetime.
+    let data = unsafe { std::slice::from_raw_parts_mut(ptr, len) };
+    Ok((data, stride))
+}
+
 /// `t` (see [`rgb_geometry`]) as an RGB24 frame, gathered through the
 /// tensor's strides (any layout, contiguous or not) with no torch op.
 fn tensor_to_rgb24(t: &tch::Tensor, what: &str) -> Result<AVFrame, anyhow::Error> {
     let (height, width, [sc, sh, sw]) = rgb_geometry(t, what)?;
+    if height <= 0 || width <= 0 {
+        bail!("{what}: expected a non-empty frame, got {:?}", t.size());
+    }
+    let (height, width) = (height as usize, width as usize);
+    let (sc, sh, sw) = (sc as usize, sh as usize, sw as usize);
+    // The largest element offset addressed by any (c, y, x) in range, plus
+    // one: the extent of `t`'s storage the copy reads.
+    let extent = 2 * sc + (height - 1) * sh + (width - 1) * sw + 1;
+    // SAFETY: `rgb_geometry` checked the dtype (one byte per element), the
+    // device and that the strides are non-negative, so the first `extent`
+    // bytes from the data pointer are elements of `t`, which stays alive
+    // (and is only read) for the call.
+    let src = unsafe { std::slice::from_raw_parts(t.data_ptr() as *const u8, extent) };
+
     let mut frame = AVFrame::new();
     frame.set_format(ffi::AV_PIX_FMT_RGB24);
     frame.set_width(i32::try_from(width).context("width")?);
     frame.set_height(i32::try_from(height).context("height")?);
     frame.alloc_buffer().context("Allocating an rgb24 frame")?;
-    let src = t.data_ptr() as *const u8;
-    let linesize = frame.linesize[0] as usize;
+    let (dst, stride) = rgb24_plane_mut(&mut frame)?;
     for y in 0..height {
-        // SAFETY: `rgb_geometry` checked the shape and dtype; for every
-        // (c, y, x) in range the offset `c*sc + y*sh + x*sw` addresses an
-        // element of `t`, which stays alive for the call. The destination row
-        // has `linesize >= 3 * width` bytes (FFmpeg's allocation).
-        unsafe {
-            let dst_row = frame.data[0].add(y as usize * linesize);
-            for x in 0..width {
-                let base = src.offset((y * sh + x * sw) as isize);
-                let dst = dst_row.add(3 * x as usize);
-                *dst = *base;
-                *dst.add(1) = *base.offset(sc as isize);
-                *dst.add(2) = *base.offset(2 * sc as isize);
-            }
+        let row = &mut dst[y * stride..y * stride + 3 * width];
+        let src_row = y * sh;
+        if (sc, sw) == (1, 3) {
+            // Interleaved [H, W, 3] input: the row is already rgb24.
+            row.copy_from_slice(&src[src_row..src_row + 3 * width]);
+            continue;
+        }
+        for (x, px) in row.as_chunks_mut::<3>().0.iter_mut().enumerate() {
+            let base = src_row + x * sw;
+            px[0] = src[base];
+            px[1] = src[base + sc];
+            px[2] = src[base + 2 * sc];
         }
     }
     Ok(frame)
@@ -92,26 +151,41 @@ fn tensor_to_rgb24(t: &tch::Tensor, what: &str) -> Result<AVFrame, anyhow::Error
 
 /// Writes an RGB24 frame into `out[i]` of a contiguous `uint8` `[N, 3, H, W]`
 /// tensor, de-interleaving into the three channel planes with no torch op.
-fn rgb24_into_chw(frame: &AVFrame, out: &tch::Tensor, i: i64) {
+fn rgb24_into_chw(frame: &AVFrame, out: &mut tch::Tensor, i: usize) -> Result<(), anyhow::Error> {
+    let (src, stride) = rgb24_plane(frame)?;
     let (height, width) = (frame.height as usize, frame.width as usize);
+    let n = out.size().first().copied().unwrap_or(0);
+    if out.kind() != tch::Kind::Uint8
+        || out.device() != tch::Device::Cpu
+        || !out.is_contiguous()
+        || out.size() != [n, 3, height as i64, width as i64]
+        || i64::try_from(i).map_or(true, |i| i >= n)
+    {
+        bail!(
+            "Expected a contiguous uint8 [N > {i}, 3, {height}, {width}] CPU output, got {:?} {:?}",
+            out.kind(),
+            out.size()
+        );
+    }
     let plane = height * width;
-    let linesize = frame.linesize[0] as usize;
-    // SAFETY: `out` is the contiguous [N, 3, H, W] uint8 tensor allocated
-    // by the caller with N > i, so frame `i` is `3 * plane` bytes at offset
-    // `i * 3 * plane`; the source rows hold `3 * width` bytes each.
-    unsafe {
-        let dst = (out.data_ptr() as *mut u8).add(i as usize * 3 * plane);
-        for y in 0..height {
-            let src_row = frame.data[0].add(y * linesize);
-            let row = y * width;
-            for x in 0..width {
-                let s = src_row.add(3 * x);
-                *dst.add(row + x) = *s;
-                *dst.add(plane + row + x) = *s.add(1);
-                *dst.add(2 * plane + row + x) = *s.add(2);
-            }
+    // SAFETY: `out` is a contiguous uint8 CPU tensor of `n * 3 * plane`
+    // elements (checked above), borrowed mutably for the call, so nothing
+    // else reads or writes it while the slice lives.
+    let dst = unsafe {
+        std::slice::from_raw_parts_mut(out.data_ptr() as *mut u8, n as usize * 3 * plane)
+    };
+    let (r, gb) = dst[i * 3 * plane..(i + 1) * 3 * plane].split_at_mut(plane);
+    let (g, b) = gb.split_at_mut(plane);
+    for y in 0..height {
+        let src_row = &src[y * stride..y * stride + 3 * width];
+        let row = y * width;
+        for (x, px) in src_row.as_chunks::<3>().0.iter().enumerate() {
+            r[row + x] = px[0];
+            g[row + x] = px[1];
+            b[row + x] = px[2];
         }
     }
+    Ok(())
 }
 
 /// A BT.709 limited-range `rgb24 <-> yuv444p` converter of one frame size.
@@ -218,7 +292,7 @@ pub fn interpolate_rgb_pair(
             next.size()
         );
     }
-    let out = tch::Tensor::empty(
+    let mut out = tch::Tensor::empty(
         [phases.len() as i64, 3, height, width],
         (tch::Kind::Uint8, tch::Device::Cpu),
     );
@@ -248,7 +322,7 @@ pub fn interpolate_rgb_pair(
             alpha,
             super::motion::frame_planes_mut(&mut yuv, &layout)?,
         );
-        rgb24_into_chw(&conv.yuv_to_rgb(&yuv)?, &out, i as i64);
+        rgb24_into_chw(&conv.yuv_to_rgb(&yuv)?, &mut out, i)?;
     }
     Ok(out)
 }
@@ -363,10 +437,10 @@ mod tests {
         assert!(base.equal(&narrowed));
         // The reader itself against explicit indexing.
         let frame = tensor_to_rgb24(&p_hwc, "prev").unwrap();
-        let ls = frame.linesize[0] as usize;
+        let (plane, ls) = rgb24_plane(&frame).unwrap();
         for &(y, x, c) in &[(0i64, 0i64, 0i64), (5, 7, 1), (h - 1, w - 1, 2), (3, 20, 0)] {
             let want = prev.int64_value(&[c, y, x]) as u8;
-            let got = unsafe { *frame.data[0].add(y as usize * ls + 3 * x as usize + c as usize) };
+            let got = plane[y as usize * ls + 3 * x as usize + c as usize];
             assert_eq!(got, want, "({c},{y},{x})");
         }
     }
