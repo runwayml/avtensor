@@ -18,14 +18,23 @@
 //! that goes through unchanged (`alpha` snapped to 0 or 1 by the caller) is
 //! not routed through here, so the round trip only ever touches synthesized
 //! frames.
+//!
+//! Threads: no torch op runs on the pixel data. The input is read through
+//! its strides straight into an RGB24 frame and the synthesized frames are
+//! written row by row into the output tensor, so the call does not wake
+//! torch's intra-op pool (whose workers would otherwise busy-wait through
+//! the serial swscale / interpolator work: ~10x the CPU for the same wall
+//! time, measured at 480x854). The only torch call is the output allocation.
 
 use anyhow::{anyhow, bail, Context};
 use rsmpeg::{avutil::AVFrame, ffi, swscale::SwsContext};
 
 use super::motion::{Interpolator, Layout, PaddedFrame, ALPHA_ONE};
-use crate::conversion::{convert_rgb24_frame_to_tensor, convert_rgb24_tensor_to_avframe};
 
-/// `alpha` in `(0, 1)` as the interpolator's phase (`1..ALPHA_ONE`).
+/// `alpha` in `(0, 1)` as the interpolator's phase (`1..ALPHA_ONE`): the
+/// phase is quantised to `1 / ALPHA_ONE` (1/256) and clamped to the open
+/// interval, so `1e-4` becomes 1/256 and anything at or above 255/256
+/// becomes 255/256.
 fn phase(alpha: f64) -> Result<u32, anyhow::Error> {
     if !(alpha > 0.0 && alpha < 1.0) || !alpha.is_finite() {
         bail!("alpha must be strictly between 0 and 1, got {alpha}");
@@ -33,22 +42,76 @@ fn phase(alpha: f64) -> Result<u32, anyhow::Error> {
     Ok(((alpha * ALPHA_ONE as f64).round() as u32).clamp(1, ALPHA_ONE - 1))
 }
 
-/// An RGB frame tensor (`uint8`, `[3, H, W]` or `[H, W, 3]`, CPU) as a
-/// contiguous `[H, W, 3]` tensor.
-fn as_hwc(t: &tch::Tensor, what: &str) -> Result<tch::Tensor, anyhow::Error> {
+/// The geometry of a `uint8` CPU RGB frame tensor, `[3, H, W]` or
+/// `[H, W, 3]`, read through its strides: `(height, width, [stride_c,
+/// stride_h, stride_w])` in elements.
+fn rgb_geometry(t: &tch::Tensor, what: &str) -> Result<(i64, i64, [i64; 3]), anyhow::Error> {
     if t.kind() != tch::Kind::Uint8 {
         bail!("{what}: expected a uint8 tensor, got {:?}", t.kind());
     }
     if t.device() != tch::Device::Cpu {
         bail!("{what}: expected a CPU tensor, got {:?}", t.device());
     }
-    let shape = t.size();
-    let hwc = match shape.as_slice() {
-        [3, _, _] => t.permute([1, 2, 0]),
-        [_, _, 3] => t.shallow_clone(),
+    let (shape, st) = (t.size(), t.stride());
+    match shape.as_slice() {
+        [3, h, w] => Ok((*h, *w, [st[0], st[1], st[2]])),
+        [h, w, 3] => Ok((*h, *w, [st[2], st[0], st[1]])),
         _ => bail!("{what}: expected shape [3, H, W] or [H, W, 3], got {shape:?}"),
-    };
-    Ok(hwc.contiguous())
+    }
+}
+
+/// `t` (see [`rgb_geometry`]) as an RGB24 frame, gathered through the
+/// tensor's strides (any layout, contiguous or not) with no torch op.
+fn tensor_to_rgb24(t: &tch::Tensor, what: &str) -> Result<AVFrame, anyhow::Error> {
+    let (height, width, [sc, sh, sw]) = rgb_geometry(t, what)?;
+    let mut frame = AVFrame::new();
+    frame.set_format(ffi::AV_PIX_FMT_RGB24);
+    frame.set_width(i32::try_from(width).context("width")?);
+    frame.set_height(i32::try_from(height).context("height")?);
+    frame.alloc_buffer().context("Allocating an rgb24 frame")?;
+    let src = t.data_ptr() as *const u8;
+    let linesize = frame.linesize[0] as usize;
+    for y in 0..height {
+        // SAFETY: `rgb_geometry` checked the shape and dtype; for every
+        // (c, y, x) in range the offset `c*sc + y*sh + x*sw` addresses an
+        // element of `t`, which stays alive for the call. The destination row
+        // has `linesize >= 3 * width` bytes (FFmpeg's allocation).
+        unsafe {
+            let dst_row = frame.data[0].add(y as usize * linesize);
+            for x in 0..width {
+                let base = src.offset((y * sh + x * sw) as isize);
+                let dst = dst_row.add(3 * x as usize);
+                *dst = *base;
+                *dst.add(1) = *base.offset(sc as isize);
+                *dst.add(2) = *base.offset(2 * sc as isize);
+            }
+        }
+    }
+    Ok(frame)
+}
+
+/// Writes an RGB24 frame into `out[i]` of a contiguous `uint8` `[N, 3, H, W]`
+/// tensor, de-interleaving into the three channel planes with no torch op.
+fn rgb24_into_chw(frame: &AVFrame, out: &tch::Tensor, i: i64) {
+    let (height, width) = (frame.height as usize, frame.width as usize);
+    let plane = height * width;
+    let linesize = frame.linesize[0] as usize;
+    // SAFETY: `out` is the contiguous [N, 3, H, W] uint8 tensor allocated
+    // by the caller with N > i, so frame `i` is `3 * plane` bytes at offset
+    // `i * 3 * plane`; the source rows hold `3 * width` bytes each.
+    unsafe {
+        let dst = (out.data_ptr() as *mut u8).add(i as usize * 3 * plane);
+        for y in 0..height {
+            let src_row = frame.data[0].add(y * linesize);
+            let row = y * width;
+            for x in 0..width {
+                let s = src_row.add(3 * x);
+                *dst.add(row + x) = *s;
+                *dst.add(plane + row + x) = *s.add(1);
+                *dst.add(2 * plane + row + x) = *s.add(2);
+            }
+        }
+    }
 }
 
 /// A BT.709 limited-range `rgb24 <-> yuv444p` converter of one frame size.
@@ -132,8 +195,11 @@ impl Yuv444Converter {
 /// 1 = `next`) between two RGB frames, by motion-compensated interpolation.
 ///
 /// `prev` / `next`: `uint8` CPU tensors of the same shape, `[3, H, W]` or
-/// `[H, W, 3]`. Returns `uint8` `[len(alphas), 3, H, W]`. Motion is
-/// estimated once for the pair; each phase is one compensation pass.
+/// `[H, W, 3]`, any strides. Returns `uint8` `[len(alphas), 3, H, W]`.
+/// Motion is estimated once for the pair; each phase is one compensation
+/// pass. Phases are quantised to 1/256 (see [`phase`]). No torch op touches
+/// the pixel data (module docs), so the cost is the same whatever the
+/// caller's torch thread settings.
 pub fn interpolate_rgb_pair(
     prev: &tch::Tensor,
     next: &tch::Tensor,
@@ -143,15 +209,15 @@ pub fn interpolate_rgb_pair(
         .iter()
         .map(|&a| phase(a))
         .collect::<Result<Vec<_>, _>>()?;
-    let (a, b) = (as_hwc(prev, "prev")?, as_hwc(next, "next")?);
-    if a.size() != b.size() {
+    let (height, width, _) = rgb_geometry(prev, "prev")?;
+    let (h2, w2, _) = rgb_geometry(next, "next")?;
+    if (height, width) != (h2, w2) {
         bail!(
             "prev and next must have the same shape, got {:?} vs {:?}",
             prev.size(),
             next.size()
         );
     }
-    let (height, width) = (a.size()[0], a.size()[1]);
     let out = tch::Tensor::empty(
         [phases.len() as i64, 3, height, width],
         (tch::Kind::Uint8, tch::Device::Cpu),
@@ -164,8 +230,8 @@ pub fn interpolate_rgb_pair(
         i32::try_from(height).context("height")?,
     );
     let mut conv = Yuv444Converter::new(w, h)?;
-    let yuv_prev = conv.rgb_to_yuv(&convert_rgb24_tensor_to_avframe(&a)?)?;
-    let yuv_next = conv.rgb_to_yuv(&convert_rgb24_tensor_to_avframe(&b)?)?;
+    let yuv_prev = conv.rgb_to_yuv(&tensor_to_rgb24(prev, "prev")?)?;
+    let yuv_next = conv.rgb_to_yuv(&tensor_to_rgb24(next, "next")?)?;
 
     let layout = Layout::new(w, h, ffi::AV_PIX_FMT_YUV444P)?;
     let (mut pa, mut pb) = (PaddedFrame::new(&layout), PaddedFrame::new(&layout));
@@ -174,8 +240,6 @@ pub fn interpolate_rgb_pair(
     let mut interp = Interpolator::new(layout);
     interp.estimate(&pa, &pb);
 
-    // One [H, W, 3] staging tensor; the output is channels-first.
-    let staging = tch::Tensor::empty([height, width, 3], (tch::Kind::Uint8, tch::Device::Cpu));
     for (i, &alpha) in phases.iter().enumerate() {
         let mut yuv = conv.blank(ffi::AV_PIX_FMT_YUV444P)?;
         interp.interpolate(
@@ -184,10 +248,7 @@ pub fn interpolate_rgb_pair(
             alpha,
             super::motion::frame_planes_mut(&mut yuv, &layout)?,
         );
-        let rgb = conv.yuv_to_rgb(&yuv)?;
-        let mut dst = staging.shallow_clone();
-        convert_rgb24_frame_to_tensor(&rgb, &mut dst)?;
-        out.get(i as i64).copy_(&staging.permute([2, 0, 1]));
+        rgb24_into_chw(&conv.yuv_to_rgb(&yuv)?, &out, i as i64);
     }
     Ok(out)
 }
@@ -269,5 +330,54 @@ mod tests {
             interpolate_rgb_pair(&prev, &next, &[]).unwrap().size(),
             [0, 3, 16, 32]
         );
+    }
+
+    /// The strided reader: a contiguous `[3, H, W]`, its `[H, W, 3]` permute
+    /// (non-contiguous view, never materialised) and a narrowed view of a
+    /// wider frame all give byte-identical output to the explicit-indexing
+    /// reference, and the output planes are the de-interleaved RGB24 rows.
+    #[test]
+    fn test_any_input_layout_gives_identical_output() {
+        let (w, h) = (40, 24);
+        let prev = rgb_at(w, h, 0.0, 0.0);
+        let next = rgb_at(w, h, 6.0, 2.0);
+        let base = interpolate_rgb_pair(&prev, &next, &[0.5]).unwrap();
+        // [H, W, 3] view, non-contiguous (strides [W, 1, H*W]).
+        let (p_hwc, n_hwc) = (prev.permute([1, 2, 0]), next.permute([1, 2, 0]));
+        assert!(!p_hwc.is_contiguous());
+        let hwc = interpolate_rgb_pair(&p_hwc, &n_hwc, &[0.5]).unwrap();
+        assert!(base.equal(&hwc));
+        // A narrowed window of a wider [3, H, W+16] frame (row stride != W).
+        let wide = |t: &tch::Tensor| {
+            tch::Tensor::cat(
+                &[
+                    t,
+                    &tch::Tensor::zeros([3, h, 16], (tch::Kind::Uint8, tch::Device::Cpu)),
+                ],
+                2,
+            )
+        };
+        let (p_w, n_w) = (wide(&prev).narrow(2, 0, w), wide(&next).narrow(2, 0, w));
+        assert!(!p_w.is_contiguous());
+        let narrowed = interpolate_rgb_pair(&p_w, &n_w, &[0.5]).unwrap();
+        assert!(base.equal(&narrowed));
+        // The reader itself against explicit indexing.
+        let frame = tensor_to_rgb24(&p_hwc, "prev").unwrap();
+        let ls = frame.linesize[0] as usize;
+        for &(y, x, c) in &[(0i64, 0i64, 0i64), (5, 7, 1), (h - 1, w - 1, 2), (3, 20, 0)] {
+            let want = prev.int64_value(&[c, y, x]) as u8;
+            let got = unsafe { *frame.data[0].add(y as usize * ls + 3 * x as usize + c as usize) };
+            assert_eq!(got, want, "({c},{y},{x})");
+        }
+    }
+
+    #[test]
+    fn test_phase_is_quantised_to_1_over_256_and_clamped() {
+        assert_eq!(phase(1e-4).unwrap(), 1);
+        assert_eq!(phase(0.5).unwrap(), 128);
+        assert_eq!(phase(255.0 / 256.0).unwrap(), 255);
+        assert_eq!(phase(0.9999).unwrap(), 255);
+        assert_eq!(phase(1.0 / 256.0 + 1e-9).unwrap(), 1);
+        assert!(phase(0.0).is_err() && phase(1.0).is_err() && phase(f64::NAN).is_err());
     }
 }
