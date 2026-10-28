@@ -267,6 +267,36 @@ pub fn generate_fractional_fps_video(num_frames: usize) -> Result<NamedTempFile,
     Ok(file)
 }
 
+/// Generates a 320x240 video of a 16 px wide white bar on black, moving
+/// right at `speed` px/s, at `frame_rate` fps for `duration`. Encoded near
+/// losslessly so the bar's position can be measured from decoded frames.
+pub fn generate_moving_bar_video(
+    frame_rate: u32,
+    speed: u32,
+    duration: Duration,
+) -> Result<NamedTempFile, anyhow::Error> {
+    let file = NamedTempFile::with_suffix(".mp4")?;
+    let secs = duration.as_secs();
+    run_ffmpeg(&[
+        "-f",
+        "lavfi",
+        "-i",
+        &format!(
+            "color=black:s=320x240:r={frame_rate}:d={secs}[bg];\
+             color=white:s=16x240:r={frame_rate}:d={secs}[bar];\
+             [bg][bar]overlay=x='8+t*{speed}':y=0:eval=frame"
+        ),
+        "-c:v",
+        "libx264",
+        "-crf",
+        "10",
+        "-pix_fmt",
+        "yuv420p",
+        file.path().to_str().context("temp path")?,
+    ])?;
+    Ok(file)
+}
+
 /// Re-encodes `input` as a variable-frame-rate video: the first 75 frames
 /// keep 30 fps timing, the rest switch to 15 fps timing, producing
 /// non-uniform PTS gaps.

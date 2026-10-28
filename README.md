@@ -113,6 +113,16 @@ request = MediaDecodeRequest(
 streams = avtensor.decode_asset(request)
 ```
 
+By default `fps` keeps the source frame nearest each output timestamp, which
+spaces frames unevenly for non-integer ratios (30 -> 24 fps keeps 4 of every 5
+frames). `fps_conversion="blend"` cross-fades neighbouring frames instead, and
+`fps_conversion="motion"` interpolates along estimated motion (about 1.25x
+the cost of the default):
+
+```python
+VideoStreamRequest(fps=24.0, fps_conversion="motion")
+```
+
 ### Decode a time window (seek)
 
 ```python
