@@ -19,12 +19,18 @@
 //! not routed through here, so the round trip only ever touches synthesized
 //! frames.
 //!
-//! Threads: no torch op runs on the pixel data. The input is read through
-//! its strides straight into an RGB24 frame and the synthesized frames are
-//! written row by row into the output tensor, so the call does not wake
-//! torch's intra-op pool (whose workers would otherwise busy-wait through
-//! the serial swscale / interpolator work: ~10x the CPU for the same wall
-//! time, measured at 480x854). The only torch call is the output allocation.
+//! Threads: no torch kernel runs over the pixel data in the per-frame work.
+//! The inputs are copied out through tch's byte-copy API (a `memcpy` for a
+//! contiguous tensor; a strided view is first made contiguous by torch) into
+//! RGB24 frames, and the synthesized frames are de-interleaved into a plain
+//! byte buffer that becomes the output tensor in one copy at the end. So the
+//! serial swscale / interpolator work does not wake torch's intra-op pool
+//! (whose workers would otherwise busy-wait through it: ~10x the CPU for the
+//! same wall time, measured at 480x854). The only torch calls are the input
+//! copies and the output construction (an allocation, a zero fill and a
+//! `memcpy`), both at the edges of the call. No raw-pointer access to tensor
+//! memory is needed; the `unsafe` left in this module is the FFmpeg FFI
+//! (borrowing an `AVFrame` plane, setting the swscale colourspace).
 
 use anyhow::{anyhow, bail, Context};
 use rsmpeg::{avutil::AVFrame, ffi, swscale::SwsContext};
@@ -43,24 +49,25 @@ fn phase(alpha: f64) -> Result<u32, anyhow::Error> {
 }
 
 /// The geometry of a `uint8` CPU RGB frame tensor, `[3, H, W]` or
-/// `[H, W, 3]`, read through its strides: `(height, width, [stride_c,
-/// stride_h, stride_w])` in elements.
-fn rgb_geometry(t: &tch::Tensor, what: &str) -> Result<(i64, i64, [i64; 3]), anyhow::Error> {
+/// `[H, W, 3]`: `(height, width, interleaved)`, `interleaved` meaning the
+/// `[H, W, 3]` shape.
+fn rgb_geometry(t: &tch::Tensor, what: &str) -> Result<(i64, i64, bool), anyhow::Error> {
     if t.kind() != tch::Kind::Uint8 {
         bail!("{what}: expected a uint8 tensor, got {:?}", t.kind());
     }
     if t.device() != tch::Device::Cpu {
         bail!("{what}: expected a CPU tensor, got {:?}", t.device());
     }
-    let (shape, st) = (t.size(), t.stride());
-    if st.iter().any(|&s| s < 0) {
-        bail!("{what}: expected non-negative strides, got {st:?}");
-    }
-    match shape.as_slice() {
-        [3, h, w] => Ok((*h, *w, [st[0], st[1], st[2]])),
-        [h, w, 3] => Ok((*h, *w, [st[2], st[0], st[1]])),
+    let shape = t.size();
+    let (h, w, interleaved) = match shape.as_slice() {
+        [3, h, w] => (*h, *w, false),
+        [h, w, 3] => (*h, *w, true),
         _ => bail!("{what}: expected shape [3, H, W] or [H, W, 3], got {shape:?}"),
+    };
+    if h <= 0 || w <= 0 {
+        bail!("{what}: expected a non-empty frame, got {shape:?}");
     }
+    Ok((h, w, interleaved))
 }
 
 /// Checks that `frame` is a non-empty `rgb24` frame with a non-null plane
@@ -107,23 +114,16 @@ fn rgb24_plane_mut(frame: &mut AVFrame) -> Result<(&mut [u8], usize), anyhow::Er
     Ok((data, stride))
 }
 
-/// `t` (see [`rgb_geometry`]) as an RGB24 frame, gathered through the
-/// tensor's strides (any layout, contiguous or not) with no torch op.
+/// `t` (see [`rgb_geometry`]) as an RGB24 frame. The bytes are copied out
+/// through tch in `t`'s logical (shape) order: a `memcpy` for a contiguous
+/// tensor, with torch making a strided view contiguous first.
 fn tensor_to_rgb24(t: &tch::Tensor, what: &str) -> Result<AVFrame, anyhow::Error> {
-    let (height, width, [sc, sh, sw]) = rgb_geometry(t, what)?;
-    if height <= 0 || width <= 0 {
-        bail!("{what}: expected a non-empty frame, got {:?}", t.size());
-    }
+    let (height, width, interleaved) = rgb_geometry(t, what)?;
     let (height, width) = (height as usize, width as usize);
-    let (sc, sh, sw) = (sc as usize, sh as usize, sw as usize);
-    // The largest element offset addressed by any (c, y, x) in range, plus
-    // one: the extent of `t`'s storage the copy reads.
-    let extent = 2 * sc + (height - 1) * sh + (width - 1) * sw + 1;
-    // SAFETY: `rgb_geometry` checked the dtype (one byte per element), the
-    // device and that the strides are non-negative, so the first `extent`
-    // bytes from the data pointer are elements of `t`, which stays alive
-    // (and is only read) for the call.
-    let src = unsafe { std::slice::from_raw_parts(t.data_ptr() as *const u8, extent) };
+    let plane = height * width;
+    let mut src = vec![0u8; 3 * plane];
+    t.f_copy_data_u8(&mut src, 3 * plane)
+        .with_context(|| format!("{what}: copying the frame bytes out of the tensor"))?;
 
     let mut frame = AVFrame::new();
     frame.set_format(ffi::AV_PIX_FMT_RGB24);
@@ -131,58 +131,48 @@ fn tensor_to_rgb24(t: &tch::Tensor, what: &str) -> Result<AVFrame, anyhow::Error
     frame.set_height(i32::try_from(height).context("height")?);
     frame.alloc_buffer().context("Allocating an rgb24 frame")?;
     let (dst, stride) = rgb24_plane_mut(&mut frame)?;
-    for y in 0..height {
-        let row = &mut dst[y * stride..y * stride + 3 * width];
-        let src_row = y * sh;
-        if (sc, sw) == (1, 3) {
-            // Interleaved [H, W, 3] input: the row is already rgb24.
-            row.copy_from_slice(&src[src_row..src_row + 3 * width]);
-            continue;
+    if interleaved {
+        // [H, W, 3]: every row is already rgb24, only the stride may differ.
+        for (y, row) in src.as_chunks::<3>().0.chunks_exact(width).enumerate() {
+            dst[y * stride..y * stride + 3 * width].copy_from_slice(row.as_flattened());
         }
-        for (x, px) in row.as_chunks_mut::<3>().0.iter_mut().enumerate() {
-            let base = src_row + x * sw;
-            px[0] = src[base];
-            px[1] = src[base + sc];
-            px[2] = src[base + 2 * sc];
+    } else {
+        // [3, H, W]: interleave the three planes.
+        let (r, gb) = src.split_at(plane);
+        let (g, b) = gb.split_at(plane);
+        for y in 0..height {
+            let row = &mut dst[y * stride..y * stride + 3 * width];
+            let o = y * width;
+            for (x, px) in row.as_chunks_mut::<3>().0.iter_mut().enumerate() {
+                *px = [r[o + x], g[o + x], b[o + x]];
+            }
         }
     }
     Ok(frame)
 }
 
-/// Writes an RGB24 frame into `out[i]` of a contiguous `uint8` `[N, 3, H, W]`
-/// tensor, de-interleaving into the three channel planes with no torch op.
-fn rgb24_into_chw(frame: &AVFrame, out: &mut tch::Tensor, i: usize) -> Result<(), anyhow::Error> {
+/// De-interleaves an RGB24 frame into `out`, the `3 * H * W` bytes of one
+/// `[3, H, W]` frame of the output buffer.
+fn rgb24_into_chw(frame: &AVFrame, out: &mut [u8]) -> Result<(), anyhow::Error> {
     let (src, stride) = rgb24_plane(frame)?;
     let (height, width) = (frame.height as usize, frame.width as usize);
-    let n = out.size().first().copied().unwrap_or(0);
-    if out.kind() != tch::Kind::Uint8
-        || out.device() != tch::Device::Cpu
-        || !out.is_contiguous()
-        || out.size() != [n, 3, height as i64, width as i64]
-        || i64::try_from(i).map_or(true, |i| i >= n)
-    {
+    let plane = height * width;
+    if out.len() != 3 * plane {
         bail!(
-            "Expected a contiguous uint8 [N > {i}, 3, {height}, {width}] CPU output, got {:?} {:?}",
-            out.kind(),
-            out.size()
+            "Expected a {} byte output slot, got {}",
+            3 * plane,
+            out.len()
         );
     }
-    let plane = height * width;
-    // SAFETY: `out` is a contiguous uint8 CPU tensor of `n * 3 * plane`
-    // elements (checked above), borrowed mutably for the call, so nothing
-    // else reads or writes it while the slice lives.
-    let dst = unsafe {
-        std::slice::from_raw_parts_mut(out.data_ptr() as *mut u8, n as usize * 3 * plane)
-    };
-    let (r, gb) = dst[i * 3 * plane..(i + 1) * 3 * plane].split_at_mut(plane);
+    let (r, gb) = out.split_at_mut(plane);
     let (g, b) = gb.split_at_mut(plane);
     for y in 0..height {
         let src_row = &src[y * stride..y * stride + 3 * width];
-        let row = y * width;
+        let o = y * width;
         for (x, px) in src_row.as_chunks::<3>().0.iter().enumerate() {
-            r[row + x] = px[0];
-            g[row + x] = px[1];
-            b[row + x] = px[2];
+            r[o + x] = px[0];
+            g[o + x] = px[1];
+            b[o + x] = px[2];
         }
     }
     Ok(())
@@ -271,9 +261,10 @@ impl Yuv444Converter {
 /// `prev` / `next`: `uint8` CPU tensors of the same shape, `[3, H, W]` or
 /// `[H, W, 3]`, any strides. Returns `uint8` `[len(alphas), 3, H, W]`.
 /// Motion is estimated once for the pair; each phase is one compensation
-/// pass. Phases are quantised to 1/256 (see [`phase`]). No torch op touches
-/// the pixel data (module docs), so the cost is the same whatever the
-/// caller's torch thread settings.
+/// pass. Phases are quantised to 1/256 (see [`phase`]). No torch kernel runs
+/// over the pixel data between the input copies and the output construction
+/// (module docs), so the cost is the same whatever the caller's torch thread
+/// settings.
 pub fn interpolate_rgb_pair(
     prev: &tch::Tensor,
     next: &tch::Tensor,
@@ -292,12 +283,18 @@ pub fn interpolate_rgb_pair(
             next.size()
         );
     }
-    let mut out = tch::Tensor::empty(
-        [phases.len() as i64, 3, height, width],
-        (tch::Kind::Uint8, tch::Device::Cpu),
-    );
+    let plane = (height * width) as usize;
+    let mut out = vec![0u8; phases.len() * 3 * plane];
+    let to_tensor = |out: &[u8]| {
+        tch::Tensor::f_from_data_size(
+            out,
+            &[phases.len() as i64, 3, height, width],
+            tch::Kind::Uint8,
+        )
+        .context("Building the output tensor")
+    };
     if phases.is_empty() {
-        return Ok(out);
+        return to_tensor(&out);
     }
     let (w, h) = (
         i32::try_from(width).context("width")?,
@@ -322,9 +319,12 @@ pub fn interpolate_rgb_pair(
             alpha,
             super::motion::frame_planes_mut(&mut yuv, &layout)?,
         );
-        rgb24_into_chw(&conv.yuv_to_rgb(&yuv)?, &mut out, i)?;
+        rgb24_into_chw(
+            &conv.yuv_to_rgb(&yuv)?,
+            &mut out[i * 3 * plane..(i + 1) * 3 * plane],
+        )?;
     }
-    Ok(out)
+    to_tensor(&out)
 }
 
 #[cfg(test)]
@@ -406,10 +406,9 @@ mod tests {
         );
     }
 
-    /// The strided reader: a contiguous `[3, H, W]`, its `[H, W, 3]` permute
-    /// (non-contiguous view, never materialised) and a narrowed view of a
-    /// wider frame all give byte-identical output to the explicit-indexing
-    /// reference, and the output planes are the de-interleaved RGB24 rows.
+    /// Input layouts: a contiguous `[3, H, W]`, its `[H, W, 3]` permute
+    /// (non-contiguous view) and a narrowed view of a wider frame all give
+    /// byte-identical output, and the RGB24 reader matches explicit indexing.
     #[test]
     fn test_any_input_layout_gives_identical_output() {
         let (w, h) = (40, 24);
