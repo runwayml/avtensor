@@ -232,8 +232,8 @@ Constraints on this path:
 
 - `width`/`height` must both be set to an even, strictly smaller size
   (NVDEC's own scaler) or both left unset.
-- `fps` resampling and HDR tone mapping are unavailable; frames never reach
-  the CPU filter graph.
+- `fps` resampling, HDR tone mapping and `autorotate` of a rotated stream
+  are unavailable; frames never reach the CPU filter graph.
 - Values may differ from the CPU path by ±1 (NPP vs swscale rounding).
 
 The CUDA runtime and NPP libraries must be present at run time. They are
@@ -283,10 +283,14 @@ Returns the asset's stream layout without decoding it: a dict with
 `nb_frames`, `rotation`, `sample_aspect_ratio`) and `audio_streams` (each with
 `index`, `sample_rate`, `channels`, `codec_name`, `duration_s`,
 `duration_source`). Stream durations fall back to the container duration
-(`duration_source="container"`, e.g. Matroska/WebM). `rotation` (display
-matrix, counterclockwise degrees) and `sample_aspect_ratio` are reported but
-not applied by the decoder. Accepts the same inputs as `MediaDecodeRequest`.
-The GIL is released while probing.
+(`duration_source="container"`, e.g. Matroska/WebM). `sample_aspect_ratio` is
+reported but not applied by the decoder. `rotation` is the stream's display
+matrix (counterclockwise degrees); the decoder applies it only with
+`VideoStreamRequest(autorotate=True)`. It is the stream-level matrix only:
+orientation carried per frame (JPEG EXIF Orientation, H.264/HEVC
+display-orientation SEI) is reported as `rotation=None` and not applied, even
+though the ffmpeg CLI applies it. Accepts the same inputs as
+`MediaDecodeRequest`. The GIL is released while probing.
 
 ### `plan_asset(request: MediaDecodeRequest) -> list[PlannedStream]`
 
@@ -294,10 +298,13 @@ Returns, per stream, the buffer `decode_asset(request)` would allocate,
 without decoding: `stream_type`, `stream_index`, `shape` (in the returned
 layout), `dtype`, `fps` or `sample_rate`, and the `duration_s` /
 `duration_source` being decoded. Stream selection, the seek window, `fps`,
-`width`/`height` and `dtype` resolve through the same code as
+`width`/`height`, `autorotate` and `dtype` resolve through the same code as
 `decode_asset`. The decoded tensor is trimmed to what was actually decoded, so
-`shape` is an upper bound on its length. Decoders are not opened, so codec
-and hardware errors only surface at decode time.
+`shape` is an upper bound on its length, except for video with
+`fps_mode="cli"`: its output grows past the plan when the CLI emits more frames
+(a file with no stored duration plans 1 frame), up to the output size limit.
+Decoders are not opened, so codec and hardware errors only surface at decode
+time.
 
 ### `MediaDecodeRequest(input: str | bytes)`
 
@@ -308,6 +315,7 @@ and hardware errors only surface at decode time.
 | `end_time` | `float \| None` | decode window end, in seconds |
 | `video_stream` | `VideoStreamRequest \| None` | request the video stream (`None` = skip video) |
 | `audio_streams` | `list[AudioStreamRequest] \| None` | audio streams to decode (`None` = skip audio) |
+| `max_output_bytes` | `int \| None` | largest output buffer per stream, in bytes (see [Output size limit](#output-size-limit)) |
 
 All request classes accept their attributes as keyword arguments
 (`VideoStreamRequest(width=512, height=288)`). Nested request objects are
@@ -323,12 +331,14 @@ All attributes default to `None`, meaning "keep the source value".
 | `index` | `int \| None` | select a specific video stream |
 | `width`, `height` | `int \| None` | rescale output frames (a lone `width` or `height` keeps the source's coded aspect ratio; sample aspect ratio is not applied) |
 | `fps` | `float \| None` | resample to this frame rate |
-| `number_of_threads` | `int \| None` | FFmpeg decoder threads (default: 1; `0` = FFmpeg auto) |
+| `number_of_threads` | `int \| None` | FFmpeg decoder threads (default: 1; `0` = auto). Also sizes the RGB conversion on the [direct conversion path](#direct-conversion-path); other decodes convert in the filter graph with its own pool of up to 16 threads |
 | `hardware_acceleration` | `bool \| None` | decode on the GPU's NVDEC engine (see [GPU-accelerated decoding](#gpu-accelerated-decoding-nvdec)) |
 | `dimension_order` | `str \| None` | `"NCHW"` (default, `[T, C, H, W]`, a non-contiguous view) or `"NHWC"` (`[T, H, W, C]`, contiguous) |
 | `device` | `str \| None` | `"cuda"` / `"cuda:N"`: keep frames on the GPU, implies `hardware_acceleration` (see [GPU-accelerated decoding](#gpu-accelerated-decoding-nvdec)) |
 | `dtype` | `str \| None` | `"uint8"` (default) or `"float32"` (`[0, 1]`, NCHW-contiguous, preserves 10/12-bit source depth) |
 | `color_conversion` | `str \| None` | `"fast"` (libswscale default; default for `uint8`) or `"accurate"` (zimg: exact `float32`, round-to-nearest `uint8`, resizes after the RGB conversion; default for `float32` when FFmpeg has libzimg). Not supported with `device="cuda"` |
+| `autorotate` | `bool \| None` | apply the stream's display-matrix rotation as the ffmpeg CLI's `-autorotate` does (90°/270° swap the output width and height); `width`/`height` refer to the rotated frame. Default `False`. Stream-level matrix only: per-frame orientation (JPEG EXIF, H.264/HEVC SEI) is not applied |
+| `fps_mode` | `str \| None` | `"filter"` (default) or `"cli"`: the frames `ffmpeg -i <input> -f rawvideo -` outputs, at the stream's guessed rate, with the CLI's duplication/dropping and MPEG-TS/PS/HLS timestamp-discontinuity correction. Whole-file decodes only, without `fps`, `device` or `hardware_acceleration=True`. Unlike the CLI it autorotates only with `autorotate=True`. |
 
 ### `AudioStreamRequest`
 
@@ -344,6 +354,25 @@ Mirrors FFmpeg's [`loudnorm`](https://ffmpeg.org/ffmpeg-filters.html#loudnorm)
 filter: `integrated_loudness_target` (LUFS), `true_peak_level_target` (dBTP),
 `loudness_range_target` (LU), the `measured_*` variants for two-pass
 normalization, `offset_gain`, `linear` and `dual_mono`.
+
+## Output size limit
+
+Each stream's output buffer is preallocated at a size computed from the file's
+metadata (duration, frame rate, dimensions, sample rate), which an untrusted
+file controls. To bound that allocation, a request whose buffer for any one
+stream would exceed 16 GiB fails before any buffer is allocated, for example
+30 s of uncropped 4K `uint8` video (about 22 GB). `plan_asset` applies the
+same check.
+
+- The limit is per stream: video plus N audio streams can total (1 + N)× it.
+- Set it per request with `MediaDecodeRequest(max_output_bytes=...)`, or for
+  the whole process with `AVTENSOR_MAX_OUTPUT_TENSOR_BYTES` (bytes, or with a
+  `K`/`M`/`G`/`T` binary suffix such as `32G`); the request's value wins.
+  Prefer raising it for the requests that need it over a huge process-wide
+  value, which lets a file with spoofed metadata allocate that much.
+- `0` refuses every non-empty stream; it does not mean unlimited.
+- An invalid `AVTENSOR_MAX_OUTPUT_TENSOR_BYTES` keeps the 16 GiB default, and
+  the error names the ignored value.
 
 ## Reading from cloud storage
 
@@ -419,6 +448,30 @@ provider-specific support — the URL is handed to FFmpeg's http protocol.
   at saturated hard edges. Odd-size 4:2:0/4:2:2 frames are upsampled to
   4:4:4 first, because zimg rejects them otherwise.
 
+## Direct conversion path
+
+When no filtering is needed, avtensor converts decoded frames straight into the
+output tensor with swscale instead of going through an FFmpeg filter graph. The
+output is identical; it saves a copy per frame, and its conversion threads
+follow `number_of_threads`. A video stream takes this path only when all of
+these hold:
+
+- software decoding (no `hardware_acceleration` or `device`);
+- `uint8` (`rgb24`) output, with no `width`/`height` resize and no `fps`;
+- an output width that is a multiple of 32 (swscale's vectorized RGB24 writer
+  needs it on the tensor's tightly packed rows), so e.g. 1920 or 1280 wide
+  qualify and 720 or 854 do not;
+- an SDR source, or an HDR source with `hdr_mode="raw"` whose YUV matrix is
+  BT.709, BT.601, FCC, SMPTE 240M, BT.2020 NCL or CL, RGB, or untagged. These
+  are the matrices the `scale` filter accepts, plus BT.2020 CL, which only this
+  path can convert: a BT.2020 CL source that needs the filter graph (a resize,
+  `fps`, a width that isn't a multiple of 32, or
+  `AVTENSOR_DISABLE_DIRECT_PATH`) fails.
+
+Everything else converts in the filter graph, whose thread pool is up to 16
+threads whatever `number_of_threads` is. `AVTENSOR_DISABLE_DIRECT_PATH=1` forces
+the filter graph for every stream.
+
 ## Troubleshooting
 
 - **Build fails with "Cannot find a libtorch install"** — set
@@ -450,6 +503,18 @@ provider-specific support — the URL is handed to FFmpeg's http protocol.
   allocator and hands them to torch via `from_blob` with a deleter, so a free
   is an immediate `munmap` on any thread. `AVTENSOR_OUTPUT_ALLOCATOR=torch`
   switches back to `torch.empty`-style allocation.
+- **Filling large output buffers is slow** — on Linux, set
+  `AVTENSOR_OUTPUT_HUGE_PAGES=1` to advise output buffers of 64 MiB or more to
+  use transparent huge pages (THP), which roughly halves the cost of filling
+  them on hosts with plenty of free memory. It is off by default: under the
+  common THP settings `enabled=madvise` and `defrag=madvise`, a fault in an
+  advised buffer may stall on memory reclaim and compaction when free memory
+  is low (for example, a data loader whose page cache fills RAM), which can
+  make decodes several times slower instead. Under `enabled=always`, unadvised
+  memory already gets huge pages when they are cheap. If you enable it, watch
+  `compact_stall` and `thp_fault_fallback` in `/proc/vmstat`. The advice is
+  skipped on kernels whose huge pages are larger than 2 MiB (such as 512 MiB
+  on 64 KiB-page arm64).
 
 ## Contributing
 

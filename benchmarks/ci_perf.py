@@ -13,11 +13,18 @@ Usage:
 The compared statistic is the minimum over repeats: for CPU-bound decode
 work, interference from a noisy runner only ever adds time, so the minimum
 is the most stable estimate. The median is reported for context.
+
+Process CPU time (user + system, all threads) is measured too. Scenarios at
+the default thread setting (`CPU_GATED`) also fail when their CPU time
+regresses: data loaders run many such decodes in parallel, so CPU per decode,
+not the latency of one decode, sets their throughput, and a thread pool can
+lower wall time while costing more CPU.
 """
 
 import argparse
 import json
 import os
+import resource
 import statistics
 import subprocess
 import sys
@@ -46,6 +53,16 @@ FIXTURES = {
         "-pix_fmt",
         "yuv420p",
     ],
+    "image.jpg": [
+        "-f",
+        "lavfi",
+        "-i",
+        "testsrc2=size=512x384",
+        "-frames:v",
+        "1",
+        "-q:v",
+        "3",
+    ],
     "audio.m4a": [
         "-f",
         "lavfi",
@@ -59,6 +76,12 @@ FIXTURES = {
         "128k",
     ],
 }
+
+
+# Scenarios whose CPU time is gated as well as their wall time (see the module
+# docstring). `number_of_threads=0` deliberately trades CPU for latency, so
+# the other scenarios only report it.
+CPU_GATED = {"video_full_default_threads", "image_small_x300"}
 
 
 def prepare_fixtures() -> None:
@@ -75,6 +98,7 @@ def scenarios():
     from avtensor import AudioStreamRequest, MediaDecodeRequest, VideoStreamRequest
 
     video = str(FIXTURES_DIR / "video.mp4")
+    image = str(FIXTURES_DIR / "image.jpg")
     audio = str(FIXTURES_DIR / "audio.m4a")
 
     def decode(path, video_kwargs=None, audio_stream=False, start=None, end=None):
@@ -98,8 +122,25 @@ def scenarios():
         "video_seek_window": lambda: decode(
             video, video_kwargs={"number_of_threads": 0}, start=3.0, end=6.0
         ),
+        # The default number_of_threads (1), as data loaders use it.
+        "video_full_default_threads": lambda: decode(video, video_kwargs={}),
+        # One small image per decode at the default thread setting, where
+        # per-decode setup costs dominate; repeated to clear timer noise.
+        "image_small_x300": lambda: [
+            decode(image, video_kwargs={}) for _ in range(300)
+        ],
         "audio_full": lambda: decode(audio, audio_stream=True),
     }
+
+
+def cpu_seconds() -> float:
+    """User + system CPU time of this process, all threads included.
+
+    Same as benchmark.py's _cpu_time, kept separate: CI copies this file alone
+    to /tmp (perf.yml), and benchmark.py imports torchcodec.
+    """
+    usage = resource.getrusage(resource.RUSAGE_SELF)
+    return usage.ru_utime + usage.ru_stime
 
 
 def run(output: Path, repeats: int) -> None:
@@ -110,18 +151,24 @@ def run(output: Path, repeats: int) -> None:
     for name, fn in scenarios().items():
         fn()  # warmup
         walls = []
+        cpus = []
         for _ in range(repeats):
+            c0 = cpu_seconds()
             t0 = time.perf_counter()
             fn()
             walls.append(time.perf_counter() - t0)
+            cpus.append(cpu_seconds() - c0)
         results[name] = {
             "min_s": min(walls),
             "median_s": statistics.median(walls),
+            "cpu_min_s": min(cpus),
+            "cpu_median_s": statistics.median(cpus),
             "repeats": repeats,
         }
         print(
             f"{name}: min {min(walls) * 1000:.0f} ms, "
-            f"median {statistics.median(walls) * 1000:.0f} ms",
+            f"median {statistics.median(walls) * 1000:.0f} ms, "
+            f"CPU min {min(cpus) * 1000:.0f} ms",
             flush=True,
         )
     output.write_text(json.dumps(results, indent=2))
@@ -132,23 +179,39 @@ def compare(base_path: Path, head_path: Path, threshold: float) -> int:
     base = json.loads(base_path.read_text())
     head = json.loads(head_path.read_text())
 
-    rows = []
+    def ratio(h: float, b: float) -> float:
+        return h / b if b > 0 else float("inf")
+
+    lines = [
+        f"| scenario | base min | head min | head/base (fail > {threshold:.2f}) "
+        "| base CPU | head CPU | CPU head/base |",
+        "| --- | --- | --- | --- | --- | --- | --- |",
+    ]
     regressions = []
     for name in sorted(set(base) & set(head)):
         b, h = base[name], head[name]
-        ratio = h["min_s"] / b["min_s"] if b["min_s"] > 0 else float("inf")
-        rows.append((name, b["min_s"], h["min_s"], ratio))
-        if ratio > threshold:
-            regressions.append((name, ratio))
-
-    lines = [
-        f"| scenario | base min | head min | head/base (fail > {threshold:.2f}) |",
-        "| --- | --- | --- | --- |",
-    ]
-    for name, b, h, ratio in rows:
-        flag = " ⚠️" if ratio > threshold else ""
+        wall = ratio(h["min_s"], b["min_s"])
+        flag = ""
+        if wall > threshold:
+            regressions.append((name, wall))
+            flag = " ⚠️"
+        cpu_cells = "| – | – | – |"
+        if "cpu_min_s" in b and "cpu_min_s" in h:
+            cpu = ratio(h["cpu_min_s"], b["cpu_min_s"])
+            if name not in CPU_GATED:
+                cpu_flag = " (not gated)"
+            elif cpu > threshold:
+                regressions.append((f"{name} CPU", cpu))
+                cpu_flag = " ⚠️"
+            else:
+                cpu_flag = ""
+            cpu_cells = (
+                f"| {b['cpu_min_s'] * 1000:.0f} ms | {h['cpu_min_s'] * 1000:.0f} ms "
+                f"| {cpu:.2f}{cpu_flag} |"
+            )
         lines.append(
-            f"| {name} | {b * 1000:.0f} ms | {h * 1000:.0f} ms | {ratio:.2f}{flag} |"
+            f"| {name} | {b['min_s'] * 1000:.0f} ms | {h['min_s'] * 1000:.0f} ms "
+            f"| {wall:.2f}{flag} {cpu_cells}"
         )
     table = "\n".join(lines)
     print(table)

@@ -200,6 +200,44 @@ pub fn generate_test_webm_file(duration: Duration) -> Result<NamedTempFile, anyh
     Ok(file)
 }
 
+/// Copies an H.264 `video` with its VUI matrix coefficients rewritten to
+/// `matrix_coefficients` (ITU-T H.273 code point). Covers matrices ffmpeg's
+/// own `-colorspace` cannot encode (its scale filter rejects e.g. `bt2020c`).
+pub fn retag_matrix_coefficients(
+    video: &Path,
+    matrix_coefficients: u8,
+) -> Result<NamedTempFile, anyhow::Error> {
+    let file = NamedTempFile::with_suffix(".mp4")?;
+    run_ffmpeg(&[
+        "-i",
+        video.to_str().context("non-UTF-8 path")?,
+        "-c",
+        "copy",
+        "-bsf:v",
+        &format!("h264_metadata=matrix_coefficients={matrix_coefficients}"),
+        file.path().to_str().context("non-UTF-8 path")?,
+    ])?;
+    Ok(file)
+}
+
+/// Generates a 1 s, 64x48 rawvideo clip in `xyz12le`, the pixel format of
+/// DCP JPEG2000 (NUT, since MP4 cannot carry raw video).
+pub fn generate_xyz12_video_file() -> Result<NamedTempFile, anyhow::Error> {
+    let file = NamedTempFile::with_suffix(".nut")?;
+    run_ffmpeg(&[
+        "-f",
+        "lavfi",
+        "-i",
+        "testsrc=duration=1:size=64x48:rate=30",
+        "-c:v",
+        "rawvideo",
+        "-pix_fmt",
+        "xyz12le",
+        file.path().to_str().context("non-UTF-8 path")?,
+    ])?;
+    Ok(file)
+}
+
 /// Runs an ffmpeg command, failing loudly on a non-zero exit.
 fn run_ffmpeg(args: &[&str]) -> Result<(), anyhow::Error> {
     let status = Command::new(get_ffmpeg_binary())
@@ -209,6 +247,199 @@ fn run_ffmpeg(args: &[&str]) -> Result<(), anyhow::Error> {
         .context("running ffmpeg")?;
     anyhow::ensure!(status.success(), "ffmpeg exited with {status}");
     Ok(())
+}
+
+/// Runs ffmpeg with `args` (inputs and filters) and returns its rgb24
+/// output frames, as `ffmpeg ... -pix_fmt rgb24 -f rawvideo -` emits them.
+pub fn ffmpeg_rgb24_frames(
+    args: &[&str],
+    width: usize,
+    height: usize,
+) -> Result<Vec<Vec<u8>>, anyhow::Error> {
+    let output = Command::new(get_ffmpeg_binary())
+        .args(["-hide_banner", "-loglevel", "error"])
+        .args(args)
+        .args(["-pix_fmt", "rgb24", "-f", "rawvideo", "-"])
+        .output()
+        .context("running ffmpeg")?;
+    anyhow::ensure!(
+        output.status.success(),
+        "ffmpeg exited with {}",
+        output.status
+    );
+    let frame = width * height * 3;
+    anyhow::ensure!(
+        output.stdout.len() % frame == 0,
+        "partial frame in ffmpeg output"
+    );
+    Ok(output.stdout.chunks(frame).map(<[u8]>::to_vec).collect())
+}
+
+/// The default timestamp expression of [`generate_vfr_video_file`]: jitter
+/// plus two gaps, in frames (`N` is the frame index).
+pub const JITTER_AND_GAPS: &str = "N+0.45*sin(N*1.3)+2*gt(N,30)+3*gt(N,60)";
+
+/// Encodes a `width`x`height` H.264 clip (3 s of 30 fps frames) whose frame
+/// timestamps follow `setpts` (in frames; `N` is the frame index), so the
+/// ffmpeg CLI's constant-frame-rate output drops and duplicates frames.
+/// `input` precedes the video input (e.g. `-itsoffset`); `extra` follows it
+/// (e.g. `-bf 2`, or an audio input).
+pub fn generate_vfr_video_file(
+    suffix: &str,
+    width: usize,
+    height: usize,
+    setpts: &str,
+    input: &[&str],
+    extra: &[&str],
+) -> Result<NamedTempFile, anyhow::Error> {
+    let file = NamedTempFile::with_suffix(suffix)?;
+    let size = format!("testsrc2=size={width}x{height}:rate=30");
+    let filter = format!("setpts='({setpts})/(30*TB)'");
+    let mut args = input.to_vec();
+    args.extend_from_slice(&["-f", "lavfi", "-t", "3", "-i", size.as_str()]);
+    args.extend_from_slice(extra);
+    args.extend_from_slice(&[
+        "-vf",
+        filter.as_str(),
+        "-fps_mode",
+        "passthrough",
+        "-c:v",
+        "libx264",
+        "-preset",
+        "ultrafast",
+        "-pix_fmt",
+        "yuv420p",
+        file.path().to_str().context("temp path")?,
+    ]);
+    run_ffmpeg(&args)?;
+    Ok(file)
+}
+
+/// [`generate_vfr_video_file`] as Matroska written to a pipe, as a stream
+/// is: the file stores no duration. Encoding it directly keeps timestamps
+/// the ffmpeg CLI would fix on input (a remux would apply its fixes).
+pub fn generate_streamed_vfr_mkv(
+    width: usize,
+    height: usize,
+    setpts: &str,
+) -> Result<NamedTempFile, anyhow::Error> {
+    let file = NamedTempFile::with_suffix(".mkv")?;
+    let size = format!("testsrc2=size={width}x{height}:rate=30");
+    let filter = format!("setpts='({setpts})/(30*TB)'");
+    let output = Command::new(get_ffmpeg_binary())
+        .args(["-hide_banner", "-loglevel", "error"])
+        .args([
+            "-f",
+            "lavfi",
+            "-t",
+            "3",
+            "-i",
+            size.as_str(),
+            "-vf",
+            filter.as_str(),
+        ])
+        .args([
+            "-fps_mode",
+            "passthrough",
+            "-c:v",
+            "libx264",
+            "-preset",
+            "ultrafast",
+        ])
+        .args(["-pix_fmt", "yuv420p", "-bf", "0", "-map_metadata", "-1"])
+        .args(["-f", "matroska", "-"])
+        .output()
+        .context("running ffmpeg")?;
+    anyhow::ensure!(
+        output.status.success(),
+        "ffmpeg exited with {}",
+        output.status
+    );
+    std::fs::write(file.path(), output.stdout)?;
+    Ok(file)
+}
+
+/// Remuxes `video` into a `suffix` file whose video track starts `offset`
+/// seconds late, optionally beside an AAC audio track that starts at 0.
+pub fn make_late_video(
+    video: &Path,
+    suffix: &str,
+    offset: &str,
+    with_audio: bool,
+) -> Result<NamedTempFile, anyhow::Error> {
+    let file = NamedTempFile::with_suffix(suffix)?;
+    let video = video.to_str().context("input path")?;
+    let out = file.path().to_str().context("temp path")?;
+    if with_audio {
+        run_ffmpeg(&[
+            "-itsoffset",
+            offset,
+            "-i",
+            video,
+            "-f",
+            "lavfi",
+            "-i",
+            "sine=sample_rate=48000",
+            "-map",
+            "0:v",
+            "-map",
+            "1:a",
+            "-c:v",
+            "copy",
+            "-c:a",
+            "aac",
+            "-shortest",
+            out,
+        ])?;
+    } else {
+        run_ffmpeg(&["-itsoffset", offset, "-i", video, "-c", "copy", out])?;
+    }
+    Ok(file)
+}
+
+/// Encodes 2 s of a 30 fps `width`x`height` test pattern into an MPEG-TS
+/// (`suffix` ".ts") or MPEG-PS (".mpg") segment whose timestamps start
+/// `offset` seconds in. `extra` adds inputs/options (e.g. an audio track).
+pub fn generate_segment(
+    suffix: &str,
+    width: usize,
+    height: usize,
+    offset: &str,
+    extra: &[&str],
+) -> Result<NamedTempFile, anyhow::Error> {
+    let file = NamedTempFile::with_suffix(suffix)?;
+    let size = format!("testsrc2=size={width}x{height}:rate=30");
+    let codec: &[&str] = if suffix == ".mpg" {
+        &["-c:v", "mpeg2video", "-bf", "2"]
+    } else {
+        &["-c:v", "libx264", "-preset", "ultrafast", "-bf", "0"]
+    };
+    let mut args = vec!["-f", "lavfi", "-t", "2", "-i", size.as_str()];
+    args.extend_from_slice(extra);
+    args.extend_from_slice(codec);
+    args.extend_from_slice(&[
+        "-pix_fmt",
+        "yuv420p",
+        "-t",
+        "2",
+        "-output_ts_offset",
+        offset,
+    ]);
+    args.push(file.path().to_str().context("temp path")?);
+    run_ffmpeg(&args)?;
+    Ok(file)
+}
+
+/// Concatenates `parts` byte for byte (as `cat` does), e.g. MPEG-TS
+/// segments into a stream with a timestamp discontinuity.
+pub fn concat_files(suffix: &str, parts: &[&Path]) -> Result<NamedTempFile, anyhow::Error> {
+    let file = NamedTempFile::with_suffix(suffix)?;
+    let mut bytes = Vec::new();
+    for part in parts {
+        bytes.extend(std::fs::read(part)?);
+    }
+    std::fs::write(file.path(), bytes)?;
+    Ok(file)
 }
 
 /// Generates an audio-only FLAC file containing a sine tone.

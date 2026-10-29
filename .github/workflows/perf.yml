@@ -3,9 +3,9 @@ name: Performance
 # Guards against performance regressions: builds wheels for the PR head and
 # its merge-base with main, measures both with benchmarks/ci_perf.py on the
 # same runner in the same job, and fails when head is slower than base beyond
-# the threshold. The comparison is relative, so runner speed differences
-# cancel out; the compared statistic is min-over-repeats (noise only ever
-# adds time).
+# the threshold (or, for scenarios at the default thread setting, uses more
+# CPU). The comparison is relative, so runner speed differences cancel out;
+# the compared statistic is min-over-repeats (noise only ever adds time).
 
 on:
   pull_request:
