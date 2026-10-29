@@ -54,11 +54,6 @@ class VideoStreamRequest:
     # "blend" cross-fades neighbouring frames; "motion" interpolates along
     # estimated block motion (about 1.2-1.6x the cost of "nearest").
     fps_conversion: Literal["nearest", "blend", "motion"] | None
-    # Scene cuts for fps_conversion="blend"/"motion": "detect" (default) finds
-    # hard cuts and takes the nearer source frame for output frames that fall
-    # between two shots instead of mixing them; "off" interpolates across
-    # cuts. Frame count and timestamps are the same either way.
-    scene_cuts: Literal["detect", "off"] | None
     # Apply the stream's display-matrix rotation as the ffmpeg CLI's
     # -autorotate does (90/270 degrees swap width and height). width/height
     # refer to the rotated frame. Default False: frames come out as coded.
@@ -93,7 +88,6 @@ class VideoStreamRequest:
         hdr_mode: Literal["tonemap", "raw"] | None = None,
         color_conversion: Literal["fast", "accurate"] | None = None,
         fps_conversion: Literal["nearest", "blend", "motion"] | None = None,
-        scene_cuts: Literal["detect", "off"] | None = None,
         autorotate: bool | None = None,
         fps_mode: Literal["filter", "cli"] | None = None,
     ): ...

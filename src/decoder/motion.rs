@@ -13,7 +13,7 @@
 //! - Overlapped block motion compensation: each output block blends the two
 //!   frames along its vector, weighted by a 32x32 bilinear window, so
 //!   neighbouring blocks cross-fade instead of leaving block edges.
-//! - Scene cuts ([`super::scenecut`]) are not interpolated; the resampler
+//! - Scene cuts (frame-difference detector) are not interpolated; the caller
 //!   repeats the nearer frame.
 //!
 //! It is written for throughput rather than ported: planes are copied into
@@ -32,7 +32,6 @@ use rsmpeg::{
     ffi,
 };
 
-use super::scenecut::CutDetector;
 use crate::util::ffmpeg::RetUpgrade;
 
 /// Interpolation phases run over `0..ALPHA_ONE` (0 = previous frame).
@@ -50,6 +49,8 @@ const PRED_COST: u32 = 64;
 /// Border replicated around every padded plane. Reads reach at most a block
 /// plus the window margin plus a full motion vector (2 * SEARCH) outside.
 const PAD: usize = 128;
+/// `minterpolate`'s default `scd_threshold`.
+const SCENE_THRESHOLD: f64 = 10.0;
 
 /// A borrowed 8-bit image plane: `height` rows of `width` bytes, `stride`
 /// bytes apart.
@@ -188,7 +189,8 @@ fn sad_row(a: &[u8; WINDOW], b: &[u8; WINDOW]) -> u32 {
 }
 
 /// Motion-compensated interpolation between consecutive frames of one
-/// stream. Call [`Self::estimate`] for a pair before [`Self::interpolate`]ing
+/// stream. Feed every consecutive source pair to [`Self::scene_change`];
+/// call [`Self::estimate`] for a pair before [`Self::interpolate`]ing
 /// frames inside it.
 pub(crate) struct Interpolator {
     layout: Layout,
@@ -202,6 +204,7 @@ pub(crate) struct Interpolator {
     window: [[u16; WINDOW]; WINDOW],
     /// Weighted-sum accumulator for one plane, with a block of margin.
     acc: Vec<u16>,
+    prev_mafd: f64,
 }
 
 impl Interpolator {
@@ -218,7 +221,31 @@ impl Interpolator {
             mvs_prev2: vec![[0; 2]; blocks],
             window: obmc_window(),
             acc: vec![0; (blocks_w + 3) * BLOCK * (blocks_h + 3) * BLOCK],
+            prev_mafd: 0.0,
         }
+    }
+
+    /// Whether `next` starts a new scene after `prev` (luma planes). Uses the
+    /// previous pair's difference, so call it for every consecutive pair, in
+    /// order.
+    pub fn scene_change(&mut self, prev: Plane, next: Plane) -> bool {
+        let (w, h) = (self.layout.width, self.layout.height);
+        let mut sad = 0u64;
+        for y in 0..h {
+            let (a, b) = (
+                &prev.data[y * prev.stride..][..w],
+                &next.data[y * next.stride..][..w],
+            );
+            sad += a
+                .iter()
+                .zip(b)
+                .map(|(&p, &q)| p.abs_diff(q) as u32)
+                .sum::<u32>() as u64;
+        }
+        let mafd = sad as f64 * 100.0 / (w * h) as f64 / 256.0;
+        let diff = (mafd - self.prev_mafd).abs();
+        self.prev_mafd = mafd;
+        mafd.min(diff).clamp(0.0, 100.0) >= SCENE_THRESHOLD
     }
 
     #[inline(always)]
@@ -579,23 +606,8 @@ struct Source {
     time: i128,
 }
 
-/// Blend phases outside `BLEND_START..=BLEND_END` take the nearer source
-/// frame (FFmpeg `framerate`'s default `interp_start`/`interp_end`).
-const BLEND_START: u32 = 15;
-const BLEND_END: u32 = 240;
-
-/// How a [`Resampler`] synthesizes an output frame between two source frames.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum Synthesis {
-    /// Linear cross-fade ([`super::FpsConversion::Blend`]).
-    Blend,
-    /// Motion-compensated interpolation with [`Interpolator`]
-    /// ([`super::FpsConversion::Motion`]).
-    Motion,
-}
-
 /// Resamples a frame stream to a constant rate, synthesizing in-between
-/// frames by cross-fading or with [`Interpolator`].
+/// frames with [`Interpolator`].
 ///
 /// Output timing mirrors FFmpeg's `fps` filter (default options), so the
 /// frame count and timestamps equal those of [`super::FpsConversion::Nearest`]:
@@ -603,13 +615,9 @@ pub(crate) enum Synthesis {
 /// output grid, and output stops at the end of the last input frame
 /// (`pts + duration`, rounded). Output frames that land exactly on a source
 /// frame pass it through untouched, as do frames across a scene cut (the
-/// nearer side, see [`CutDetector`]) and past the last source frame.
+/// nearer side) and past the last source frame.
 pub(crate) struct Resampler {
-    synthesis: Synthesis,
-    /// Motion interpolation state; `None` for [`Synthesis::Blend`].
-    motion: Option<MotionState>,
-    /// `None` when scene-cut detection is off.
-    cuts: Option<CutDetector>,
+    interp: Interpolator,
     layout: Layout,
     in_tb: AVRational,
     out_tb: AVRational,
@@ -624,48 +632,16 @@ pub(crate) struct Resampler {
     end: i64,
     /// Whether the current pair straddles a scene cut.
     scene_cut: bool,
-}
-
-/// The [`Resampler`]'s motion-interpolation state.
-struct MotionState {
-    interp: Interpolator,
     /// Prepared copies of source frames, keyed by source pts.
     padded: [(PaddedFrame, Option<i64>); 2],
     /// Source pts of the pair the interpolator's motion field belongs to.
     estimated: Option<(i64, i64)>,
 }
 
-impl MotionState {
-    fn new(layout: Layout) -> Self {
+impl Resampler {
+    pub fn new(layout: Layout, in_tb: AVRational, out_tb: AVRational) -> Self {
         Self {
             interp: Interpolator::new(layout),
-            padded: [
-                (PaddedFrame::new(&layout), None),
-                (PaddedFrame::new(&layout), None),
-            ],
-            estimated: None,
-        }
-    }
-
-    /// Drops cached copies keyed by pts (pts may repeat after a regression).
-    fn invalidate(&mut self) {
-        self.estimated = None;
-        self.padded.iter_mut().for_each(|(_, pts)| *pts = None);
-    }
-}
-
-impl Resampler {
-    pub fn new(
-        layout: Layout,
-        in_tb: AVRational,
-        out_tb: AVRational,
-        synthesis: Synthesis,
-        detect_cuts: bool,
-    ) -> Self {
-        Self {
-            synthesis,
-            motion: (synthesis == Synthesis::Motion).then(|| MotionState::new(layout)),
-            cuts: detect_cuts.then(|| CutDetector::new(layout.width, layout.height)),
             layout,
             in_tb,
             out_tb,
@@ -674,6 +650,11 @@ impl Resampler {
             next_out: None,
             end: 0,
             scene_cut: false,
+            padded: [
+                (PaddedFrame::new(&layout), None),
+                (PaddedFrame::new(&layout), None),
+            ],
+            estimated: None,
         }
     }
 
@@ -688,11 +669,11 @@ impl Resampler {
     /// Feeds the next source frame; returns the output frames it completes.
     pub fn push(&mut self, frame: AVFrame) -> Result<Vec<AVFrame>, anyhow::Error> {
         if frame.pts == ffi::AV_NOPTS_VALUE {
-            log::debug!("Dropping a frame without timestamp before frame interpolation");
+            log::debug!("Dropping a frame without timestamp before motion interpolation");
             return Ok(vec![]);
         }
         if frame_layout(&frame)? != self.layout {
-            bail!("Frame size or format changed mid-stream, which frame interpolation does not support");
+            bail!("Frame size or format changed mid-stream, which motion interpolation does not support");
         }
         let source = Source {
             time: self.in_time(frame.pts),
@@ -703,36 +684,25 @@ impl Resampler {
             av_rescale_q_rnd(source.frame.pts, self.in_tb, self.out_tb, ROUNDING)
         });
         let Some(prev) = self.prev.take() else {
-            self.push_cut_detector(&source.frame)?;
             self.prev = Some(source);
             return Ok(vec![]);
         };
         if source.time <= prev.time {
             log::debug!(
-                "Non-increasing pts {} before frame interpolation, dropping the earlier frame",
+                "Non-increasing pts {} before motion interpolation, dropping the earlier frame",
                 source.frame.pts
             );
-            // Pts may now repeat, so cached copies keyed by pts are stale,
-            // and the dropped frame must not count as the cut detector's
-            // previous frame.
-            if let Some(motion) = &mut self.motion {
-                motion.invalidate();
-            }
-            if let Some(cuts) = &mut self.cuts {
-                cuts.reset();
-            }
-            self.push_cut_detector(&source.frame)?;
+            // Pts may now repeat, so cached copies keyed by pts are stale.
+            self.estimated = None;
+            self.padded.iter_mut().for_each(|(_, pts)| *pts = None);
             self.prev = Some(source);
             return Ok(vec![]);
         }
-        self.scene_cut = self.push_cut_detector(&source.frame)?;
-        if self.scene_cut {
-            log::debug!(
-                "Scene cut between source pts {} and {}; not interpolating across it",
-                prev.frame.pts,
-                source.frame.pts
-            );
-        }
+        let layout = self.layout;
+        self.scene_cut = self.interp.scene_change(
+            frame_planes(&prev.frame, &layout)?[0],
+            frame_planes(&source.frame, &layout)?[0],
+        );
         let mut k = next_out;
         while self.out_time(k) < source.time {
             let offset = (self.out_time(k) - prev.time).max(0);
@@ -747,15 +717,6 @@ impl Resampler {
         let bound = av_rescale_q_rnd(source.frame.pts, self.in_tb, self.out_tb, ROUNDING);
         self.prev = Some(source);
         Ok(self.release(bound))
-    }
-
-    /// Feeds `frame` to the cut detector (if enabled); returns whether a cut
-    /// separates it from the frame fed before.
-    fn push_cut_detector(&mut self, frame: &AVFrame) -> Result<bool, anyhow::Error> {
-        let Some(cuts) = &mut self.cuts else {
-            return Ok(false);
-        };
-        Ok(cuts.push(frame_planes(frame, &self.layout)?[0]))
     }
 
     /// Ends the stream: returns the remaining output frames up to the end of
@@ -804,14 +765,7 @@ impl Resampler {
             let nearer = if alpha > ALPHA_ONE / 2 { next } else { prev };
             return Ok(self.retimed(&nearer.frame, pts));
         }
-        match self.synthesis {
-            // As FFmpeg's `framerate` (default `interp_start`/`interp_end`):
-            // a frame within 1/16 of a source frame is that frame.
-            Synthesis::Blend if alpha < BLEND_START => return Ok(self.retimed(&prev.frame, pts)),
-            Synthesis::Blend if alpha > BLEND_END => return Ok(self.retimed(&next.frame, pts)),
-            Synthesis::Blend => {}
-            Synthesis::Motion => self.estimate(prev, next)?,
-        }
+        self.estimate(prev, next)?;
 
         let mut out = AVFrame::new();
         out.set_format(prev.frame.format);
@@ -823,21 +777,9 @@ impl Resampler {
             .upgrade()
             .map_err(|e| anyhow!("Copying frame properties: {e}"))?;
         let layout = self.layout;
-        let dst = frame_planes_mut(&mut out, &layout)?;
-        match &mut self.motion {
-            Some(MotionState {
-                interp,
-                padded: [(a, _), (b, _)],
-                ..
-            }) => interp.interpolate(a, b, alpha, dst),
-            None => blend(
-                &layout,
-                frame_planes(&prev.frame, &layout)?,
-                frame_planes(&next.frame, &layout)?,
-                alpha,
-                dst,
-            ),
-        }
+        let [(a, _), (b, _)] = &self.padded;
+        self.interp
+            .interpolate(a, b, alpha, frame_planes_mut(&mut out, &layout)?);
         out.set_pts(pts);
         out.set_time_base(self.out_tb);
         unsafe { (*out.as_mut_ptr()).duration = 1 };
@@ -847,45 +789,23 @@ impl Resampler {
     /// Estimates motion for the pair (prev, next) unless already done,
     /// reusing a prepared copy of `prev` from the previous pair.
     fn estimate(&mut self, prev: &Source, next: &Source) -> Result<(), anyhow::Error> {
-        let layout = self.layout;
-        let Some(motion) = &mut self.motion else {
-            return Ok(());
-        };
         let (prev_pts, next_pts) = (prev.frame.pts, next.frame.pts);
-        if motion.estimated == Some((prev_pts, next_pts)) {
+        if self.estimated == Some((prev_pts, next_pts)) {
             return Ok(());
         }
-        if motion.padded[1].1 == Some(prev_pts) {
-            motion.padded.swap(0, 1);
+        let layout = self.layout;
+        if self.padded[1].1 == Some(prev_pts) {
+            self.padded.swap(0, 1);
         } else {
-            motion.padded[0].0.fill(frame_planes(&prev.frame, &layout)?);
-            motion.padded[0].1 = Some(prev_pts);
+            self.padded[0].0.fill(frame_planes(&prev.frame, &layout)?);
+            self.padded[0].1 = Some(prev_pts);
         }
-        motion.padded[1].0.fill(frame_planes(&next.frame, &layout)?);
-        motion.padded[1].1 = Some(next_pts);
-        let [(a, _), (b, _)] = &motion.padded;
-        motion.interp.estimate(a, b);
-        motion.estimated = Some((prev_pts, next_pts));
+        self.padded[1].0.fill(frame_planes(&next.frame, &layout)?);
+        self.padded[1].1 = Some(next_pts);
+        let [(a, _), (b, _)] = &self.padded;
+        self.interp.estimate(a, b);
+        self.estimated = Some((prev_pts, next_pts));
         Ok(())
-    }
-}
-
-/// Cross-fades `prev` and `next` into `dst`: `prev` weighted
-/// `ALPHA_ONE - alpha`, `next` weighted `alpha`, rounded to nearest.
-fn blend(layout: &Layout, prev: [Plane; 3], next: [Plane; 3], alpha: u32, dst: [PlaneMut; 3]) {
-    let (wa, wb) = ((ALPHA_ONE - alpha) as u16, alpha as u16);
-    for (i, ((a, b), d)) in prev.into_iter().zip(next).zip(dst).enumerate() {
-        let (rows, width) = plane_size(layout, i);
-        for y in 0..rows {
-            let (ra, rb) = (
-                &a.data[y * a.stride..][..width],
-                &b.data[y * b.stride..][..width],
-            );
-            let rd = &mut d.data[y * d.stride..][..width];
-            for ((o, &p), &q) in rd.iter_mut().zip(ra).zip(rb) {
-                *o = ((p as u16 * wa + q as u16 * wb + (ALPHA_ONE / 2) as u16) >> 8) as u8;
-            }
-        }
     }
 }
 
@@ -1034,7 +954,7 @@ mod tests {
         };
         let in_tb = AVRational { num: 1, den };
         let out_tb = AVRational { num: 1, den: 24 };
-        let mut resampler = Resampler::new(layout, in_tb, out_tb, Synthesis::Motion, true);
+        let mut resampler = Resampler::new(layout, in_tb, out_tb);
         let pts: Vec<i64> = (0..n).map(|i| 3 * step + i * step).collect();
         let mut out = Vec::new();
         for &p in &pts {
@@ -1058,13 +978,7 @@ mod tests {
             chroma_shift: (1, 1),
         };
         let tb = AVRational { num: 1, den: 48 };
-        let mut resampler = Resampler::new(
-            layout,
-            tb,
-            AVRational { num: 1, den: 24 },
-            Synthesis::Motion,
-            true,
-        );
+        let mut resampler = Resampler::new(layout, tb, AVRational { num: 1, den: 24 });
         let dark = |_: f64, _: f64, _: usize| 40;
         let bright = |_: f64, _: f64, _: usize| 200;
         // A(0) and B(4): the frame between them (pts 1/24) is interpolated.
@@ -1225,129 +1139,24 @@ mod tests {
         assert!(frame_planes_mut(&mut packed, &layout).is_err());
     }
 
-    /// Output frames between two shots repeat the nearer source frame with
-    /// cut detection on, and mix the shots with it off; frames inside a shot
-    /// are interpolated either way. Timestamps do not change.
-    #[test_case(Synthesis::Blend, true ; "blend detect")]
-    #[test_case(Synthesis::Motion, true ; "motion detect")]
-    #[test_case(Synthesis::Blend, false ; "blend off")]
-    #[test_case(Synthesis::Motion, false ; "motion off")]
-    fn test_resampler_scene_cut(synthesis: Synthesis, detect: bool) {
-        let layout = Layout {
-            width: 256,
-            height: 144,
-            chroma_shift: (1, 1),
-        };
-        // 50 fps -> 24 fps; shot A for frames 0..23, shot B from 23. Output
-        // frame 11 sits at source 22.92, between the shots.
-        let (in_tb, out_tb) = (
-            AVRational { num: 1, den: 50 },
-            AVRational { num: 1, den: 24 },
-        );
-        let shot = |i: i64| -> f64 {
-            if i < 23 {
-                0.0
-            } else {
-                1.0
-            }
-        };
-        let image = move |i: i64, x: f64, y: f64| -> u8 {
-            let s = shot(i);
-            let (x, y) = (x + 2.0 * i as f64, y);
-            if s == 0.0 {
-                pattern(x, y)
-            } else {
-                255 - pattern(y * 3.0 + 11.0, x * 2.0 + 5.0)
-            }
-        };
-        let mut resampler = Resampler::new(layout, in_tb, out_tb, synthesis, detect);
-        let mut out = Vec::new();
-        for i in 0..50 {
-            out.extend(
-                resampler
-                    .push(av_frame(&layout, i, 1, move |x, y, _| image(i, x, y)))
-                    .unwrap(),
-            );
-        }
-        out.extend(resampler.finish());
-        assert_eq!(
-            out.iter().map(|f| f.pts).collect::<Vec<_>>(),
-            fps_filter_pts(&(0..50).collect::<Vec<_>>(), 50, in_tb, out_tb)
-        );
-        // Output frames whose two source neighbours are in different shots
-        // must equal one of them (mean luma error ~0) with detection on.
-        let mut straddling = 0;
-        let mut mixed = 0;
-        for f in &out {
-            let u = f.pts as f64 * 50.0 / 24.0;
-            let (lo, hi) = (u.floor() as i64, u.ceil() as i64);
-            if shot(lo) != shot(hi.min(49)) {
-                straddling += 1;
-                let planes = frame_planes(f, &layout).unwrap();
-                let err = |src: i64| {
-                    let mut e = 0.0;
-                    for y in 0..layout.height {
-                        for x in 0..layout.width {
-                            let v = planes[0].data[y * planes[0].stride + x] as f64;
-                            e += (v - image(src, x as f64, y as f64) as f64).abs();
-                        }
-                    }
-                    e / (layout.width * layout.height) as f64
-                };
-                if err(lo).min(err(hi)) > 0.5 {
-                    mixed += 1;
-                }
-            }
-        }
-        assert_eq!(straddling, 1);
-        if detect {
-            assert_eq!(mixed, 0, "{synthesis:?} mixed shots across the cut");
-        } else {
-            assert!(
-                mixed > 0,
-                "{synthesis:?} without detection should interpolate the cut"
-            );
-        }
-    }
-
-    /// A cross-fade at phase alpha weights the frames (256 - alpha, alpha).
     #[test]
-    fn test_blend_weights() {
+    fn test_scene_change() {
         let layout = Layout {
-            width: 8,
-            height: 4,
+            width: 64,
+            height: 32,
             chroma_shift: (1, 1),
         };
-        let a = planes(&layout, |_, _, _| 40);
-        let b = planes(&layout, |_, _, _| 200);
-        let (cw, ch) = layout.chroma_size();
-        let mut out = [
-            vec![0u8; layout.width * layout.height],
-            vec![0u8; cw * ch],
-            vec![0u8; cw * ch],
-        ];
-        fn plane(data: &[u8], stride: usize) -> Plane<'_> {
-            Plane { data, stride }
+        let a = planes(&layout, |x, y, _| pattern(x, y));
+        let b = planes(&layout, |x, y, _| pattern(x + 1.0, y));
+        let cut = planes(&layout, |x, y, _| 255 - pattern(y * 3.0, x * 2.0));
+        fn plane(p: &[Vec<u8>; 3]) -> Plane<'_> {
+            Plane {
+                data: &p[0],
+                stride: 64,
+            }
         }
-        let [y, u, v] = &mut out;
-        blend(
-            &layout,
-            [plane(&a[0], 8), plane(&a[1], cw), plane(&a[2], cw)],
-            [plane(&b[0], 8), plane(&b[1], cw), plane(&b[2], cw)],
-            64,
-            [
-                PlaneMut { data: y, stride: 8 },
-                PlaneMut {
-                    data: u,
-                    stride: cw,
-                },
-                PlaneMut {
-                    data: v,
-                    stride: cw,
-                },
-            ],
-        );
-        // (40 * 192 + 200 * 64 + 128) >> 8 = 80
-        assert!(out.iter().flatten().all(|&p| p == 80));
+        let mut interp = Interpolator::new(layout);
+        assert!(!interp.scene_change(plane(&a), plane(&b)));
+        assert!(interp.scene_change(plane(&b), plane(&cut)));
     }
 }

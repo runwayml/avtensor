@@ -123,14 +123,6 @@ the cost of the default):
 VideoStreamRequest(fps=24.0, fps_conversion="motion")
 ```
 
-Both interpolating modes detect hard scene cuts and use the nearer source
-frame for an output frame that falls between two shots, so no frame mixes two
-unrelated shots. The detector looks for a one-frame spike in frame difference
-against recent motion and confirms it with local block correlation, so fast
-pans and lighting changes don't count as cuts. `scene_cuts="off"`
-interpolates across cuts instead. Frame count and timestamps are the same as
-`"nearest"` in every mode.
-
 ### Decode a time window (seek)
 
 ```python

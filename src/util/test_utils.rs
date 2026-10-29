@@ -664,29 +664,6 @@ pub fn generate_moving_bar_video(
     Ok(file)
 }
 
-/// A 2 s, 50 fps, 320x240 clip with a hard cut after frame 22 (t = 0.46 s):
-/// a moving `testsrc2` pattern, then a moving Mandelbrot zoom. At 24 fps,
-/// output frame 11 (source time 22.92 frames) falls between the two shots.
-pub fn generate_hard_cut_video() -> Result<NamedTempFile, anyhow::Error> {
-    let file = NamedTempFile::with_suffix(".mp4")?;
-    run_ffmpeg(&[
-        "-f",
-        "lavfi",
-        "-i",
-        "testsrc2=s=320x240:r=50:d=0.46[a];\
-         mandelbrot=s=320x240:r=50,trim=duration=1.54,setpts=PTS-STARTPTS[b];\
-         [a][b]concat=n=2:v=1:a=0",
-        "-c:v",
-        "libx264",
-        "-crf",
-        "10",
-        "-pix_fmt",
-        "yuv420p",
-        file.path().to_str().context("temp path")?,
-    ])?;
-    Ok(file)
-}
-
 /// Re-encodes `input` as a variable-frame-rate video: the first 75 frames
 /// keep 30 fps timing, the rest switch to 15 fps timing, producing
 /// non-uniform PTS gaps.
