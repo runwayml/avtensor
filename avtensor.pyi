@@ -38,6 +38,14 @@ class VideoStreamRequest:
     # "raw" when you need the actual HDR signal, e.g. training on PQ
     # masters or colorimetric measurement.
     hdr_mode: Literal["tonemap", "raw"] | None
+    # YUV->RGB conversion: "fast" (libswscale's default path) or "accurate"
+    # (zimg: exact float output, round-to-nearest uint8). Defaults to "fast"
+    # for uint8 (bit-identical to earlier releases) and "accurate" for
+    # float32 (falling back to "fast" with a warning when FFmpeg lacks
+    # zscale/libzimg). The fast path biases uint8 low by ~0.5-1.4 code values
+    # per channel on 4:2:0 sources and scales float32 by 255/256. "accurate"
+    # is not supported with device="cuda".
+    color_conversion: Literal["fast", "accurate"] | None
     # How `fps` resampling builds each output frame: "nearest" (default)
     # keeps the nearest source frame (uneven spacing for e.g. 30 -> 24 fps);
     # "blend" cross-fades neighbouring frames; "motion" interpolates along
@@ -57,6 +65,7 @@ class VideoStreamRequest:
         device: str | None = None,
         dtype: str | None = None,
         hdr_mode: Literal["tonemap", "raw"] | None = None,
+        color_conversion: Literal["fast", "accurate"] | None = None,
         fps_conversion: Literal["nearest", "blend", "motion"] | None = None,
     ): ...
 
