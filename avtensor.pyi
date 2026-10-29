@@ -18,8 +18,11 @@ class VideoStreamRequest:
     width: int | None
     height: int | None
     fps: float | None
-    # FFmpeg decoder threads. Defaults to 1 (best when many decodes run
-    # concurrently); 0 lets FFmpeg pick automatically (faster single decode).
+    # Threads for FFmpeg decoding. Defaults to 1 (best when many decodes run
+    # concurrently); 0 picks automatically (faster single decode). Also sizes
+    # the RGB conversion on the direct conversion path (README: software
+    # decode, rgb24, no resize/fps, width a multiple of 32, SDR or supported
+    # raw HDR); other decodes use the filter graph's pool of up to 16 threads.
     number_of_threads: int | None
     hardware_acceleration: bool | None
     # "NCHW" (default, [T, C, H, W], a non-contiguous view) or "NHWC"
@@ -51,6 +54,24 @@ class VideoStreamRequest:
     # "blend" cross-fades neighbouring frames; "motion" interpolates along
     # estimated block motion (about 1.2-1.6x the cost of "nearest").
     fps_conversion: Literal["nearest", "blend", "motion"] | None
+    # Apply the stream's display-matrix rotation as the ffmpeg CLI's
+    # -autorotate does (90/270 degrees swap width and height). width/height
+    # refer to the rotated frame. Default False: frames come out as coded.
+    # Stream-level matrix only: orientation carried per frame (JPEG EXIF
+    # Orientation, H.264/HEVC display-orientation SEI) is not applied, unlike
+    # the CLI. Not supported with device="cuda" on a rotated stream.
+    autorotate: bool | None
+    # "filter" (default): `fps` resamples with FFmpeg's fps filter, or every
+    # decoded frame is returned. "cli": the ffmpeg CLI's constant-frame-rate
+    # output at the stream's guessed rate (frames duplicated/dropped by
+    # timestamp drift, as `ffmpeg -i in -f rawvideo -` emits them), including
+    # its timestamp-discontinuity correction for MPEG-TS/PS/HLS. "cli"
+    # requires fps unset and a whole-file decode, and is not supported with
+    # device or hardware_acceleration=True. Differences from the CLI: it
+    # autorotates only with autorotate=True (the CLI rotates by the display
+    # matrix by default), and plan_asset is an estimate, not an upper bound
+    # (the output grows past it, up to the output size limit).
+    fps_mode: Literal["filter", "cli"] | None
 
     def __init__(
         self,
@@ -67,6 +88,8 @@ class VideoStreamRequest:
         hdr_mode: Literal["tonemap", "raw"] | None = None,
         color_conversion: Literal["fast", "accurate"] | None = None,
         fps_conversion: Literal["nearest", "blend", "motion"] | None = None,
+        autorotate: bool | None = None,
+        fps_mode: Literal["filter", "cli"] | None = None,
     ): ...
 
 class LoudnessNormalization:
@@ -136,6 +159,12 @@ class MediaDecodeRequest:
     end_time: float | None
     video_stream: VideoStreamRequest | None
     audio_streams: list[AudioStreamRequest] | None
+    # Largest output tensor (bytes) each stream may allocate. Default:
+    # AVTENSOR_MAX_OUTPUT_TENSOR_BYTES when set, else 16 GiB. Per stream, so
+    # video plus N audio streams can total (1 + N)x it; 0 refuses every
+    # non-empty stream. It bounds buffers sized from file metadata, which an
+    # untrusted file controls: raise it per request rather than process-wide.
+    max_output_bytes: int | None
 
     def __init__(
         self,
@@ -145,6 +174,7 @@ class MediaDecodeRequest:
         end_time: float | None = None,
         video_stream: VideoStreamRequest | None = None,
         audio_streams: list[AudioStreamRequest] | None = None,
+        max_output_bytes: int | None = None,
     ): ...
 
 DurationSource = Literal["stream", "container", "none"]
@@ -161,7 +191,8 @@ class AudioStreamMetadata(TypedDict):
 
 class VideoStreamMetadata(TypedDict):
     index: int
-    # Coded dimensions: what the decoder outputs unless a size is requested.
+    # Coded dimensions: what the decoder outputs unless a size is requested
+    # or autorotate turns the frame by 90/270 degrees (swapping them).
     width: int
     height: int
     fps: float
@@ -170,8 +201,10 @@ class VideoStreamMetadata(TypedDict):
     duration_source: DurationSource
     # Frame count from the container header, if it stores one.
     nb_frames: int | None
-    # Display-matrix rotation in degrees (counterclockwise, ffprobe's
-    # `rotation`). The decoder does not apply it.
+    # Stream display-matrix rotation in degrees (counterclockwise, ffprobe's
+    # `rotation`); applied only with VideoStreamRequest(autorotate=True).
+    # None when the orientation is carried per frame (JPEG EXIF Orientation,
+    # H.264/HEVC display-orientation SEI), which is not applied either.
     rotation: float | None
     # Sample aspect ratio (num, den), (0, 1) when unknown. The decoder does
     # not apply it.
@@ -188,8 +221,10 @@ class PlannedStream(TypedDict):
     stream_type: StreamType
     stream_index: int
     # Shape decode_asset allocates; the decoded tensor is trimmed to what was
-    # actually decoded, so this is an upper bound. Video is in the requested
-    # dimension_order; audio is [C, T].
+    # actually decoded, so this is an upper bound, except for video with
+    # fps_mode="cli", whose output grows past it when the CLI emits more
+    # frames (e.g. files with no stored duration plan 1 frame). Video is in
+    # the requested dimension_order; audio is [C, T].
     shape: list[int]
     dtype: Literal["uint8", "float32"]
     # Only set for Video Streams

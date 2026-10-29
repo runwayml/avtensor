@@ -79,8 +79,9 @@ pub struct VideoStreamRequest {
     /// `hardware_acceleration=True`. The returned tensor is CUDA-resident
     /// (NV12 -> RGB conversion runs on the GPU via NPP); frames are never
     /// copied to system memory. `width`/`height` must both be set to an
-    /// even, strictly-downscaled size (NVDEC's scaler) or both unset; `fps`
-    /// and HDR tone mapping are not supported on this path.
+    /// even, strictly-downscaled size (NVDEC's scaler) or both unset; `fps`,
+    /// HDR tone mapping and `autorotate` of a rotated stream are not
+    /// supported on this path.
     #[pyo3(get, set)]
     device: Option<String>,
     /// Element type of the decoded video tensor: "uint8" (the default) or
@@ -117,6 +118,29 @@ pub struct VideoStreamRequest {
     /// even. Motion costs about 1.2-1.6x nearest's decode time.
     #[pyo3(get, set)]
     fps_conversion: Option<String>,
+    /// Apply the stream's display-matrix rotation, as the ffmpeg CLI's
+    /// `-autorotate` does (90°/270° swap the output width and height; other
+    /// angles rotate within the coded size). `width`/`height` refer to the
+    /// rotated frame. Defaults to False: frames are returned as coded, and
+    /// the rotation is reported by `probe_asset`. Only the stream-level
+    /// display matrix is applied: orientation carried per frame (JPEG EXIF
+    /// Orientation, H.264/HEVC display-orientation SEI) is not, unlike the
+    /// CLI.
+    #[pyo3(get, set)]
+    autorotate: Option<bool>,
+    /// How frames are mapped onto the output frame rate: "filter" (the
+    /// default) resamples with FFmpeg's `fps` filter when `fps` is set and
+    /// otherwise returns every decoded frame; "cli" returns the ffmpeg CLI's
+    /// constant-frame-rate output at the stream's guessed frame rate
+    /// (`ffmpeg -i <input> -f rawvideo -`), duplicating and dropping frames
+    /// by their timestamps as the CLI does, after its timestamp-discontinuity
+    /// correction for MPEG-TS/PS/HLS. "cli" requires `fps` unset and decodes
+    /// whole files (no `start_time`/`end_time`); `device` and
+    /// `hardware_acceleration=True` are not supported. Unlike the CLI it
+    /// autorotates only with `autorotate=True`, and `plan_asset` is an
+    /// estimate rather than an upper bound for it.
+    #[pyo3(get, set)]
+    fps_mode: Option<String>,
 }
 
 impl VideoStreamRequest {
@@ -136,7 +160,7 @@ impl VideoStreamRequest {
 #[pymethods]
 impl VideoStreamRequest {
     #[new]
-    #[pyo3(signature = (*, index=None, width=None, height=None, fps=None, number_of_threads=None, hardware_acceleration=None, dimension_order=None, device=None, dtype=None, hdr_mode=None, color_conversion=None, fps_conversion=None))]
+    #[pyo3(signature = (*, index=None, width=None, height=None, fps=None, number_of_threads=None, hardware_acceleration=None, dimension_order=None, device=None, dtype=None, hdr_mode=None, color_conversion=None, fps_conversion=None, autorotate=None, fps_mode=None))]
     #[allow(clippy::too_many_arguments)]
     pub fn py_new(
         index: Option<usize>,
@@ -151,6 +175,8 @@ impl VideoStreamRequest {
         hdr_mode: Option<String>,
         color_conversion: Option<String>,
         fps_conversion: Option<String>,
+        autorotate: Option<bool>,
+        fps_mode: Option<String>,
     ) -> Self {
         VideoStreamRequest {
             index,
@@ -165,6 +191,8 @@ impl VideoStreamRequest {
             hdr_mode,
             color_conversion,
             fps_conversion,
+            autorotate,
+            fps_mode,
         }
     }
 }
@@ -212,6 +240,16 @@ impl VideoStreamRequest {
                 .map(decoder::ColorConversion::try_from)
                 .transpose()?,
             fps_conversion: decoder::FpsConversion::try_from(self.fps_conversion.as_deref())?,
+            autorotate: self.autorotate.unwrap_or(false),
+            fps_mode: match self.fps_mode.as_deref() {
+                None | Some("filter") => decoder::FpsMode::Filter,
+                Some("cli") => decoder::FpsMode::Cli,
+                Some(other) => {
+                    return Err(anyhow::anyhow!(
+                        "fps_mode must be \"filter\" or \"cli\", got {other:?}"
+                    ))
+                }
+            },
         })
     }
 }
@@ -394,18 +432,24 @@ pub struct MediaDecodeRequest {
     /// The audio streams to decode (if any).
     #[pyo3(get, set)]
     audio_streams: Option<Vec<Py<AudioStreamRequest>>>,
+    /// Largest output tensor, in bytes, each stream may allocate (`0` refuses
+    /// every non-empty stream). Defaults to `AVTENSOR_MAX_OUTPUT_TENSOR_BYTES`
+    /// when set, else 16 GiB.
+    #[pyo3(get, set)]
+    max_output_bytes: Option<u64>,
 }
 
 #[pymethods]
 impl MediaDecodeRequest {
     #[new]
-    #[pyo3(signature = (input, *, start_time=None, end_time=None, video_stream=None, audio_streams=None))]
+    #[pyo3(signature = (input, *, start_time=None, end_time=None, video_stream=None, audio_streams=None, max_output_bytes=None))]
     pub fn py_new(
         input: MediaInput,
         start_time: Option<f64>,
         end_time: Option<f64>,
         video_stream: Option<Py<VideoStreamRequest>>,
         audio_streams: Option<Vec<Py<AudioStreamRequest>>>,
+        max_output_bytes: Option<u64>,
     ) -> Self {
         MediaDecodeRequest {
             input,
@@ -413,6 +457,7 @@ impl MediaDecodeRequest {
             end_time,
             video_stream,
             audio_streams,
+            max_output_bytes,
         }
     }
 }
@@ -448,6 +493,7 @@ impl MediaDecodeRequest {
                     .map(|s| s.borrow(py).to_decoder_request(py))
                     .collect()
             }),
+            max_output_bytes: self.max_output_bytes,
         })
     }
 }
@@ -568,9 +614,11 @@ pub struct AudioStreamMetadata {
 pub struct VideoStreamMetadata {
     /// The index of the video stream in the media container.
     index: usize,
-    /// The coded width of the video stream in pixels.
+    /// The coded width of the video stream in pixels (the output height
+    /// when `autorotate` turns the frame by 90°/270°).
     width: usize,
-    /// The coded height of the video stream in pixels.
+    /// The coded height of the video stream in pixels (the output width
+    /// when `autorotate` turns the frame by 90°/270°).
     height: usize,
     /// The average frame rate of the video stream.
     fps: f64,
@@ -582,8 +630,9 @@ pub struct VideoStreamMetadata {
     duration_source: &'static str,
     /// Frame count from the container header, if it stores one.
     nb_frames: Option<i64>,
-    /// Display-matrix rotation in degrees (counterclockwise, ffprobe's
-    /// `rotation`); not applied by the decoder.
+    /// Stream display-matrix rotation in degrees (counterclockwise,
+    /// ffprobe's `rotation`); applied only with `autorotate`. `None` when
+    /// the orientation is carried per frame (JPEG EXIF, H.264/HEVC SEI).
     rotation: Option<f64>,
     /// Sample aspect ratio `(num, den)`, `(0, 1)` when unknown; not applied
     /// by the decoder.
@@ -618,7 +667,9 @@ pub enum PlannedStream {
         stream_index: usize,
         /// Shape of the returned tensor if every planned frame decodes; the
         /// decoded tensor is trimmed to what was decoded, so this is an
-        /// upper bound. In the requested `dimension_order`.
+        /// upper bound, except with `fps_mode="cli"`, whose output grows
+        /// past it when the CLI emits more frames (a file with no stored
+        /// duration plans 1). In the requested `dimension_order`.
         shape: Vec<i64>,
         dtype: &'static str,
         fps: f64,

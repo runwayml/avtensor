@@ -11,7 +11,10 @@ use rsmpeg::{
     ffi::{self, AVPixelFormat, AV_NOPTS_VALUE},
 };
 use std::fmt::{Debug, Display};
-use std::{cmp::min, ffi::CString};
+use std::{
+    cmp::min,
+    ffi::{CStr, CString},
+};
 use tch::IndexOp;
 
 use crate::{
@@ -22,6 +25,7 @@ use crate::{
 
 use crate::conversion;
 
+mod cfr;
 mod cuda;
 mod io;
 mod motion;
@@ -36,6 +40,7 @@ struct StreamContext {
     filter_config: FilterConfig,
     frame_data: tch::Tensor,
     metadata: StreamMetadata,
+    cfr: Option<CliSync>,
 }
 
 struct FilteringContext<'graph> {
@@ -62,6 +67,40 @@ struct FilteringContext<'graph> {
     frame_pts: Vec<f64>,
     // Whether we should continue to route new packets through the FilteringContext.
     finished: bool,
+    /// The CLI's frame-rate sync (`FpsMode::Cli` video streams only), and
+    /// the last frame it emitted, for duplicates of it.
+    cfr: Option<CliSync>,
+}
+
+/// [`cfr::CfrSync`] plus where the previous emitted frame is.
+struct CliSync {
+    sync: cfr::CfrSync,
+    /// The CLI's fixes to packet timestamps, before decoding.
+    demux: cfr::DemuxFixup,
+    /// Row of the output tensor holding the previous emitted frame.
+    previous_row: Option<i64>,
+    /// The request's resolved output limit, which growth stays within.
+    output_limit: OutputLimit,
+    /// Whether the output outgrew its plan.
+    grew: bool,
+}
+
+impl CliSync {
+    /// Whether `rows` rows of `frame_data`'s shape fit the output limit.
+    fn fits(&self, frame_data: &tch::Tensor, rows: i64) -> bool {
+        rows <= max_cli_rows(frame_data, self.output_limit.bytes)
+    }
+
+    /// Grows the output to at least `needed` rows (see [`ensure_cli_capacity`]).
+    fn ensure_capacity(
+        &mut self,
+        frame_data: &mut tch::Tensor,
+        needed: i64,
+        wanted: i64,
+    ) -> anyhow::Result<()> {
+        self.grew |= ensure_cli_capacity(frame_data, needed, wanted, &self.output_limit)?;
+        Ok(())
+    }
 }
 
 struct FilterContext<'graph> {
@@ -147,7 +186,9 @@ pub struct VideoStreamRequest {
     pub width: Option<u32>,
     pub height: Option<u32>,
     pub frame_rate: Option<f64>,
-    /// Number of threads to use for video decoding.
+    /// Number of threads to use for video decoding, and for the RGB
+    /// conversion when it takes the direct swscale path. Defaults to 1; 0
+    /// picks automatically.
     pub number_of_threads: Option<usize>,
     /// Decode on GPU hardware (NVDEC via FFmpeg's `*_cuvid` decoders).
     ///
@@ -178,6 +219,36 @@ pub struct VideoStreamRequest {
     /// How `frame_rate` resampling builds each output frame. Ignored when
     /// `frame_rate` is unset.
     pub fps_conversion: FpsConversion,
+    /// Apply the stream's display-matrix rotation, as the ffmpeg CLI's
+    /// `-autorotate` does: multiples of 90° transpose or flip the frame (and
+    /// swap the output dimensions for 90°/270°), any other angle rotates it
+    /// within the coded frame size. `width`/`height` then refer to the
+    /// rotated frame. Off by default. Only the stream-level display matrix
+    /// is applied: orientation carried per frame (JPEG EXIF Orientation,
+    /// H.264/HEVC display-orientation SEI), which the CLI also applies, is
+    /// not.
+    pub autorotate: bool,
+    /// How the output frame rate is reached (see [`FpsMode`]).
+    pub fps_mode: FpsMode,
+}
+
+/// How decoded frames are mapped onto the output frame rate.
+#[derive(Default, Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FpsMode {
+    /// The `fps` filter at `frame_rate` when one is requested; otherwise
+    /// every decoded frame once. The default.
+    #[default]
+    Filter,
+    /// The ffmpeg CLI's constant-frame-rate output (`-fps_mode cfr`) at the
+    /// stream's guessed frame rate: each frame takes the next output slot and
+    /// is dropped or duplicated by its timestamp drift, so the output matches
+    /// what `ffmpeg -i <input> -f rawvideo -` produces, including the CLI's
+    /// timestamp fixes before decoding (discontinuities in MPEG-TS/PS/HLS).
+    /// `frame_rate`, `device`, `hardware_acceleration` and a seek window must
+    /// be unset. Duplicates are copies of the frame in the output tensor. The
+    /// plan is an estimate the output grows past, up to the output limit.
+    /// Unlike the CLI, frames are autorotated only with `autorotate`.
+    Cli,
 }
 
 #[derive(Default, Debug, Clone)]
@@ -218,6 +289,10 @@ pub struct MediaDecodeRequest {
     pub end_time: Option<f64>,
     pub video_stream: Option<VideoStreamRequest>,
     pub audio_streams: Option<Vec<AudioStreamRequest>>,
+    /// Largest output tensor (bytes) each stream may allocate; `None` uses
+    /// `AVTENSOR_MAX_OUTPUT_TENSOR_BYTES`, else 16 GiB. Every stream is
+    /// checked before any buffer is allocated.
+    pub max_output_bytes: Option<u64>,
 }
 
 struct Seek {
@@ -236,7 +311,9 @@ pub fn decode_media(
         end_time,
         video_stream: video_stream_request,
         audio_streams,
+        max_output_bytes,
     } = request;
+    let output_limit = OutputLimit::resolve(max_output_bytes);
 
     let mut input_format_context = source.open(s3_config)?;
 
@@ -257,24 +334,39 @@ pub fn decode_media(
         end_time,
     };
 
+    // Plan every stream before allocating any buffer, so a stream over the
+    // output limit fails the request before another stream's buffer exists.
+    let video_plan = video_stream
+        .as_ref()
+        .map(|video_stream| {
+            plan_video_stream(&input_format_context, video_stream, &seek, &output_limit)
+        })
+        .transpose()?;
+    let audio_plans = audio_streams
+        .iter()
+        .flatten()
+        .map(|audio_stream| {
+            plan_audio_stream(&input_format_context, audio_stream, &seek, &output_limit)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+
     // Configure video decoder
-    if let Some(video_stream) = &video_stream {
+    if let (Some(video_stream), Some(plan)) = (&video_stream, video_plan) {
         stream_ctx.push(init_video_stream_context(
             &input_format_context,
             video_stream,
-            &seek,
+            plan,
+            &output_limit,
         )?);
     }
 
     // Configure audio decoder(s)
-    if let Some(audio_streams) = audio_streams {
-        for audio_stream in audio_streams.iter() {
-            stream_ctx.push(init_audio_stream_context(
-                &input_format_context,
-                audio_stream,
-                &seek,
-            )?);
-        }
+    for (audio_stream, plan) in audio_streams.iter().flatten().zip(audio_plans) {
+        stream_ctx.push(init_audio_stream_context(
+            &input_format_context,
+            audio_stream,
+            plan,
+        )?);
     }
 
     // Plain conversions bypass these graphs entirely (see `DirectPath`); the
@@ -331,7 +423,7 @@ pub fn decode_media(
 
     // Read packets from the demuxer and route them to the filter graph.
     loop {
-        let packet = match input_format_context.read_packet() {
+        let mut packet = match input_format_context.read_packet() {
             Ok(Some(p)) => p,
             Ok(None) => break, // End of file reached
             Err(e) => bail!("Failed to read packet: {e:?}"),
@@ -343,6 +435,13 @@ pub fn decode_media(
             .iter_mut()
             .find(|f| f.stream_index == in_stream_index && !f.finished)
         {
+            if let Some(cli) = &mut filter.cfr {
+                let stream = input_format_context
+                    .streams()
+                    .get(in_stream_index)
+                    .context("packet of an unknown stream")?;
+                fix_cli_packet(&mut cli.demux, &mut packet, stream);
+            }
             let pkt_timebase = filter.dec_ctx.pkt_timebase;
             let pts_seconds = pts_to_seconds(packet.pts, pkt_timebase);
             log::trace!(
@@ -422,6 +521,7 @@ pub fn decode_media(
             frame_data,
             frame_data_ptr,
             frame_pts,
+            cfr,
             ..
         } = filter_ctx;
 
@@ -444,12 +544,18 @@ pub fn decode_media(
             frame_data,
             frame_data_ptr,
             frame_pts,
+            cfr,
             &seek,
         )?;
         log::debug!(
             "Received {} frames after flushing the decoder",
             frames.len()
         );
+        if let Some(cli) = cfr {
+            // The CLI repeats the last frame as often as recent frames were.
+            let copies = cli.sync.finish();
+            emit_previous_copies(cli, copies, frame_data, frame_data_ptr, frame_pts)?;
+        }
         // Drop any frames returned by the decoder past the seek range.
         let frames = filter_frames_seek(frames, &seek);
         decoded_stream.decoded_frames.extend(frames);
@@ -503,17 +609,27 @@ pub fn decode_media(
     // the `data` field is not optional such that the type system can guarantee its presence?
     for FilteringContext {
         stream_index,
-        frame_data,
+        mut frame_data,
         frame_data_ptr,
         mut frame_pts,
         stream_type,
+        cfr,
         ..
     } in filter_ctx.into_iter()
     {
+        let decoded_stream = decoded_streams
+            .iter_mut()
+            .find(|s| s.src_stream_index == stream_index)
+            .context("Decoded stream not found for the given stream index")?;
         let trimmed_data = match stream_type {
             StreamType::Video => {
                 let rows = min(frame_data_ptr as i64, frame_data.size()[0]);
                 frame_pts.truncate(rows as usize);
+                if cfr.is_some_and(|cli| cli.grew) {
+                    // Growth leaves up to a quarter of the rows unused; keep
+                    // them out of the returned tensor's storage.
+                    trim_cli_output(&mut frame_data, rows, &decoded_stream.decoded_frames);
+                }
                 frame_data.f_narrow(0, 0, rows).context(
                 "Failed to trim video frame data Tensor to the correct number of decoded frames",
             )?
@@ -524,10 +640,6 @@ pub fn decode_media(
                 "Failed to trim audio frame data Tensor to the correct number of decoded samples",
             )?,
         };
-        let decoded_stream = decoded_streams
-            .iter_mut()
-            .find(|s| s.src_stream_index == stream_index)
-            .context("Decoded stream not found for the given stream index")?;
         decoded_stream.data = Some(trimmed_data);
         decoded_stream.frame_pts = frame_pts;
     }
@@ -539,9 +651,13 @@ pub fn decode_media(
 #[derive(Debug, Clone)]
 pub struct ProbedVideoStream {
     pub index: usize,
-    /// Coded width; the decoder outputs this unless a width is requested.
+    /// Coded width; the decoder outputs this unless a width is requested
+    /// or `autorotate` turns the frame by 90°/270° (it then outputs
+    /// `height`).
     pub width: i32,
-    /// Coded height; the decoder outputs this unless a height is requested.
+    /// Coded height; the decoder outputs this unless a height is requested
+    /// or `autorotate` turns the frame by 90°/270° (it then outputs
+    /// `width`).
     pub height: i32,
     pub fps: f64,
     pub codec_name: String,
@@ -551,7 +667,9 @@ pub struct ProbedVideoStream {
     pub nb_frames: Option<i64>,
     /// Display-matrix rotation in degrees, as reported by
     /// `av_display_rotation_get` (counterclockwise; ffprobe's `rotation`).
-    /// The decoder does not apply it.
+    /// The decoder applies it only with [`VideoStreamRequest::autorotate`].
+    /// Stream-level matrix only: `None` when the orientation is carried per
+    /// frame (JPEG EXIF Orientation, H.264/HEVC display-orientation SEI).
     pub rotation: Option<f64>,
     /// Sample (pixel) aspect ratio as `(num, den)`; `(0, 1)` when unknown.
     /// The decoder does not apply it.
@@ -650,7 +768,9 @@ pub fn plan_media(
         end_time,
         video_stream,
         audio_streams,
+        max_output_bytes,
     } = request;
+    let output_limit = OutputLimit::resolve(max_output_bytes);
     let input_format_context = source.open(s3_config)?;
     let video_stream = select_video_stream(&input_format_context, video_stream)?;
     let audio_streams = select_audio_streams(&input_format_context, audio_streams)?;
@@ -664,6 +784,7 @@ pub fn plan_media(
             &input_format_context,
             video_stream,
             &seek,
+            &output_limit,
         )?);
     }
     for audio_stream in audio_streams.iter().flatten() {
@@ -671,6 +792,7 @@ pub fn plan_media(
             &input_format_context,
             audio_stream,
             &seek,
+            &output_limit,
         )?);
     }
     Ok(plans)
@@ -698,6 +820,19 @@ fn codec_name(codec_id: ffi::AVCodecID) -> String {
 
 /// The stream's display-matrix rotation (degrees, counterclockwise), if any.
 fn display_rotation(codecpar: &ffi::AVCodecParameters) -> Option<f64> {
+    let rotation = unsafe { ffi::av_display_rotation_get(display_matrix(codecpar)?.as_ptr()) };
+    rotation.is_finite().then_some(rotation)
+}
+
+/// The stream's display matrix, if it has one.
+///
+/// This is the stream-level matrix only (e.g. an MP4 `tkhd` matrix). The
+/// ffmpeg CLI takes the matrix from each decoded frame, so it also applies
+/// orientation that only reaches the frames: JPEG EXIF Orientation and
+/// H.264/HEVC display-orientation SEI. Those are neither reported nor
+/// applied here; doing so needs the first decoded frame, which `plan_media`
+/// does not decode.
+fn display_matrix(codecpar: &ffi::AVCodecParameters) -> Option<[i32; 9]> {
     let side_data = unsafe {
         ffi::av_packet_side_data_get(
             codecpar.coded_side_data,
@@ -708,8 +843,80 @@ fn display_rotation(codecpar: &ffi::AVCodecParameters) -> Option<f64> {
     if side_data.is_null() || unsafe { (*side_data).size } < 9 * 4 {
         return None;
     }
-    let rotation = unsafe { ffi::av_display_rotation_get((*side_data).data as *const i32) };
-    rotation.is_finite().then_some(rotation)
+    Some(unsafe { *((*side_data).data as *const [i32; 9]) })
+}
+
+/// The filters ffmpeg's `-autorotate` inserts for a display matrix
+/// (`get_rotation` and `configure_input_video_filter` in FFmpeg 7.1's
+/// fftools), including the flips of mirrored matrices.
+fn autorotate_filters(matrix: &[i32; 9]) -> Vec<String> {
+    let rotation = unsafe { ffi::av_display_rotation_get(matrix.as_ptr()) };
+    if !rotation.is_finite() {
+        return vec![]; // a degenerate matrix
+    }
+    // Clockwise, in whole degrees normalized to 0..=359, as `get_rotation`.
+    let mut theta = -rotation.round();
+    theta -= 360.0 * (theta / 360.0 + 0.9 / 360.0).floor();
+    if (theta - 90.0).abs() < 1.0 {
+        vec![if matrix[3] > 0 {
+            "transpose=cclock_flip"
+        } else {
+            "transpose=clock"
+        }
+        .to_string()]
+    } else if (theta - 180.0).abs() < 1.0 {
+        let mut filters = vec![];
+        if matrix[0] < 0 {
+            filters.push("hflip".to_string());
+        }
+        if matrix[4] < 0 {
+            filters.push("vflip".to_string());
+        }
+        filters
+    } else if (theta - 270.0).abs() < 1.0 {
+        vec![if matrix[3] < 0 {
+            "transpose=clock_flip"
+        } else {
+            "transpose=cclock"
+        }
+        .to_string()]
+    } else if theta.abs() > 1.0 {
+        vec![format!("rotate={theta:.6}*PI/180")]
+    } else if theta.abs() < 1.0 && matrix[4] < 0 {
+        // theta is whole, so this is theta == 0: at exactly 1° the CLI
+        // applies nothing, not even a mirrored matrix's vflip.
+        vec!["vflip".to_string()]
+    } else {
+        vec![]
+    }
+}
+
+/// Whether the rotation `filters` swap the frame's width and height.
+fn swaps_dimensions(filters: &[String]) -> bool {
+    filters.first().is_some_and(|f| f.starts_with("transpose"))
+}
+
+/// The rotation filters `request` applies to the stream: empty unless
+/// autorotate is on and the stream's display matrix rotates or mirrors.
+/// Shared by decode and plan, so both refuse GPU-resident output (which
+/// never reaches the filter graph) for a rotated stream.
+fn requested_rotation(
+    request: &VideoStreamRequest,
+    codecpar: &ffi::AVCodecParameters,
+) -> Result<Vec<String>, anyhow::Error> {
+    if !request.autorotate {
+        return Ok(vec![]);
+    }
+    let filters = display_matrix(codecpar)
+        .map(|m| autorotate_filters(&m))
+        .unwrap_or_default();
+    if request.device.is_some() && !filters.is_empty() {
+        return Err(anyhow!(
+            "device=\"cuda\" does not support autorotate (frames never \
+             reach the CPU filter graph)"
+        ));
+    }
+    Ok(filters)
 }
 
 /// Selects video streams to decode
@@ -790,11 +997,15 @@ fn select_audio_streams(
     })
 }
 
-/// Initializes the video stream processor.
+/// Initializes the video stream processor and allocates `plan`'s buffer,
+/// which must come from [`plan_video_stream`] (which also validates
+/// `fps_mode` before any decoder or CUDA device is set up). A
+/// `FpsMode::Cli` output grows within `output_limit`.
 fn init_video_stream_context(
     input_format_context: &AVFormatContextInput,
     request: &VideoStreamRequest,
-    seek: &Seek,
+    plan: StreamPlan,
+    output_limit: &OutputLimit,
 ) -> Result<StreamContext, anyhow::Error> {
     let video_index = request
         .index
@@ -849,9 +1060,13 @@ fn init_video_stream_context(
         .apply_codecpar(&codecpar)
         .context("Failed to apply codec parameters to video decode context")?;
 
+    // Rotation filters for autorotate (empty when off or not rotated).
+    let rotate = requested_rotation(request, &codecpar)?;
+
     if let Some(device) = request.device {
         // GPU-resident output is a constrained pipeline: frames never reach
-        // system memory, so only NVDEC's own capabilities are available.
+        // system memory, so only NVDEC's own capabilities are available
+        // (autorotate is refused by requested_rotation above).
         if request.frame_rate.is_some() {
             return Err(anyhow!(
                 "device=\"cuda\" does not support fps resampling (frames never \
@@ -958,7 +1173,9 @@ fn init_video_stream_context(
     // by the scale factor and removes most of the CPU scaling cost; the
     // filter graph still runs afterwards and guarantees the exact requested
     // dimensions.
-    let hw_resize = if hardware_acceleration {
+    // The resize request refers to the rotated frame, so NVDEC (which scales
+    // before rotation) only pre-resizes unrotated streams.
+    let hw_resize = if hardware_acceleration && rotate.is_empty() {
         compute_hw_resize(codecpar.width, codecpar.height, request)
     } else {
         None
@@ -987,12 +1204,19 @@ fn init_video_stream_context(
     let mut video_filter = VideoFilterConfig::try_from(request)?;
     if request.width.is_some() || request.height.is_some() {
         // Give the graph both dimensions so it produces exactly the planned
-        // shape (`scale` and `zscale` reject a lone width or height).
-        let (w, h) = resolve_output_size(codecpar.width as i64, codecpar.height as i64, request);
+        // shape (`scale` and `zscale` reject a lone width or height). With
+        // autorotate they refer to the rotated frame, as in the plan.
+        let (src_w, src_h) = if swaps_dimensions(&rotate) {
+            (codecpar.height as i64, codecpar.width as i64)
+        } else {
+            (codecpar.width as i64, codecpar.height as i64)
+        };
+        let (w, h) = resolve_output_size(src_w, src_h, request);
         video_filter.width = Some(w as usize);
         video_filter.height = Some(h as usize);
     }
     video_filter.source_color = SourceColorInfo::from_codec_context(&decode_context);
+    video_filter.rotate = rotate;
     log::debug!("Source color info: {:?}", video_filter.source_color);
     video_filter.source_format = SourceFormat::new(
         buffersrc_pixel_format(&decode_context),
@@ -1015,7 +1239,6 @@ fn init_video_stream_context(
         }
     }
 
-    let plan = plan_video_stream(input_format_context, request, seek)?;
     log::debug!(
         "Allocating Tensor with shape {:?} to decode video to.",
         plan.shape
@@ -1030,6 +1253,26 @@ fn init_video_stream_context(
     let dest =
         crate::alloc::empty(&plan.shape, kind, device).context("allocating output Tensor")?;
 
+    let cfr = match request.fps_mode {
+        FpsMode::Filter => None,
+        // Validated above.
+        FpsMode::Cli => {
+            let start_time = cli_start_time(input_format_context, video_stream);
+            Some(CliSync {
+                sync: cfr::CfrSync::new(
+                    cli_frame_rate(video_stream),
+                    video_stream.time_base,
+                    start_time,
+                    input_format_context.nb_streams == 1,
+                ),
+                demux: cli_demux_fixup(input_format_context, video_stream, start_time),
+                previous_row: None,
+                output_limit: output_limit.clone(),
+                grew: false,
+            })
+        }
+    };
+
     Ok(StreamContext {
         stream_type: StreamType::Video,
         stream_index: video_index,
@@ -1037,6 +1280,7 @@ fn init_video_stream_context(
         filter_config: FilterConfig::Video(video_filter),
         frame_data: dest,
         metadata: plan.metadata,
+        cfr,
     })
 }
 
@@ -1054,7 +1298,8 @@ pub enum DurationSource {
 /// The output buffer a decode preallocates for one stream, derived from
 /// container metadata and the request alone. [`decode_media`] allocates
 /// exactly `shape` and trims it to the frames/samples actually decoded, so
-/// `shape` is an upper bound on the returned tensor.
+/// `shape` is an upper bound on the returned tensor, except for
+/// `FpsMode::Cli` video, which grows past it when more frames are emitted.
 #[derive(Debug, Clone)]
 pub struct StreamPlan {
     pub stream_index: usize,
@@ -1078,12 +1323,15 @@ impl StreamPlan {
     }
 }
 
-/// Plans the decode of the video stream selected by `request.index`.
+/// Plans the decode of the video stream selected by `request.index`, whose
+/// buffer may not exceed `max_output_bytes`.
 fn plan_video_stream(
     input_format_context: &AVFormatContextInput,
     request: &VideoStreamRequest,
     seek: &Seek,
+    output_limit: &OutputLimit,
 ) -> Result<StreamPlan, anyhow::Error> {
+    validate_fps_mode(request, seek)?;
     let video_index = request
         .index
         .ok_or(anyhow!("No video stream index specified"))?;
@@ -1092,6 +1340,7 @@ fn plan_video_stream(
         .get(video_index)
         .context("Failed to get video stream")?;
     let codecpar = video_stream.codecpar();
+    let rotate = requested_rotation(request, &codecpar)?;
     let source_frame_rate = video_stream
         .guess_framerate()
         .unwrap_or(video_stream.avg_frame_rate);
@@ -1100,14 +1349,21 @@ fn plan_video_stream(
         match stream_duration_seconds(input_format_context, video_stream) {
             None => {
                 // If neither the stream nor the container reports a duration, assume we are dealing with an image.
-                (1, 1.0, None, DurationSource::None)
+                // CLI mode still outputs at the stream's rate (and grows).
+                let frame_rate = match request.fps_mode {
+                    FpsMode::Cli => av_q2d(cli_frame_rate(video_stream)),
+                    FpsMode::Filter => 1.0,
+                };
+                (1, frame_rate, None, DurationSource::None)
             }
             Some((stream_duration, duration_source)) => {
                 // Estimate the duration of media we'll be decoding, this will be the minimum of the specified end time (if any), or duration of the stream.
                 let duration_seconds = asset_duration(stream_duration, seek)?;
 
                 // In order to allocate storage for the decoded frames, we need to know the frame rate.
-                let frame_rate = if let Some(frame_rate) = request.frame_rate {
+                let frame_rate = if request.fps_mode == FpsMode::Cli {
+                    av_q2d(cli_frame_rate(video_stream))
+                } else if let Some(frame_rate) = request.frame_rate {
                     frame_rate
                 } else {
                     // Convert `frame_rate` to double.
@@ -1130,7 +1386,22 @@ fn plan_video_stream(
                     }
                 };
                 let epsilon = (1.0 / frame_rate) * 0.5; // Small epsilon to avoid floating point precision errors causing trailing black frames because we've allocated too many frames.
-                let num_frames = ((duration_seconds - epsilon) * frame_rate).ceil() as i64;
+                let num_frames = if request.fps_mode == FpsMode::Cli {
+                    // The CLI's output runs from the file's start (which an
+                    // audio track can put before the video's) to the
+                    // stream's end, and its last frame may repeat; allow
+                    // for both. The tensor is trimmed to what is emitted.
+                    // A container-wide duration already spans the lead.
+                    let lead = match duration_source {
+                        DurationSource::Stream => (stream_start_seconds(video_stream)
+                            - cli_start_time(input_format_context, video_stream) as f64 / 1e6)
+                            .max(0.0),
+                        _ => 0.0,
+                    };
+                    ((duration_seconds + lead) * frame_rate).ceil() as i64 + 2
+                } else {
+                    ((duration_seconds - epsilon) * frame_rate).ceil() as i64
+                };
                 (
                     num_frames,
                     frame_rate,
@@ -1140,8 +1411,15 @@ fn plan_video_stream(
             }
         };
 
+    // With autorotate, a 90°/270° rotation swaps the displayed dimensions;
+    // `width`/`height` (and a lone one's aspect ratio) refer to that frame.
+    let (display_width, display_height) = if swaps_dimensions(&rotate) {
+        (codecpar.height, codecpar.width)
+    } else {
+        (codecpar.width, codecpar.height)
+    };
     let (out_width, out_height) =
-        resolve_output_size(codecpar.width as i64, codecpar.height as i64, request);
+        resolve_output_size(display_width as i64, display_height as i64, request);
     // uint8 decodes to packed rgb24 ([T, H, W, C]); float32 decodes to
     // planar float ([T, C, H, W], contiguous channels-first).
     let (shape, element_size) = match request.dtype {
@@ -1154,7 +1432,7 @@ fn plan_video_stream(
             std::mem::size_of::<f32>(),
         ),
     };
-    check_output_tensor_size(&shape, element_size)?;
+    check_output_tensor_size(&shape, element_size, output_limit)?;
 
     Ok(StreamPlan {
         stream_index: video_index,
@@ -1166,11 +1444,13 @@ fn plan_video_stream(
     })
 }
 
-/// Plans the decode of the audio stream selected by `request.index`.
+/// Plans the decode of the audio stream selected by `request.index`, whose
+/// buffer may not exceed `max_output_bytes`.
 fn plan_audio_stream(
     input_format_context: &AVFormatContextInput,
     request: &AudioStreamRequest,
     seek: &Seek,
+    output_limit: &OutputLimit,
 ) -> Result<StreamPlan, anyhow::Error> {
     let audio_index = request
         .index
@@ -1210,7 +1490,7 @@ fn plan_audio_stream(
         ));
     }
     let shape = vec![num_channels as i64, num_samples as i64];
-    check_output_tensor_size(&shape, std::mem::size_of::<f32>())?;
+    check_output_tensor_size(&shape, std::mem::size_of::<f32>(), output_limit)?;
 
     Ok(StreamPlan {
         stream_index: audio_index,
@@ -1224,10 +1504,12 @@ fn plan_audio_stream(
     })
 }
 
+/// Initializes an audio stream processor and allocates `plan`'s buffer, which
+/// must come from [`plan_audio_stream`].
 fn init_audio_stream_context(
     input_format_context: &AVFormatContextInput,
     request: &AudioStreamRequest,
-    seek: &Seek,
+    plan: StreamPlan,
 ) -> Result<StreamContext, anyhow::Error> {
     let audio_index = request
         .index
@@ -1251,7 +1533,6 @@ fn init_audio_stream_context(
         .context("Failed to open audio codec")?;
 
     let filter_config = AudioFilterConfig::try_from(request)?;
-    let plan = plan_audio_stream(input_format_context, request, seek)?;
     log::debug!(
         "Allocating Tensor with shape {:?} to decode audio to for stream #{}.",
         plan.shape,
@@ -1265,20 +1546,145 @@ fn init_audio_stream_context(
         stream_index: audio_index,
         dec_ctx: decode_context,
         filter_config: FilterConfig::Audio(filter_config),
+        cfr: None,
         frame_data: dest,
         metadata: plan.metadata,
     })
 }
 
-/// Maximum number of bytes avtensor will preallocate for a single decoded
+/// Default ceiling on the buffer avtensor preallocates for a single decoded
 /// stream. Duration, frame rate, dimensions, and sample rate all come from
 /// file metadata and are attacker-controllable, so this bounds the up-front
 /// allocation rather than trusting those values.
-const MAX_OUTPUT_TENSOR_BYTES: u128 = 16 * 1024 * 1024 * 1024; // 16 GiB
+const DEFAULT_MAX_OUTPUT_TENSOR_BYTES: u128 = 16 * 1024 * 1024 * 1024; // 16 GiB
+
+const MAX_OUTPUT_TENSOR_BYTES_VAR: &str = "AVTENSOR_MAX_OUTPUT_TENSOR_BYTES";
+
+/// The per-stream output size limit of one request, and where it came from
+/// (named in the error when a stream exceeds it).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct OutputLimit {
+    bytes: u128,
+    source: OutputLimitSource,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum OutputLimitSource {
+    /// `MediaDecodeRequest.max_output_bytes`.
+    Request,
+    /// `AVTENSOR_MAX_OUTPUT_TENSOR_BYTES`, with its raw value.
+    Env(String),
+    /// Neither is set.
+    Default,
+    /// `AVTENSOR_MAX_OUTPUT_TENSOR_BYTES` holds this invalid value, so the
+    /// default applies.
+    InvalidEnv(String),
+}
+
+impl OutputLimit {
+    /// The request's own limit, else `AVTENSOR_MAX_OUTPUT_TENSOR_BYTES`, else
+    /// [`DEFAULT_MAX_OUTPUT_TENSOR_BYTES`]. Some decodes legitimately exceed
+    /// the default: 30 s of uncropped 4K rgb24 is about 22 GB.
+    fn resolve(requested: Option<u64>) -> Self {
+        match requested {
+            Some(bytes) => OutputLimit {
+                bytes: bytes.into(),
+                source: OutputLimitSource::Request,
+            },
+            None => Self::from_env(match std::env::var(MAX_OUTPUT_TENSOR_BYTES_VAR) {
+                Ok(value) => Some(value),
+                Err(std::env::VarError::NotPresent) => None,
+                Err(std::env::VarError::NotUnicode(value)) => {
+                    Some(value.to_string_lossy().into_owned())
+                }
+            }),
+        }
+    }
+
+    fn from_env(value: Option<String>) -> Self {
+        let default = |source| OutputLimit {
+            bytes: DEFAULT_MAX_OUTPUT_TENSOR_BYTES,
+            source,
+        };
+        match value {
+            None => default(OutputLimitSource::Default),
+            Some(value) if value.trim().is_empty() => default(OutputLimitSource::Default),
+            Some(value) => match parse_byte_size(&value) {
+                Some(bytes) => OutputLimit {
+                    bytes,
+                    source: OutputLimitSource::Env(value),
+                },
+                None => {
+                    log::warn!(
+                        "Ignoring invalid {MAX_OUTPUT_TENSOR_BYTES_VAR} value {value:?}; \
+                         using the default of {DEFAULT_MAX_OUTPUT_TENSOR_BYTES} bytes"
+                    );
+                    default(OutputLimitSource::InvalidEnv(value))
+                }
+            },
+        }
+    }
+}
+
+impl Display for OutputLimit {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let bytes = self.bytes;
+        let var = MAX_OUTPUT_TENSOR_BYTES_VAR;
+        match &self.source {
+            OutputLimitSource::Request => {
+                write!(f, "the request's max_output_bytes of {bytes} bytes")
+            }
+            OutputLimitSource::Env(value) => write!(
+                f,
+                "the limit of {bytes} bytes set by {var}={value:?} (raise it, or \
+                 per request with MediaDecodeRequest(max_output_bytes=...))"
+            ),
+            OutputLimitSource::Default => write!(
+                f,
+                "the default limit of {bytes} bytes (raise it per request with \
+                 MediaDecodeRequest(max_output_bytes=...) or process-wide with {var})"
+            ),
+            OutputLimitSource::InvalidEnv(value) => write!(
+                f,
+                "the default limit of {bytes} bytes: {var}={value:?} was ignored because \
+                 it is not a byte count such as 34359738368 or 32G (fix it, or raise the \
+                 limit per request with MediaDecodeRequest(max_output_bytes=...))"
+            ),
+        }
+    }
+}
+
+/// Parses a byte count with an optional binary suffix, case-insensitive:
+/// `1024`, `512K`, `64M`, `32G`, `1T`, or `KiB`/`MiB`/`GiB`/`TiB`. `KB`-style
+/// suffixes are rejected rather than guessed as decimal or binary. A leading
+/// `+` is accepted, as `u128::from_str` does.
+fn parse_byte_size(value: &str) -> Option<u128> {
+    let value = value.trim();
+    let value = value.strip_prefix('+').unwrap_or(value);
+    let (number, suffix) = value.split_at(
+        value
+            .find(|c: char| !c.is_ascii_digit())
+            .unwrap_or(value.len()),
+    );
+    let number: u128 = number.parse().ok()?;
+    let shift = match suffix.trim_start().to_ascii_lowercase().as_str() {
+        "" | "b" => 0,
+        "k" | "kib" => 10,
+        "m" | "mib" => 20,
+        "g" | "gib" => 30,
+        "t" | "tib" => 40,
+        _ => return None,
+    };
+    number.checked_mul(1 << shift)
+}
 
 /// Rejects output shapes that contain a negative dimension or whose total
-/// allocation would exceed [`MAX_OUTPUT_TENSOR_BYTES`].
-fn check_output_tensor_size(shape: &[i64], element_size: usize) -> Result<(), anyhow::Error> {
+/// allocation would exceed `limit`.
+fn check_output_tensor_size(
+    shape: &[i64],
+    element_size: usize,
+    limit: &OutputLimit,
+) -> Result<(), anyhow::Error> {
     let mut total = element_size as u128;
     for &dim in shape {
         let dim = u128::try_from(dim)
@@ -1287,9 +1693,9 @@ fn check_output_tensor_size(shape: &[i64], element_size: usize) -> Result<(), an
             .checked_mul(dim)
             .ok_or_else(|| anyhow!("output tensor size overflow for shape {shape:?}"))?;
     }
-    if total > MAX_OUTPUT_TENSOR_BYTES {
+    if total > limit.bytes {
         return Err(anyhow!(
-            "output tensor for shape {shape:?} would require {total} bytes, exceeding the maximum of {MAX_OUTPUT_TENSOR_BYTES} bytes"
+            "output tensor for shape {shape:?} would require {total} bytes, exceeding {limit}"
         ));
     }
     Ok(())
@@ -1316,6 +1722,126 @@ fn stream_duration_seconds(
         stream.index
     );
     Some((container_duration, DurationSource::Container))
+}
+
+/// Rejects requests `FpsMode::Cli` cannot serve, for planning and decoding
+/// alike.
+fn validate_fps_mode(request: &VideoStreamRequest, seek: &Seek) -> Result<(), anyhow::Error> {
+    if request.fps_mode != FpsMode::Cli {
+        return Ok(());
+    }
+    if request.frame_rate.is_some() {
+        return Err(anyhow!(
+            "fps_mode=\"cli\" outputs the stream's own frame rate and cannot be combined with fps"
+        ));
+    }
+    if request.device.is_some() {
+        return Err(anyhow!(
+            "fps_mode=\"cli\" is not supported with device=\"cuda\""
+        ));
+    }
+    // NVDEC frames carry no duration, which the sync needs to match the CLI.
+    if request.hardware_acceleration == Some(true) {
+        return Err(anyhow!(
+            "fps_mode=\"cli\" is not supported with hardware_acceleration=True"
+        ));
+    }
+    if seek.start_time.is_some() || seek.end_time.is_some() {
+        return Err(anyhow!(
+            "fps_mode=\"cli\" decodes whole files; start_time and end_time are not supported"
+        ));
+    }
+    Ok(())
+}
+
+/// The stream's first timestamp in seconds (0 when unknown).
+fn stream_start_seconds(stream: &AVStreamRef) -> f64 {
+    if stream.start_time == AV_NOPTS_VALUE {
+        0.0
+    } else {
+        stream.start_time as f64 * av_q2d(stream.time_base)
+    }
+}
+
+/// The output frame rate the ffmpeg CLI uses for a stream: its guessed
+/// frame rate (`tbr`), or 25 without one.
+fn cli_frame_rate(stream: &AVStreamRef) -> AVRational {
+    match stream.guess_framerate() {
+        Some(rate) if rate.num > 0 && rate.den > 0 => rate,
+        _ => AVRational { num: 25, den: 1 },
+    }
+}
+
+/// Whether the format allows timestamp discontinuities (MPEG-TS/PS, HLS).
+fn has_ts_discontinuities(input_format_context: &AVFormatContextInput) -> bool {
+    input_format_context.iformat().flags & ffi::AVFMT_TS_DISCONT as i32 != 0
+}
+
+/// The start time (microseconds; 0 when unknown) the CLI shifts all
+/// timestamps by so its output starts at 0: the file's, or in formats with
+/// timestamp discontinuities, that of the streams it reads, which for raw
+/// video output is just the video stream (`correct_input_start_times`).
+fn cli_start_time(input_format_context: &AVFormatContextInput, stream: &AVStreamRef) -> i64 {
+    let start = input_format_context.start_time;
+    if start == AV_NOPTS_VALUE {
+        0
+    } else if has_ts_discontinuities(input_format_context) && stream.start_time != AV_NOPTS_VALUE {
+        cfr::rescale(stream.start_time, stream.time_base, cfr::AV_TIME_BASE_Q)
+    } else {
+        start
+    }
+}
+
+/// The CLI's packet timestamp fixes for `stream`.
+fn cli_demux_fixup(
+    input_format_context: &AVFormatContextInput,
+    stream: &AVStreamRef,
+    start_time: i64,
+) -> cfr::DemuxFixup {
+    let codecpar = stream.codecpar();
+    // ist_dts_update's first-dts estimate: back by the decoder delay. C
+    // computes it in double and truncates.
+    let initial_dts = if stream.avg_frame_rate.num != 0 {
+        ((-(codecpar.video_delay as i64) * 1_000_000) as f64 / av_q2d(stream.avg_frame_rate)) as i64
+    } else {
+        0
+    };
+    let rate = codecpar.framerate;
+    let field_rate = (rate.num != 0)
+        .then(|| rate.num.checked_mul(2))
+        .flatten()
+        .map(|num| AVRational { num, den: rate.den });
+    cfr::DemuxFixup::new(
+        stream.time_base,
+        start_time,
+        has_ts_discontinuities(input_format_context),
+        initial_dts,
+        field_rate,
+    )
+}
+
+/// Applies the CLI's timestamp fixes to a packet just read from `stream`.
+fn fix_cli_packet(demux: &mut cfr::DemuxFixup, packet: &mut AVPacket, stream: &AVStreamRef) {
+    let ts = |ts: i64| (ts != AV_NOPTS_VALUE).then_some(ts);
+    // Fields in the packet, which predict the next dts when it has no
+    // duration: the parser's count for codecs that can code fields, else 2.
+    let fields = if packet.duration != 0 {
+        2
+    } else {
+        let descriptor = unsafe { ffi::avcodec_descriptor_get(stream.codecpar().codec_id) };
+        let parser = unsafe { ffi::av_stream_get_parser(stream.as_ptr()) };
+        if !descriptor.is_null()
+            && unsafe { (*descriptor).props } & ffi::AV_CODEC_PROP_FIELDS as i32 != 0
+            && !parser.is_null()
+        {
+            1 + i64::from(unsafe { (*parser).repeat_pict })
+        } else {
+            2
+        }
+    };
+    let (pts, dts) = demux.fix(ts(packet.pts), ts(packet.dts), packet.duration, fields);
+    packet.set_pts(pts.unwrap_or(AV_NOPTS_VALUE));
+    packet.set_dts(dts.unwrap_or(AV_NOPTS_VALUE));
 }
 
 fn container_duration_seconds(input_format_context: &AVFormatContextInput) -> Option<f64> {
@@ -1420,6 +1946,7 @@ fn decode_packet(
         frame_data_ptr,
         frame_pts,
         finished,
+        cfr,
         ..
     } = filter_ctx;
 
@@ -1442,6 +1969,7 @@ fn decode_packet(
                     frame_data,
                     frame_data_ptr,
                     frame_pts,
+                    cfr,
                     seek,
                 )
                 .context("Failed to receive frames from the decoder when draining")?;
@@ -1490,6 +2018,7 @@ fn decode_packet(
             frame_data,
             frame_data_ptr,
             frame_pts,
+            cfr,
             seek,
         )
         .context("Failed to receive frames from the decoder")?,
@@ -1583,6 +2112,7 @@ fn receive_and_filter_frames(
     frame_data: &mut tch::Tensor,
     frame_data_ptr: &mut usize,
     frame_pts: &mut Vec<f64>,
+    cfr: &mut Option<CliSync>,
     seek: &Seek,
 ) -> Result<Vec<Frame>, anyhow::Error> {
     let mut frames: Vec<Frame> = Vec::new();
@@ -1591,7 +2121,8 @@ fn receive_and_filter_frames(
         // Check if we need to stop decoding.
         match stream_type {
             StreamType::Video => {
-                if has_finished_decoding(stream_type, frame_data, frame_data_ptr) {
+                // CLI mode grows its buffer on demand rather than stopping.
+                if cfr.is_none() && has_finished_decoding(stream_type, frame_data, frame_data_ptr) {
                     log::debug!(
                         "No more storage available to write video frames to, exiting early"
                     );
@@ -1614,6 +2145,25 @@ fn receive_and_filter_frames(
             Err(e) => Err(e).context("Error during decoding")?,
         };
 
+        frame.set_pts(frame.best_effort_timestamp);
+
+        // CLI frame-rate sync: how many times this frame (and the previous
+        // one, before it) is emitted. Decided from timestamps alone, before
+        // any pixels move.
+        let cli_decision = match cfr {
+            Some(cli) => {
+                let pts = (frame.pts != AV_NOPTS_VALUE).then_some(frame.pts);
+                let mut decision = cli.sync.push(pts, frame.duration);
+                if cli.previous_row.is_none() {
+                    // No previous frame yet: the CLI pads with this one.
+                    decision.current += decision.previous;
+                    decision.previous = 0;
+                }
+                Some(decision)
+            }
+            None => None,
+        };
+
         // Hardware decoders return frames in GPU memory; download them to
         // system memory so the software filter graph can process them —
         // unless the output is GPU-resident, in which case they stay put.
@@ -1623,7 +2173,28 @@ fn receive_and_filter_frames(
             frame = download_hw_frame(&frame).context("Downloading hardware frame")?;
         }
 
-        frame.set_pts(frame.best_effort_timestamp);
+        if let Some(decision) = cli_decision {
+            let cli = cfr.as_mut().expect("decision implies CLI sync");
+            emit_previous_copies(
+                cli,
+                decision.previous,
+                frame_data,
+                frame_data_ptr,
+                frame_pts,
+            )?;
+            // A dropped frame is not emitted, but it becomes the frame later
+            // gaps repeat (the CLI keeps the last frame it processed), so it is
+            // still converted, into the row after the output. Unless that row
+            // is past the output limit: then any row emitted later fails the
+            // limit anyway, so the frame can't be needed.
+            let needed = *frame_data_ptr as i64 + 1;
+            if decision.current == 0 && !cli.fits(frame_data, needed) {
+                continue;
+            }
+            cli.ensure_capacity(frame_data, needed, needed)?;
+        }
+        let row_before = *frame_data_ptr;
+        let frames_before = frames.len();
 
         // Direct paths: convert straight into the output tensor.
         match direct_path {
@@ -1641,6 +2212,17 @@ fn receive_and_filter_frames(
                 .context("Error during direct frame conversion")?
                 {
                     frames.push(converted);
+                }
+                after_cli_frame(
+                    cfr,
+                    cli_decision,
+                    row_before,
+                    frame_data,
+                    frame_data_ptr,
+                    frame_pts,
+                )?;
+                if cli_decision.is_some_and(|d| d.current == 0) {
+                    frames.truncate(frames_before);
                 }
                 continue;
             }
@@ -1711,9 +2293,156 @@ fn receive_and_filter_frames(
             Err(e) => return Err(anyhow!(e).context("Error during filtering"))?,
         };
         frames.extend(filtered_frames);
+        after_cli_frame(
+            cfr,
+            cli_decision,
+            row_before,
+            frame_data,
+            frame_data_ptr,
+            frame_pts,
+        )?;
+        if cli_decision.is_some_and(|d| d.current == 0) {
+            frames.truncate(frames_before);
+        }
     }
 
     Ok(frames)
+}
+
+/// Writes `copies` more copies of the previous emitted frame, as the CLI
+/// duplicates a frame before the one that follows a gap.
+fn emit_previous_copies(
+    cli: &mut CliSync,
+    copies: i64,
+    frame_data: &mut tch::Tensor,
+    frame_data_ptr: &mut usize,
+    frame_pts: &mut Vec<f64>,
+) -> Result<(), anyhow::Error> {
+    let Some(row) = cli.previous_row else {
+        return Ok(());
+    };
+    if copies > 0 {
+        // Room for one more row if the limit allows, so a frame that follows
+        // (dropped or not) needs no growth of its own.
+        let needed = *frame_data_ptr as i64 + copies;
+        cli.ensure_capacity(frame_data, needed, needed + 1)?;
+    }
+    for _ in 0..copies {
+        let pts = cli.sync.pts_seconds_of(*frame_data_ptr as i64);
+        // A dropped frame's first copy is the row it was converted into.
+        if row != *frame_data_ptr as i64 {
+            frame_data
+                .f_narrow(0, *frame_data_ptr as i64, 1)?
+                .f_copy_(&frame_data.f_narrow(0, row, 1)?)?;
+        }
+        cli.previous_row = Some(*frame_data_ptr as i64);
+        *frame_data_ptr += 1;
+        frame_pts.push(pts);
+    }
+    Ok(())
+}
+
+/// After a CLI-synced frame was written (one row, at `row_before`): stamps it
+/// with its output slot's timestamp and writes its own duplicates.
+fn after_cli_frame(
+    cfr: &mut Option<CliSync>,
+    decision: Option<cfr::SyncDecision>,
+    row_before: usize,
+    frame_data: &mut tch::Tensor,
+    frame_data_ptr: &mut usize,
+    frame_pts: &mut Vec<f64>,
+) -> Result<(), anyhow::Error> {
+    let (Some(cli), Some(decision)) = (cfr.as_mut(), decision) else {
+        return Ok(());
+    };
+    if *frame_data_ptr == row_before {
+        return Ok(()); // not written (e.g. before the seek start)
+    }
+    let row = row_before as i64;
+    if decision.current == 0 {
+        // Converted only to serve as the previous frame: it stays in the row
+        // past the output, which its own copies (if any) start at; any other
+        // frame written there replaces it as the previous frame.
+        *frame_data_ptr = row_before;
+        frame_pts.pop();
+        cli.previous_row = Some(row);
+        return Ok(());
+    }
+    if let Some(pts) = frame_pts.last_mut() {
+        *pts = cli.sync.pts_seconds_of(row);
+    }
+    cli.previous_row = Some(row);
+    emit_previous_copies(
+        cli,
+        decision.current - 1,
+        frame_data,
+        frame_data_ptr,
+        frame_pts,
+    )
+}
+
+/// Grows the CLI-mode output tensor to at least `needed` rows, and to
+/// `wanted` or a quarter more than it holds as headroom, but never past
+/// `output_limit`; returns whether it grew. The plan is an estimate;
+/// duplicates past it are written rather than dropped, unless the rows
+/// needed take more than `output_limit`, which is an error. Headroom is
+/// only ever clamped, never an error.
+fn ensure_cli_capacity(
+    frame_data: &mut tch::Tensor,
+    needed: i64,
+    wanted: i64,
+    output_limit: &OutputLimit,
+) -> Result<bool, anyhow::Error> {
+    let mut shape = frame_data.size();
+    let held = shape[0];
+    if held >= needed {
+        return Ok(false);
+    }
+    let element_size = frame_data.kind().elt_size_in_bytes();
+    let max_rows = max_cli_rows(frame_data, output_limit.bytes);
+    // A quarter more than held, so growth stays rare, but the headroom stops
+    // at the limit; the rows needed past it fail the check below.
+    shape[0] = (held + held / 4 + 1).max(wanted).min(max_rows).max(needed);
+    check_output_tensor_size(&shape, element_size, output_limit)
+        .context("fps_mode=\"cli\" output outgrew its plan")?;
+    // In place: the frame views already handed out move to the new buffer
+    // instead of keeping each superseded one alive.
+    crate::alloc::grow_rows(frame_data, shape[0]).context("growing the output tensor")?;
+    Ok(true)
+}
+
+/// How many rows of `frame_data`'s shape fit in `max_output_bytes`.
+fn max_cli_rows(frame_data: &tch::Tensor, max_output_bytes: u128) -> i64 {
+    let shape = frame_data.size();
+    let row_bytes = shape[1..].iter().map(|&dim| dim as u128).product::<u128>()
+        * frame_data.kind().elt_size_in_bytes() as u128;
+    (max_output_bytes / row_bytes.max(1)).min(i64::MAX as u128) as i64
+}
+
+/// Trims the grown CLI-mode output's storage to its `rows` emitted rows
+/// (see [`crate::alloc::trim_rows`]), unless a frame view reaches past them.
+/// Best effort: on failure the output keeps its unused rows.
+fn trim_cli_output(frame_data: &mut tch::Tensor, rows: i64, frames: &[Frame]) {
+    if frame_data.size()[0] <= rows {
+        return;
+    }
+    let start = frame_data.data_ptr() as usize;
+    let row_bytes =
+        frame_data.numel() / frame_data.size()[0] as usize * frame_data.kind().elt_size_in_bytes();
+    let end = start + rows as usize * row_bytes;
+    let inside = |view: &tch::Tensor| {
+        let at = view.data_ptr() as usize;
+        at >= start && at + view.numel() * view.kind().elt_size_in_bytes() <= end
+    };
+    if !frames.iter().all(|frame| inside(frame.data())) {
+        log::debug!("Not trimming the CLI-mode output: a frame view reaches past it");
+        return;
+    }
+    // SAFETY: every view of the output handed out (the frames) lies in the
+    // first `rows` rows, checked above.
+    if let Err(e) = unsafe { crate::alloc::trim_rows(frame_data, rows) } {
+        log::warn!("Not trimming the CLI-mode output: {e:#}");
+    }
 }
 
 #[derive(thiserror::Error, Debug)]
@@ -2091,11 +2820,28 @@ impl Debug for Frame {
 /// is used whenever it produces output identical to the graph (see
 /// [`DirectVideoScaler::is_eligible`]).
 struct DirectVideoScaler {
-    /// Cached swscale context, rebuilt by `sws_getCachedContext` whenever the
-    /// source frame parameters change. Null until the first frame.
+    /// swscale context, rebuilt whenever the source frame parameters change.
+    /// Null until the first frame.
     sws_ctx: *mut ffi::SwsContext,
+    /// Source parameters `sws_ctx` was built for.
+    src: (i32, i32, i32),
     dst_width: i32,
     dst_height: i32,
+    /// swscale slice threads, from the request's `number_of_threads` (see
+    /// [`direct_scaler_threads`]). The default of 1 converts on one thread,
+    /// like the single-threaded `sws_scale` this path used before, so loaders
+    /// running many decodes in parallel spend no extra CPU per decode;
+    /// `number_of_threads=0` opts into the pool for a faster single decode.
+    threads: i32,
+    /// Fail on frames whose YUV matrix the `scale` filter rejects instead of
+    /// converting them as BT.601 (see [`direct_scale_supports_colorspace`]).
+    /// Set for raw-mode HDR streams, which went through the graph (and failed
+    /// there on such matrices) before this path handled them.
+    check_matrix: bool,
+    /// Matrix for frames with none tagged. Untagged HDR is BT.2020 (NCL),
+    /// the HDR standard, as the filter graph's `setparams` tags it (see
+    /// [`SourceColorInfo::hdr_defaults`]); otherwise swscale's default.
+    untagged_colorspace: ffi::AVColorSpace,
 }
 
 // SAFETY: the context is owned exclusively by this scaler and all use happens
@@ -2109,30 +2855,99 @@ impl Drop for DirectVideoScaler {
 }
 
 impl DirectVideoScaler {
-    fn new(dst_width: i32, dst_height: i32) -> Self {
+    fn new(config: &VideoFilterConfig, dst_width: i32, dst_height: i32) -> Self {
         Self {
             sws_ctx: std::ptr::null_mut(),
+            src: (0, 0, ffi::AV_PIX_FMT_NONE),
             dst_width,
             dst_height,
+            threads: direct_scaler_threads(config.number_of_threads),
+            check_matrix: config.source_color.is_hdr(),
+            untagged_colorspace: if config.source_color.is_hdr() {
+                ffi::AVCOL_SPC_BT2020_NCL
+            } else {
+                ffi::AVCOL_SPC_UNSPECIFIED
+            },
         }
     }
 
+    /// Returns a swscale context for `frame`, (re)building it when the source
+    /// parameters change.
+    fn context_for(&mut self, frame: &AVFrame) -> Result<*mut ffi::SwsContext, anyhow::Error> {
+        let src = (frame.width, frame.height, frame.format);
+        if !self.sws_ctx.is_null() && self.src == src {
+            return Ok(self.sws_ctx);
+        }
+        unsafe { ffi::sws_freeContext(self.sws_ctx) };
+        self.sws_ctx = std::ptr::null_mut();
+        let ctx = unsafe { ffi::sws_alloc_context() };
+        if ctx.is_null() {
+            bail!("sws_alloc_context failed");
+        }
+        let options: [(&CStr, i64); 8] = [
+            (c"srcw", frame.width as i64),
+            (c"srch", frame.height as i64),
+            (c"src_format", frame.format as i64),
+            (c"dstw", self.dst_width as i64),
+            (c"dsth", self.dst_height as i64),
+            (c"dst_format", ffi::AV_PIX_FMT_RGB24 as i64),
+            // The scale filter's default; keeps output identical to the
+            // filter-graph path.
+            (c"sws_flags", ffi::SWS_BICUBIC as i64),
+            (
+                c"threads",
+                scaler_threads(frame.format, self.threads) as i64,
+            ),
+        ];
+        for (name, value) in options {
+            let ret = unsafe { ffi::av_opt_set_int(ctx as *mut _, name.as_ptr(), value, 0) };
+            if ret < 0 {
+                unsafe { ffi::sws_freeContext(ctx) };
+                bail!("setting swscale option {name:?} failed: {ret}");
+            }
+        }
+        if unsafe { ffi::sws_init_context(ctx, std::ptr::null_mut(), std::ptr::null_mut()) } < 0 {
+            unsafe { ffi::sws_freeContext(ctx) };
+            bail!(
+                "sws_init_context failed ({}x{} pix_fmt {} -> {}x{} rgb24)",
+                frame.width,
+                frame.height,
+                frame.format,
+                self.dst_width,
+                self.dst_height
+            );
+        }
+        self.sws_ctx = ctx;
+        self.src = src;
+        Ok(ctx)
+    }
+
     /// Returns true when the direct path should handle this configuration:
-    /// RGB24 output, no resize, no frame-rate resampling, no HDR tone
-    /// mapping, and a 32-multiple output width (libswscale's vectorized
-    /// RGB24 output requires this on the tightly packed rows of the output
-    /// tensor). Its output is identical to the filter graph's.
+    /// RGB24 output, the fast (swscale) color conversion, no resize, no
+    /// frame-rate resampling, no HDR tone
+    /// mapping (an HDR source with `HdrMode::Raw` is a plain conversion, as
+    /// long as the `scale` filter accepts its matrix), and a 32-multiple
+    /// output width (libswscale's vectorized RGB24 output requires this on
+    /// the tightly packed rows of the output tensor). Its output is
+    /// identical to the filter graph's.
     ///
     /// Resizes deliberately stay in the filter graph: the graph's `scale`
     /// filter downscales with slice threading (and in subsampled YUV before
     /// the RGB conversion), which measures faster than a single-threaded
     /// one-pass `sws_scale`, and with a small output the extra frame copy
     /// the graph costs is small anyway.
-    fn is_eligible(config: &VideoFilterConfig, dst_width: i64) -> bool {
+    fn is_eligible(
+        config: &VideoFilterConfig,
+        dst_width: i64,
+        colorspace: ffi::AVColorSpace,
+    ) -> bool {
         config.frame_rate.is_none()
+            && config.rotate.is_empty()
             && config.width.is_none()
             && config.height.is_none()
-            && !config.source_color.is_hdr()
+            && (!config.source_color.is_hdr()
+                || (config.hdr_mode == HdrMode::Raw
+                    && direct_scale_supports_colorspace(colorspace)))
             && config.color_conversion == ColorConversion::Fast
             && config.pixel_format == "rgb24"
             && dst_width % 32 == 0
@@ -2142,53 +2957,35 @@ impl DirectVideoScaler {
     /// Scales/converts `frame` into `dest`, a `[1, dst_height, dst_width, 3]`
     /// uint8 tensor view.
     fn scale_into(&mut self, frame: &AVFrame, dest: &tch::Tensor) -> Result<(), anyhow::Error> {
-        let ctx = unsafe {
-            ffi::sws_getCachedContext(
-                self.sws_ctx,
-                frame.width,
-                frame.height,
-                frame.format,
-                self.dst_width,
-                self.dst_height,
-                ffi::AV_PIX_FMT_RGB24,
-                // The scale filter's default; keeps output identical to the
-                // filter-graph path.
-                ffi::SWS_BICUBIC as i32,
-                std::ptr::null_mut(),
-                std::ptr::null_mut(),
-                std::ptr::null(),
-            )
-        };
-        if ctx.is_null() {
-            self.sws_ctx = std::ptr::null_mut();
+        if self.check_matrix && !direct_scale_supports_colorspace(frame.colorspace) {
             bail!(
-                "sws_getCachedContext failed ({}x{} pix_fmt {} -> {}x{} rgb24)",
-                frame.width,
-                frame.height,
-                frame.format,
-                self.dst_width,
-                self.dst_height
+                "unsupported YUV matrix {} (AVColorSpace {})",
+                ffi_color_name(unsafe { ffi::av_color_space_name(frame.colorspace) })
+                    .unwrap_or_default(),
+                frame.colorspace
             );
         }
-        self.sws_ctx = ctx;
+        let ctx = self.context_for(frame)?;
 
         // Mirror the filter graph's color handling: it forwards the stream's
         // colorspace and range to buffersrc so the YUV->RGB conversion uses
         // the tagged metadata rather than a guess. When both are untagged,
         // leave swscale's defaults in place (same as the graph).
-        let colorspace = frame.colorspace;
+        let colorspace = if frame.colorspace == ffi::AVCOL_SPC_UNSPECIFIED {
+            self.untagged_colorspace
+        } else {
+            frame.colorspace
+        };
         let range = frame.color_range;
         if colorspace != ffi::AVCOL_SPC_UNSPECIFIED || range != ffi::AVCOL_RANGE_UNSPECIFIED {
-            let sws_cs = match colorspace {
-                ffi::AVCOL_SPC_BT709 => ffi::SWS_CS_ITU709,
-                ffi::AVCOL_SPC_SMPTE170M | ffi::AVCOL_SPC_BT470BG => ffi::SWS_CS_ITU601,
-                ffi::AVCOL_SPC_SMPTE240M => ffi::SWS_CS_SMPTE240M,
-                ffi::AVCOL_SPC_BT2020_NCL => ffi::SWS_CS_BT2020,
-                _ => ffi::SWS_CS_DEFAULT,
-            };
             let src_range = (range == ffi::AVCOL_RANGE_JPEG) as i32;
             unsafe {
-                let inv_table = ffi::sws_getCoefficients(sws_cs as i32);
+                // swscale's coefficient table is indexed by AVColorSpace, and
+                // the scale filter looks the frame's colorspace up the same
+                // way. swscale maps matrices it has no entry for to BT.601,
+                // but the filter rejects those during format negotiation;
+                // see `direct_scale_supports_colorspace`.
+                let inv_table = ffi::sws_getCoefficients(colorspace as i32);
                 let table = ffi::sws_getCoefficients(ffi::SWS_CS_DEFAULT as i32);
                 // Brightness/contrast/saturation at their neutral values; RGB
                 // output is always full range.
@@ -2205,34 +3002,151 @@ impl DirectVideoScaler {
             }
         }
 
+        // sws_scale_frame runs the context's slice threads (sws_scale does
+        // not). It needs a refcounted destination, so the tensor's row block
+        // is wrapped in a buffer that does not own it.
         let dst_ptr = dest.data_ptr() as *mut u8;
-        let dst_data = [
-            dst_ptr,
-            std::ptr::null_mut(),
-            std::ptr::null_mut(),
-            std::ptr::null_mut(),
-        ];
-        let dst_stride = [self.dst_width * 3, 0, 0, 0];
-        let scaled_rows = unsafe {
-            ffi::sws_scale(
-                ctx,
-                frame.data.as_ptr() as *const *const u8,
-                frame.linesize.as_ptr(),
-                0,
-                frame.height,
-                dst_data.as_ptr(),
-                dst_stride.as_ptr(),
-            )
-        };
-        if scaled_rows != self.dst_height {
-            bail!(
-                "sws_scale produced {} rows, expected {}",
-                scaled_rows,
-                self.dst_height
-            );
+        let dst_stride = self.dst_width * 3;
+        let dst_size = dst_stride as usize * self.dst_height as usize;
+        let mut dst = unsafe { ffi::av_frame_alloc() };
+        if dst.is_null() {
+            bail!("av_frame_alloc failed");
         }
-        Ok(())
+        let result = (|| {
+            let buf = unsafe {
+                ffi::av_buffer_create(
+                    dst_ptr,
+                    dst_size,
+                    Some(borrowed_buffer_free),
+                    std::ptr::null_mut(),
+                    0,
+                )
+            };
+            if buf.is_null() {
+                bail!("av_buffer_create failed");
+            }
+            unsafe {
+                (*dst).buf[0] = buf;
+                (*dst).data[0] = dst_ptr;
+                (*dst).linesize[0] = dst_stride;
+                (*dst).width = self.dst_width;
+                (*dst).height = self.dst_height;
+                (*dst).format = ffi::AV_PIX_FMT_RGB24;
+            }
+            let ret = unsafe { ffi::sws_scale_frame(ctx, dst, frame.as_ptr()) };
+            if ret < 0 {
+                bail!("sws_scale_frame failed: {ret}");
+            }
+            Ok(())
+        })();
+        unsafe { ffi::av_frame_free(&mut dst) };
+        #[cfg(test)]
+        if result.is_ok() {
+            let mut threads = 0;
+            unsafe { ffi::av_opt_get_int(ctx as *mut _, c"threads".as_ptr(), 0, &mut threads) };
+            direct_scale_stats::record(threads);
+        }
+        result
     }
+}
+
+/// Test-only record of the direct swscale conversions on the current thread.
+/// Decoding runs on the caller's thread, so a test can tell which path its
+/// own decode took, even with other tests decoding in parallel.
+#[cfg(test)]
+mod direct_scale_stats {
+    use std::cell::Cell;
+
+    #[derive(Debug, Clone, Copy, Default)]
+    pub(super) struct Stats {
+        /// Frames converted on the direct path.
+        pub frames: usize,
+        /// swscale threads of the last conversion's context.
+        pub threads: i64,
+    }
+
+    thread_local! {
+        static STATS: Cell<Stats> = Cell::new(Stats::default());
+    }
+
+    pub(super) fn record(threads: i64) {
+        STATS.with(|s| {
+            s.set(Stats {
+                frames: s.get().frames + 1,
+                threads,
+            })
+        });
+    }
+
+    /// Returns the conversions recorded since the last call.
+    pub(super) fn take() -> Stats {
+        STATS.with(|s| s.take())
+    }
+}
+
+/// swscale slice threads for the direct path, from the request's
+/// `number_of_threads` the way the decoder reads it: the default of 1 is one
+/// thread, `0` (auto) is the filter graph's cap, and an explicit N is N,
+/// capped the same way since slice threading gains little beyond it.
+fn direct_scaler_threads(number_of_threads: Option<usize>) -> i32 {
+    // The cap reads the CPU affinity and cgroup quota (~15 us), which is
+    // measurable on small images, so skip it for the default.
+    match number_of_threads.unwrap_or(1) {
+        1 => 1,
+        0 => filter_graph_threads(),
+        n => n.min(filter_graph_threads() as usize) as i32,
+    }
+}
+
+/// Returns true for the YUV matrices the direct path converts like the
+/// filter graph: those the `scale` filter accepts (`sws_colorspaces` in
+/// FFmpeg 7.1's vf_scale.c), plus BT.2020 constant luminance, which the
+/// filter rejects but swscale has coefficients for. swscale converts any
+/// other matrix (YCgCo, chroma-derived, ICtCp, ...) as BT.601 without an
+/// error, while the graph fails on it.
+fn direct_scale_supports_colorspace(colorspace: ffi::AVColorSpace) -> bool {
+    matches!(
+        colorspace,
+        ffi::AVCOL_SPC_UNSPECIFIED
+            | ffi::AVCOL_SPC_RGB
+            | ffi::AVCOL_SPC_BT709
+            | ffi::AVCOL_SPC_BT470BG
+            | ffi::AVCOL_SPC_SMPTE170M
+            | ffi::AVCOL_SPC_FCC
+            | ffi::AVCOL_SPC_SMPTE240M
+            | ffi::AVCOL_SPC_BT2020_NCL
+            | ffi::AVCOL_SPC_BT2020_CL
+    )
+}
+
+/// swscale slice threads for a source pixel format. XYZ sources get one:
+/// every slice worker converts the whole frame from XYZ before scaling its own
+/// rows, so each extra worker repeats that work and keeps another full-frame
+/// scratch buffer (about 50 MiB at 4K).
+fn scaler_threads(src_format: i32, threads: i32) -> i32 {
+    let desc = unsafe { ffi::av_pix_fmt_desc_get(src_format) };
+    if !desc.is_null() && unsafe { (*desc).flags } & ffi::AV_PIX_FMT_FLAG_XYZ as u64 != 0 {
+        1
+    } else {
+        threads
+    }
+}
+
+/// `av_buffer_create` free callback for memory the buffer only borrows (the
+/// output tensor owns it).
+unsafe extern "C" fn borrowed_buffer_free(_opaque: *mut std::ffi::c_void, _data: *mut u8) {}
+
+/// Slice threads for a filter graph and its scalers, and the cap on the
+/// direct path's swscale pool. FFmpeg's default (0 = one worker per core)
+/// builds a large thread pool for every decode on many-core machines, which
+/// oversubscribes badly when many decodes run concurrently. Slice threading
+/// cannot use more workers than there are output rows/slices anyway, so a
+/// small pool preserves single-decode performance.
+fn filter_graph_threads() -> i32 {
+    std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(16)
+        .min(16) as i32
 }
 
 /// Returns false when the `AVTENSOR_DISABLE_DIRECT_PATH` debug escape hatch
@@ -2851,6 +3765,12 @@ pub struct VideoFilterConfig {
     source_format: SourceFormat,
     /// How `frame_rate` resampling builds each output frame.
     fps_conversion: FpsConversion,
+    /// The request's `number_of_threads`; sizes the direct path's swscale
+    /// pool (see [`direct_scaler_threads`]).
+    number_of_threads: Option<usize>,
+    /// Rotation filters to apply (empty unless autorotate is requested and
+    /// the stream has a non-zero display rotation).
+    rotate: Vec<String>,
 }
 
 impl Display for VideoFilterConfig {
@@ -2867,6 +3787,9 @@ impl Display for VideoFilterConfig {
         if let (Some(frame_rate), FpsConversion::Nearest) = (self.frame_rate, self.fps_conversion) {
             filters.push(format!("fps={}", frame_rate));
         }
+        // Rotate before scaling, so `width`/`height` refer to the displayed
+        // (rotated) frame, as with the ffmpeg CLI.
+        filters.extend(self.rotate.iter().cloned());
 
         // For HDR/wide-gamut content, insert tone mapping and gamut conversion
         // to produce correct sRGB output instead of a naive YUV→RGB conversion.
@@ -3023,6 +3946,8 @@ impl Default for VideoFilterConfig {
             color_conversion: Default::default(),
             source_format: Default::default(),
             fps_conversion: Default::default(),
+            number_of_threads: Default::default(),
+            rotate: Default::default(),
         }
     }
 }
@@ -3043,6 +3968,7 @@ impl TryFrom<&VideoStreamRequest> for VideoFilterConfig {
             hdr_mode: req.hdr_mode,
             color_conversion: ColorConversion::resolve(req.color_conversion, req.dtype)?,
             fps_conversion: req.fps_conversion,
+            number_of_threads: req.number_of_threads,
             ..Default::default()
         })
     }
@@ -3188,14 +4114,16 @@ fn init_filters(
             filter_config,
             stream_type,
             frame_data,
+            cfr,
         } = stream_context;
 
         let direct_path = match &filter_config {
             // Software-decoded video streams whose only processing is format
             // conversion skip the filter graph and convert straight into the
-            // output tensor. Hardware-decoded streams stay in the graph: its
-            // slice-threaded conversion beats a single sws_scale call when
-            // the CPU work is conversion only.
+            // output tensor. Hardware-decoded streams stay in the graph:
+            // their CPU work is conversion only, which the graph
+            // slice-threads at its usual cap, while the direct path follows
+            // `number_of_threads` (one thread by default).
             FilterConfig::Video(config) => {
                 let sizes = frame_data.size();
                 let (dst_height, dst_width) = (sizes[1], sizes[2]);
@@ -3215,10 +4143,11 @@ fn init_filters(
                         dst_height as i32,
                     )?)
                 } else if !is_hw_decoder(&dec_ctx)
-                    && DirectVideoScaler::is_eligible(config, dst_width)
+                    && DirectVideoScaler::is_eligible(config, dst_width, dec_ctx.colorspace)
                 {
                     log::debug!("Using the direct swscale path for stream {stream_index}");
                     DirectPath::VideoScale(DirectVideoScaler::new(
+                        config,
                         dst_width as i32,
                         dst_height as i32,
                     ))
@@ -3287,6 +4216,7 @@ fn init_filters(
             frame_data_ptr: 0,
             frame_pts: Vec::new(),
             finished: false,
+            cfr,
         })
     }
 
@@ -3299,11 +4229,7 @@ fn init_filters(
 /// threading cannot use more workers than there are output rows/slices
 /// anyway, so a small pool preserves single-decode filter performance.
 fn cap_graph_threads(filter_graph: &mut AVFilterGraph) {
-    let graph_threads = std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(16)
-        .min(16) as i32;
-    unsafe { (*filter_graph.as_mut_ptr()).nb_threads = graph_threads };
+    unsafe { (*filter_graph.as_mut_ptr()).nb_threads = filter_graph_threads() };
 }
 
 /// The 8-bit planar YUV format a [`MotionStage`] interpolates in. Keeps the
@@ -3705,7 +4631,8 @@ mod tests {
         test_utils::{
             generate_bt709_ffv1_video, generate_gray_png, generate_limited_range_luma_ramp,
             generate_moving_bar_video, generate_pq_ffv1_video, generate_test_video_file,
-            init_logger, ChannelLayout, TestVideoParameters,
+            generate_xyz12_video_file, init_logger, retag_matrix_coefficients, ChannelLayout,
+            TestVideoParameters, JITTER_AND_GAPS,
         },
     };
 
@@ -3726,6 +4653,7 @@ mod tests {
                 end_time: None,
                 video_stream: Some(VideoStreamRequest::default()),
                 audio_streams: Some(vec![AudioStreamRequest::default()]),
+                max_output_bytes: None,
             },
             None,
         );
@@ -3772,6 +4700,7 @@ mod tests {
                 end_time: None,
                 video_stream: None,
                 audio_streams: None,
+                max_output_bytes: None,
             },
             None,
         ) {
@@ -3809,6 +4738,7 @@ mod tests {
                     ..Default::default()
                 }),
                 audio_streams: Some(vec![AudioStreamRequest::default()]),
+                max_output_bytes: None,
             },
             None,
         )
@@ -3889,6 +4819,7 @@ mod tests {
                     ..Default::default()
                 }),
                 audio_streams: Some(vec![AudioStreamRequest::default()]),
+                max_output_bytes: None,
             },
             None,
         )
@@ -3962,6 +4893,7 @@ mod tests {
                     ..Default::default()
                 }),
                 audio_streams: None,
+                max_output_bytes: None,
             },
             None,
         )?;
@@ -4040,6 +4972,7 @@ mod tests {
                         ..Default::default()
                     }),
                     audio_streams: None,
+                    max_output_bytes: None,
                 },
                 None,
             )
@@ -4111,6 +5044,7 @@ mod tests {
                         ..Default::default()
                     }),
                     audio_streams: None,
+                    max_output_bytes: None,
                 },
                 None,
             )
@@ -4170,6 +5104,7 @@ mod tests {
                         ..Default::default()
                     }),
                     audio_streams: None,
+                    max_output_bytes: None,
                 },
                 None,
             )
@@ -4200,6 +5135,7 @@ mod tests {
                         ..Default::default()
                     }),
                     audio_streams: None,
+                    max_output_bytes: None,
                 },
                 None,
             )
@@ -4254,6 +5190,7 @@ mod tests {
                     sample_rate: Some(target_sample_rate as u32),
                     ..Default::default()
                 }]),
+                max_output_bytes: None,
             },
             None,
         )
@@ -4315,6 +5252,7 @@ mod tests {
                     }),
                     ..Default::default()
                 }]),
+                max_output_bytes: None,
             },
             None,
         )
@@ -4375,6 +5313,7 @@ mod tests {
                     ..Default::default()
                 }),
                 audio_streams: None,
+                max_output_bytes: None,
             },
             None,
         )
@@ -4419,6 +5358,7 @@ mod tests {
                 end_time: Some(end_time),
                 video_stream: Some(VideoStreamRequest::default()),
                 audio_streams: Some(vec![AudioStreamRequest::default()]),
+                max_output_bytes: None,
             },
             None,
         );
@@ -4471,6 +5411,7 @@ mod tests {
                 end_time: None,
                 video_stream: Some(VideoStreamRequest::default()),
                 audio_streams: None,
+                max_output_bytes: None,
             },
             None,
         ) {
@@ -4497,6 +5438,7 @@ mod tests {
                 end_time: None,
                 video_stream: None,
                 audio_streams: Some(vec![AudioStreamRequest::default()]),
+                max_output_bytes: None,
             },
             None,
         ) {
@@ -4538,6 +5480,7 @@ mod tests {
                 end_time: None,
                 video_stream: None,
                 audio_streams: Some(vec![AudioStreamRequest::default()]),
+                max_output_bytes: None,
             },
             None,
         )?;
@@ -4623,6 +5566,7 @@ mod tests {
                     sample_rate: Some(sample_rate),
                     ..Default::default()
                 }]),
+                max_output_bytes: None,
             },
             None,
         );
@@ -4802,6 +5746,8 @@ mod tests {
             color_conversion: ColorConversion::Fast,
             source_format: SourceFormat::default(),
             fps_conversion: FpsConversion::Nearest,
+            number_of_threads: None,
+            rotate: vec![],
         },
         "setparams=colorspace=bt2020nc,fps=24,scale=width=1920:height=1080,zscale=t=linear:npl=100,format=gbrpf32le,tonemap=hable:desat=0,zscale=p=bt709:t=bt709:m=bt709:range=tv,format=pix_fmts=rgb24";
         "HDR with fps and scale options"
@@ -5054,6 +6000,636 @@ mod tests {
         );
     }
 
+    /// `fps_mode="cli"` returns the frames the ffmpeg CLI writes for the
+    /// same input, for variable-frame-rate sources with and without
+    /// B-frames, a late-starting video track beside audio, and MOV.
+    #[test_case(".mp4", JITTER_AND_GAPS, &[], &["-bf", "0"], None; "vfr")]
+    #[test_case(".mp4", JITTER_AND_GAPS, &[], &["-bf", "2"], None; "vfr_bframes")]
+    #[test_case(".mov", JITTER_AND_GAPS, &[], &["-bf", "0", "-video_track_timescale", "600"], None; "vfr_mov_600")]
+    // A burst of frames in one slot: the CLI drops the last of them, then
+    // repeats it (not the last emitted frame) across the gap that follows.
+    #[test_case(".mkv", "if(lt(N,20),N,if(lt(N,25),20+(N-20)*0.03,N+6))", &[], &["-bf", "0"], None; "dropped_frame_fills_gap")]
+    // Gaps right before the end: the end-of-stream repeats follow them.
+    #[test_case(".mp4", "N+6*gt(N,80)+6*gt(N,84)+6*gt(N,87)", &[], &["-bf", "0"], None; "repeats_at_the_end")]
+    #[test_case(".mp4", JITTER_AND_GAPS, &[], &["-bf", "0"], Some((".mp4", true)); "late_video_beside_audio")]
+    #[test_case(".mp4", JITTER_AND_GAPS, &[], &["-bf", "0"], Some((".mp4", false)); "late_video_alone")]
+    // MPEG-TS starts at the video's own start, not the earlier audio's.
+    #[test_case(".mp4", JITTER_AND_GAPS, &[], &["-bf", "2"], Some((".ts", true)); "late_video_beside_audio_ts")]
+    fn test_fps_mode_cli_matches_ffmpeg_cli(
+        suffix: &str,
+        setpts: &str,
+        input: &[&str],
+        extra: &[&str],
+        late: Option<(&str, bool)>,
+    ) -> anyhow::Result<()> {
+        init_logger();
+        let (w, h) = (64, 48);
+        let mut video =
+            crate::util::test_utils::generate_vfr_video_file(suffix, w, h, setpts, input, extra)?;
+        if let Some((container, with_audio)) = late {
+            // A late video track is padded with its first frame when audio
+            // starts earlier, and not padded when it is the only stream.
+            video = crate::util::test_utils::make_late_video(
+                video.path(),
+                container,
+                "0.5",
+                with_audio,
+            )?;
+        }
+        let path = video.path().to_str().unwrap();
+        let expected = crate::util::test_utils::ffmpeg_rgb24_frames(&["-i", path], w, h)?;
+        let make_request = || MediaDecodeRequest {
+            source: MediaSource::Uri(path.into()),
+            start_time: None,
+            end_time: None,
+            video_stream: Some(VideoStreamRequest {
+                fps_mode: FpsMode::Cli,
+                ..Default::default()
+            }),
+            audio_streams: None,
+            max_output_bytes: None,
+        };
+        assert_plan_bounds_decode(make_request, false)?;
+        let mut streams = decode_media(make_request(), None)?;
+        let stream = streams.remove(0);
+        let data = stream.data.context("video data")?;
+        let got = data.size()[0] as usize;
+        assert_eq!(got, expected.len(), "frame count vs the ffmpeg CLI");
+        for (i, want) in expected.iter().enumerate() {
+            let frame = Vec::<u8>::try_from(data.get(i as i64).flatten(0, -1))?;
+            assert!(frame == *want, "frame {i} differs from the ffmpeg CLI's");
+        }
+        // Timestamps are the output slots: from 0 (the CLI shifts the file
+        // to start there), evenly spaced at the stream rate.
+        let pts = &stream.frame_pts;
+        assert_eq!(pts.len(), got);
+        assert_eq!(pts[0], 0.0);
+        for pair in pts.windows(2) {
+            assert!((pair[1] - pair[0] - 1.0 / 30.0).abs() < 1e-9, "{pair:?}");
+        }
+        // The gaps and collisions in these clips mean some frames repeat and
+        // some are dropped; the plain decode yields a different sequence.
+        let mut plain = decode_media(
+            MediaDecodeRequest {
+                source: MediaSource::Uri(path.into()),
+                start_time: None,
+                end_time: None,
+                video_stream: Some(VideoStreamRequest::default()),
+                audio_streams: None,
+                max_output_bytes: None,
+            },
+            None,
+        )?;
+        let plain = plain.remove(0).data.context("video data")?;
+        assert_ne!(plain.size()[0] as usize, got);
+        Ok(())
+    }
+
+    /// Matroska stores no last-frame duration, so end-of-stream repeats after
+    /// late gaps outrun the plan and the output grows. The frames still match
+    /// the CLI, and every frame view points into the final buffer instead of
+    /// keeping a superseded one alive.
+    #[test]
+    fn test_fps_mode_cli_grows_past_the_plan() -> anyhow::Result<()> {
+        init_logger();
+        let (w, h) = (64, 48);
+        let video = crate::util::test_utils::generate_vfr_video_file(
+            ".mkv",
+            w,
+            h,
+            "N+6*gt(N,86)+6*gt(N,87)+6*gt(N,88)",
+            &[],
+            &["-bf", "0"],
+        )?;
+        let path = video.path().to_str().unwrap();
+        let expected = crate::util::test_utils::ffmpeg_rgb24_frames(&["-i", path], w, h)?;
+        let make_request = || MediaDecodeRequest {
+            source: MediaSource::Uri(path.into()),
+            start_time: None,
+            end_time: None,
+            video_stream: Some(VideoStreamRequest {
+                fps_mode: FpsMode::Cli,
+                ..Default::default()
+            }),
+            audio_streams: None,
+            max_output_bytes: None,
+        };
+        let planned = plan_media(make_request(), None)?[0].shape[0];
+        let stream = decode_media(make_request(), None)?.remove(0);
+        let data = stream.data.context("video data")?;
+        assert!(data.size()[0] > planned, "the clip must outgrow its plan");
+        assert_eq!(data.size()[0] as usize, expected.len());
+        for (i, want) in expected.iter().enumerate() {
+            let frame = Vec::<u8>::try_from(data.get(i as i64).flatten(0, -1))?;
+            assert!(frame == *want, "frame {i} differs from the ffmpeg CLI's");
+        }
+        let output = data.data_ptr() as usize..data.data_ptr() as usize + data.numel();
+        assert!(!stream.decoded_frames.is_empty());
+        for frame in &stream.decoded_frames {
+            let view = frame.data().data_ptr() as usize;
+            assert!(output.contains(&view), "frame view outside the output");
+        }
+        Ok(())
+    }
+
+    /// Decodes `path` with `fps_mode="cli"` and checks every frame against
+    /// the ffmpeg CLI's output for it.
+    fn assert_cli_frames_match(path: &str, width: usize, height: usize) -> anyhow::Result<()> {
+        let expected = crate::util::test_utils::ffmpeg_rgb24_frames(&["-i", path], width, height)?;
+        let stream = decode_media(cli_request(path), None)?.remove(0);
+        let data = stream.data.context("video data")?;
+        assert_eq!(
+            data.size()[0] as usize,
+            expected.len(),
+            "frame count vs the ffmpeg CLI"
+        );
+        for (i, want) in expected.iter().enumerate() {
+            let frame = Vec::<u8>::try_from(data.get(i as i64).flatten(0, -1))?;
+            assert!(frame == *want, "frame {i} differs from the ffmpeg CLI's");
+        }
+        Ok(())
+    }
+
+    fn cli_request(path: &str) -> MediaDecodeRequest {
+        MediaDecodeRequest {
+            source: MediaSource::Uri(path.into()),
+            start_time: None,
+            end_time: None,
+            video_stream: Some(VideoStreamRequest {
+                fps_mode: FpsMode::Cli,
+                ..Default::default()
+            }),
+            audio_streams: None,
+            max_output_bytes: None,
+        }
+    }
+
+    /// MPEG-TS/PS segments joined with a timestamp jump: the CLI shifts the
+    /// timestamps after a jump of more than 10 s (or any backwards one) to
+    /// continue the stream, rather than filling or dropping the gap. Without
+    /// the correction, a +60 s jump gives 1,860 frames instead of 120.
+    #[test_case(".ts", "60", false, false; "ts_jump_forward")]
+    #[test_case(".ts", "60", true, false; "ts_jump_backward")]
+    #[test_case(".ts", "60", false, true; "ts_jump_forward_with_audio")]
+    #[test_case(".mpg", "60", false, false; "ps_jump_forward")]
+    // A 0.5 s step back is a discontinuity too; 5 s forward is not.
+    #[test_case(".ts", "1.5", false, false; "ts_step_back")]
+    #[test_case(".ts", "7", false, false; "ts_jump_below_threshold")]
+    fn test_fps_mode_cli_corrects_timestamp_discontinuities(
+        suffix: &str,
+        offset: &str,
+        reverse: bool,
+        with_audio: bool,
+    ) -> anyhow::Result<()> {
+        init_logger();
+        let (w, h) = (64, 48);
+        let audio: &[&str] = if with_audio {
+            &["-f", "lavfi", "-i", "sine=sample_rate=48000", "-c:a", "aac"]
+        } else {
+            &[]
+        };
+        let first = crate::util::test_utils::generate_segment(suffix, w, h, "0", audio)?;
+        let second = crate::util::test_utils::generate_segment(suffix, w, h, offset, audio)?;
+        let mut parts = [first.path(), second.path()];
+        if reverse {
+            parts.reverse();
+        }
+        let joined = crate::util::test_utils::concat_files(suffix, &parts)?;
+        assert_cli_frames_match(joined.path().to_str().unwrap(), w, h)
+    }
+
+    /// Outside MPEG-TS/PS, the CLI drops a timestamp more than 30 h off the
+    /// predicted one, so a bogus jump does not turn into duplicates: the
+    /// frames after it take extrapolated timestamps instead.
+    #[test]
+    fn test_fps_mode_cli_drops_timestamps_30h_off() -> anyhow::Result<()> {
+        init_logger();
+        let (w, h) = (64, 48);
+        // No stored duration, so the plan doesn't already refuse the jump.
+        let video =
+            crate::util::test_utils::generate_streamed_vfr_mkv(w, h, "N+31*3600*30*gt(N,4)")?;
+        assert_cli_frames_match(video.path().to_str().unwrap(), w, h)
+    }
+
+    /// A tiny file without a stored duration plans one frame; a 60 s
+    /// timestamp gap then grows the output to ~1,800 frames. Growth stops at
+    /// the output limit with the usual size error instead of allocating
+    /// past it, and a grown output's storage is trimmed to its rows.
+    #[test]
+    fn test_fps_mode_cli_growth_stops_at_the_output_limit() -> anyhow::Result<()> {
+        init_logger();
+        let (w, h) = (64, 48);
+        let video = crate::util::test_utils::generate_streamed_vfr_mkv(w, h, "N+1800*gt(N,1)")?;
+        let path = video.path().to_str().unwrap();
+        let plan = plan_media(cli_request(path), None)?.remove(0);
+        assert_eq!(plan.shape[0], 1);
+        assert_eq!(plan.duration_source, DurationSource::None);
+        // The plan reports the stream's rate, which the output has, not the
+        // image fallback of 1 fps.
+        let probed = probe_media(MediaSource::Uri(path.into()), None)?;
+        assert_eq!(
+            plan.metadata,
+            StreamMetadata::Video {
+                frame_rate: probed.video_streams[0].fps
+            }
+        );
+        assert!(probed.video_streams[0].fps > 25.0);
+
+        let row_bytes = (w * h * 3) as u64;
+        let limited = MediaDecodeRequest {
+            max_output_bytes: Some(100 * row_bytes),
+            ..cli_request(path)
+        };
+        let err = decode_media(limited, None)
+            .err()
+            .context("decoding past the limit must fail")?;
+        assert!(
+            format!("{err:#}").contains(&format!(
+                "exceeding the request's max_output_bytes of {} bytes",
+                100 * row_bytes
+            )),
+            "{err:#}"
+        );
+
+        let stream = decode_media(cli_request(path), None)?.remove(0);
+        let data = stream.data.context("video data")?;
+        assert_eq!(stream.metadata, plan.metadata);
+        let rows = data.size()[0];
+        assert!(rows > 1800, "{rows}");
+        // The storage is trimmed to exactly the returned rows: one more is
+        // out of bounds.
+        let mut shape = data.size();
+        shape[0] += 1;
+        assert!(
+            data.f_as_strided(&shape, data.stride(), 0).is_err(),
+            "the grown output keeps unused rows"
+        );
+        drop(data);
+        assert_cli_frames_match(path, w, h)
+    }
+
+    /// The output may fill the limit exactly: only the rows emitted count
+    /// against it, not the headroom growth asks for, nor the row a dropped
+    /// frame is converted into. Without a stored duration the plan is 1
+    /// frame, so every row is grown.
+    // Gaps before each of the last three frames: the CLI repeats the last.
+    #[test_case("N+6*gt(N,86)+6*gt(N,87)+6*gt(N,88)"; "end_repeats")]
+    // A burst in the last slots: the CLI drops the last frames.
+    #[test_case("if(lt(N,85),N,85+(N-85)*0.03)"; "dropped_last_frames")]
+    fn test_fps_mode_cli_output_can_fill_the_limit(setpts: &str) -> anyhow::Result<()> {
+        init_logger();
+        let (w, h) = (64, 48);
+        let video = crate::util::test_utils::generate_streamed_vfr_mkv(w, h, setpts)?;
+        let path = video.path().to_str().unwrap();
+        let expected = crate::util::test_utils::ffmpeg_rgb24_frames(&["-i", path], w, h)?;
+        let row_bytes = (w * h * 3) as u64;
+        let limit = expected.len() as u64 * row_bytes;
+        let limited = |bytes| MediaDecodeRequest {
+            max_output_bytes: Some(bytes),
+            ..cli_request(path)
+        };
+        let stream = decode_media(limited(limit), None)?.remove(0);
+        let data = stream.data.context("video data")?;
+        assert_eq!(data.size()[0] as usize, expected.len());
+        for (i, want) in expected.iter().enumerate() {
+            let frame = Vec::<u8>::try_from(data.get(i as i64).flatten(0, -1))?;
+            assert!(frame == *want, "frame {i} differs from the ffmpeg CLI's");
+        }
+        // One row less does not fit.
+        let err = decode_media(limited(limit - row_bytes), None)
+            .err()
+            .context("decoding past the limit must fail")?;
+        assert!(
+            format!("{err:#}").contains("exceeding the request's max_output_bytes"),
+            "{err:#}"
+        );
+        Ok(())
+    }
+
+    /// Growth clamps its headroom to the limit, and fails without growing
+    /// once the rows needed exceed it.
+    #[test]
+    fn test_ensure_cli_capacity_respects_the_limit() -> anyhow::Result<()> {
+        let mut data = tch::Tensor::f_zeros([8, 2, 2, 3], (tch::Kind::Uint8, tch::Device::Cpu))?;
+        let row_bytes = 2 * 2 * 3;
+        let limit = |bytes: u64| OutputLimit::resolve(Some(bytes));
+        // Headroom would take 11 rows; the limit allows 9.
+        assert!(ensure_cli_capacity(&mut data, 9, 9, &limit(9 * row_bytes))?);
+        assert_eq!(data.size()[0], 9);
+        assert!(!ensure_cli_capacity(
+            &mut data,
+            9,
+            9,
+            &limit(9 * row_bytes)
+        )?);
+        // Rows wanted past the limit are only headroom: no error.
+        assert!(!ensure_cli_capacity(
+            &mut data,
+            9,
+            10,
+            &limit(9 * row_bytes)
+        )?);
+        let mut exact = tch::Tensor::f_zeros([8, 2, 2, 3], (tch::Kind::Uint8, tch::Device::Cpu))?;
+        assert!(ensure_cli_capacity(
+            &mut exact,
+            9,
+            10,
+            &limit(9 * row_bytes)
+        )?);
+        assert_eq!(exact.size()[0], 9);
+        let err = ensure_cli_capacity(&mut data, 10, 10, &limit(9 * row_bytes))
+            .err()
+            .context("growing past the limit must fail")?;
+        assert!(
+            format!("{err:#}").contains(
+                "would require 120 bytes, exceeding the request's max_output_bytes of 108"
+            ),
+            "{err:#}"
+        );
+        assert_eq!(data.size()[0], 9);
+        // Below the limit, growth adds a quarter, or what is wanted.
+        assert!(ensure_cli_capacity(&mut data, 10, 10, &limit(1 << 20))?);
+        assert_eq!(data.size()[0], 12);
+        assert!(ensure_cli_capacity(&mut data, 13, 20, &limit(1 << 20))?);
+        assert_eq!(data.size()[0], 20);
+        Ok(())
+    }
+
+    #[test]
+    fn test_fps_mode_cli_rejects_fps_and_windows() -> anyhow::Result<()> {
+        init_logger();
+        let video = crate::util::test_utils::generate_vfr_video_file(
+            ".mp4",
+            64,
+            48,
+            JITTER_AND_GAPS,
+            &[],
+            &[],
+        )?;
+        let path: String = video.path().to_str().unwrap().into();
+        let request = |frame_rate, end_time| MediaDecodeRequest {
+            source: MediaSource::Uri(path.clone()),
+            start_time: None,
+            end_time,
+            video_stream: Some(VideoStreamRequest {
+                fps_mode: FpsMode::Cli,
+                frame_rate,
+                ..Default::default()
+            }),
+            audio_streams: None,
+            max_output_bytes: None,
+        };
+        let err = decode_media(request(Some(24.0), None), None)
+            .err()
+            .context("fps")?;
+        assert!(
+            format!("{err:#}").contains("cannot be combined with fps"),
+            "{err:#}"
+        );
+        let err = decode_media(request(None, Some(1.0)), None)
+            .err()
+            .context("window")?;
+        assert!(
+            format!("{err:#}").contains("start_time and end_time"),
+            "{err:#}"
+        );
+        // plan_asset refuses what decode_asset refuses.
+        let err = plan_media(request(Some(24.0), None), None)
+            .err()
+            .context("plan fps")?;
+        assert!(
+            format!("{err:#}").contains("cannot be combined with fps"),
+            "{err:#}"
+        );
+        let err = plan_media(request(None, Some(1.0)), None)
+            .err()
+            .context("plan window")?;
+        assert!(
+            format!("{err:#}").contains("start_time and end_time"),
+            "{err:#}"
+        );
+        // NVDEC frames have no duration, so the CLI's output can't be
+        // matched; both entry points refuse before touching a GPU.
+        let hardware = || MediaDecodeRequest {
+            video_stream: Some(VideoStreamRequest {
+                fps_mode: FpsMode::Cli,
+                hardware_acceleration: Some(true),
+                ..Default::default()
+            }),
+            ..request(None, None)
+        };
+        for err in [
+            plan_media(hardware(), None)
+                .err()
+                .context("plan hardware")?,
+            decode_media(hardware(), None)
+                .err()
+                .context("decode hardware")?,
+        ] {
+            assert!(
+                format!("{err:#}").contains("not supported with hardware_acceleration=True"),
+                "{err:#}"
+            );
+        }
+        // device is refused before a CUDA device is created, so an ordinal
+        // no GPU has gives the same error as one that exists.
+        let on_device = MediaDecodeRequest {
+            video_stream: Some(VideoStreamRequest {
+                fps_mode: FpsMode::Cli,
+                device: Some(999),
+                ..Default::default()
+            }),
+            ..request(None, None)
+        };
+        let err = decode_media(on_device, None).err().context("device")?;
+        assert!(
+            format!("{err:#}").contains("not supported with device"),
+            "{err:#}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_parse_byte_size() {
+        assert_eq!(parse_byte_size("0"), Some(0));
+        assert_eq!(parse_byte_size(" 1024 "), Some(1024));
+        assert_eq!(parse_byte_size("1024B"), Some(1024));
+        assert_eq!(parse_byte_size("512K"), Some(512 << 10));
+        assert_eq!(parse_byte_size("64m"), Some(64 << 20));
+        assert_eq!(parse_byte_size("32G"), Some(32 << 30));
+        assert_eq!(parse_byte_size("32 GiB"), Some(32 << 30));
+        assert_eq!(parse_byte_size("2tib"), Some(2 << 40));
+        assert_eq!(parse_byte_size("+1048576"), Some(1 << 20));
+        assert_eq!(parse_byte_size("+32G"), Some(32 << 30));
+        let big = 64u128 << 30;
+        assert_eq!(parse_byte_size(&big.to_string()), Some(big));
+        for invalid in [
+            "",
+            "G",
+            "+",
+            "++1",
+            "-1",
+            "1.5G",
+            "32GB",
+            "32 G B",
+            "1e9",
+            "16 GiB of RAM",
+            "0x10",
+        ] {
+            assert_eq!(parse_byte_size(invalid), None, "{invalid:?}");
+        }
+        // Overflow is invalid rather than wrapping.
+        assert_eq!(parse_byte_size(&format!("{}T", u128::MAX >> 39)), None);
+    }
+
+    #[test]
+    fn test_output_limit_resolution_and_errors() {
+        let default = DEFAULT_MAX_OUTPUT_TENSOR_BYTES;
+        assert_eq!(OutputLimit::from_env(None).bytes, default);
+        assert_eq!(OutputLimit::from_env(Some(" ".into())).bytes, default);
+        assert_eq!(OutputLimit::from_env(Some("64G".into())).bytes, 64 << 30);
+        // A request's own limit wins over the environment's.
+        assert_eq!(OutputLimit::resolve(Some(1024)).bytes, 1024);
+
+        // 900 frames of 4K rgb24, about 22 GB: over the default, within 64 GiB.
+        let shape = [900, 2160, 3840, 3];
+        let error = |limit: &OutputLimit| {
+            check_output_tensor_size(&shape, 1, limit)
+                .unwrap_err()
+                .to_string()
+        };
+        let err = error(&OutputLimit::from_env(None));
+        assert!(err.contains("default limit of 17179869184 bytes"), "{err}");
+        assert!(err.contains("max_output_bytes"), "{err}");
+        assert!(err.contains("AVTENSOR_MAX_OUTPUT_TENSOR_BYTES"), "{err}");
+        check_output_tensor_size(&shape, 1, &OutputLimit::from_env(Some("64G".into()))).unwrap();
+        assert!(check_output_tensor_size(&[-1, 2], 1, &OutputLimit::resolve(Some(1))).is_err());
+
+        // A value that is set but too small is named, so the error does not
+        // just say to set it.
+        let err = error(&OutputLimit::from_env(Some("8G".into())));
+        assert!(
+            err.contains("set by AVTENSOR_MAX_OUTPUT_TENSOR_BYTES=\"8G\""),
+            "{err}"
+        );
+
+        // An invalid value falls back to the default, and the error names it.
+        for invalid in ["32GB", "lots", "-1"] {
+            let limit = OutputLimit::from_env(Some(invalid.into()));
+            assert_eq!(limit.bytes, default, "{invalid:?}");
+            let err = error(&limit);
+            assert!(
+                err.contains(&format!(
+                    "AVTENSOR_MAX_OUTPUT_TENSOR_BYTES={invalid:?} was ignored"
+                )),
+                "{err}"
+            );
+        }
+
+        let err = error(&OutputLimit::resolve(Some(1024)));
+        assert!(
+            err.contains("the request's max_output_bytes of 1024 bytes"),
+            "{err}"
+        );
+    }
+
+    /// `max_output_bytes` on the request bounds both planning and decoding.
+    #[test]
+    fn test_request_max_output_bytes() -> anyhow::Result<()> {
+        init_logger();
+        let video = generate_test_video_file(&TestVideoParameters {
+            duration: Duration::from_secs(1),
+            ..Default::default()
+        })?;
+        let request = |max_output_bytes| MediaDecodeRequest {
+            source: MediaSource::Uri(video.path().to_str().unwrap().into()),
+            start_time: None,
+            end_time: None,
+            video_stream: Some(VideoStreamRequest::default()),
+            audio_streams: None,
+            max_output_bytes,
+        };
+        // 30 frames of 640x480 rgb24 is ~27.6 MB.
+        let err = decode_media(request(Some(1 << 20)), None)
+            .err()
+            .context("1 MiB limit")?;
+        assert!(format!("{err:#}").contains("max_output_bytes"), "{err:#}");
+        assert!(plan_media(request(Some(1 << 20)), None).is_err());
+        decode_media(request(Some(64 << 20)), None)?;
+        Ok(())
+    }
+
+    /// The limit applies to audio streams too, in planning and decoding.
+    #[test]
+    fn test_request_max_output_bytes_audio() -> anyhow::Result<()> {
+        init_logger();
+        let video = generate_test_video_file(&TestVideoParameters {
+            duration: Duration::from_secs(1),
+            ..Default::default()
+        })?;
+        let request = |max_output_bytes| MediaDecodeRequest {
+            source: uri(&video),
+            start_time: None,
+            end_time: None,
+            video_stream: None,
+            audio_streams: Some(vec![AudioStreamRequest::default()]),
+            max_output_bytes: Some(max_output_bytes),
+        };
+        // ~1 s of 44.1 kHz mono float32 is ~176 KB.
+        let plan_err = plan_media(request(1000), None).unwrap_err();
+        let decode_err = decode_media(request(1000), None).err().unwrap();
+        for err in [plan_err, decode_err] {
+            assert!(
+                format!("{err:#}").contains("the request's max_output_bytes of 1000 bytes"),
+                "{err:#}"
+            );
+        }
+        let plans = plan_media(request(1 << 20), None)?;
+        assert_eq!(plans[0].stream_type(), StreamType::Audio);
+        decode_media(request(1 << 20), None)?;
+        Ok(())
+    }
+
+    /// Every stream's planned size is checked before any buffer is allocated:
+    /// an audio stream over the limit fails the request without allocating
+    /// the (within-limit) video buffer first.
+    #[test]
+    fn test_output_limit_checked_before_any_allocation() -> anyhow::Result<()> {
+        init_logger();
+        let video = generate_test_video_file(&TestVideoParameters {
+            duration: Duration::from_secs(1),
+            ..Default::default()
+        })?;
+        let request = |max_output_bytes| MediaDecodeRequest {
+            source: uri(&video),
+            start_time: None,
+            end_time: None,
+            // 30 frames of 16x16 rgb24 is ~23 KB, under the limit below.
+            video_stream: Some(VideoStreamRequest {
+                width: Some(16),
+                height: Some(16),
+                ..Default::default()
+            }),
+            // ~1 s of 44.1 kHz mono float32 is ~176 KB, over it.
+            audio_streams: Some(vec![AudioStreamRequest::default()]),
+            max_output_bytes: Some(max_output_bytes),
+        };
+        let allocations = crate::alloc::allocations_on_this_thread;
+
+        let before = allocations();
+        let err = decode_media(request(100_000), None).err().unwrap();
+        assert!(format!("{err:#}").contains("max_output_bytes"), "{err:#}");
+        assert!(format!("{err:#}").contains("shape [1, "), "{err:#}");
+        assert_eq!(allocations(), before, "no output buffer may be allocated");
+
+        // With room for both, both buffers are allocated.
+        let before = allocations();
+        let streams = decode_media(request(1 << 20), None)?;
+        assert_eq!(streams.len(), 2);
+        assert_eq!(allocations(), before + 2);
+        Ok(())
+    }
+
     #[test]
     fn test_tch_slice_error_handling() -> anyhow::Result<()> {
         let tensor = tch::Tensor::randn([2, 2], (tch::Kind::Float, tch::Device::Cpu));
@@ -5179,6 +6755,7 @@ mod tests {
                 end_time: None,
                 video_stream: None,
                 audio_streams: Some(vec![AudioStreamRequest::default()]),
+                max_output_bytes: None,
             },
             None,
         )?;
@@ -5219,6 +6796,7 @@ mod tests {
                 end_time: None,
                 video_stream: None,
                 audio_streams: Some(vec![request]),
+                max_output_bytes: None,
             },
             None,
         )?;
@@ -5289,6 +6867,7 @@ mod tests {
                 end_time: None,
                 video_stream: Some(VideoStreamRequest::default()),
                 audio_streams: Some(vec![AudioStreamRequest::default()]),
+                max_output_bytes: None,
             },
             None,
         )?;
@@ -5332,6 +6911,7 @@ mod tests {
                 end_time: Some(3.0),
                 video_stream: Some(VideoStreamRequest::default()),
                 audio_streams: Some(vec![AudioStreamRequest::default()]),
+                max_output_bytes: None,
             },
             None,
         )?;
@@ -5380,13 +6960,23 @@ mod tests {
         .unwrap()
         .remove(0);
 
+        let limit = OutputLimit::from_env(None);
+        let video_context = |seek: &Seek| -> anyhow::Result<StreamContext> {
+            let plan = plan_video_stream(&input_format_context, &video_request, seek, &limit)?;
+            init_video_stream_context(&input_format_context, &video_request, plan, &limit)
+        };
+        let audio_context = |seek: &Seek| -> anyhow::Result<StreamContext> {
+            let plan = plan_audio_stream(&input_format_context, &audio_request, seek, &limit)?;
+            init_audio_stream_context(&input_format_context, &audio_request, plan)
+        };
+
         let window = Seek {
             start_time: Some(2.0),
             end_time: Some(3.0),
         };
-        let video = init_video_stream_context(&input_format_context, &video_request, &window)?;
+        let video = video_context(&window)?;
         assert_eq!(video.frame_data.size(), vec![30, 240, 320, 3]);
-        let audio = init_audio_stream_context(&input_format_context, &audio_request, &window)?;
+        let audio = audio_context(&window)?;
         assert_eq!(audio.frame_data.size(), vec![2, 48000]);
 
         // Without a window the buffers cover the whole file.
@@ -5394,9 +6984,9 @@ mod tests {
             start_time: None,
             end_time: None,
         };
-        let video = init_video_stream_context(&input_format_context, &video_request, &full)?;
+        let video = video_context(&full)?;
         assert!(video.frame_data.size()[0] >= 300);
-        let audio = init_audio_stream_context(&input_format_context, &audio_request, &full)?;
+        let audio = audio_context(&full)?;
         assert!(audio.frame_data.size()[1] >= 480000);
 
         Ok(())
@@ -5417,6 +7007,7 @@ mod tests {
                 end_time: None,
                 video_stream: Some(VideoStreamRequest::default()),
                 audio_streams: None,
+                max_output_bytes: None,
             },
             None,
         )?;
@@ -5448,6 +7039,7 @@ mod tests {
                 end_time: None,
                 video_stream: Some(VideoStreamRequest::default()),
                 audio_streams: None,
+                max_output_bytes: None,
             },
             None,
         )?;
@@ -5485,6 +7077,7 @@ mod tests {
                 end_time: None,
                 video_stream: Some(VideoStreamRequest::default()),
                 audio_streams: Some(vec![AudioStreamRequest::default()]),
+                max_output_bytes: None,
             },
             None,
         )?;
@@ -5530,6 +7123,7 @@ mod tests {
                 end_time: None,
                 video_stream: Some(VideoStreamRequest::default()),
                 audio_streams: Some(vec![AudioStreamRequest::default()]),
+                max_output_bytes: None,
             },
             None,
         )?;
@@ -5540,6 +7134,116 @@ mod tests {
             assert!(stream.data.is_some(), "Expected decoded data");
         }
 
+        Ok(())
+    }
+
+    /// GPU-resident output cannot run the rotation filters, so autorotate
+    /// on a rotated stream is refused rather than returned unrotated.
+    #[test]
+    #[ignore = "requires an NVIDIA GPU with NVDEC"]
+    fn test_autorotate_with_cuda_output_is_rejected() -> anyhow::Result<()> {
+        init_logger();
+        let source = generate_test_video_file(&TestVideoParameters {
+            duration: Duration::from_secs(1),
+            pixel_format: Some("yuv420p".to_string()),
+            ..Default::default()
+        })?;
+        let rotated = crate::util::test_utils::make_rotated_video(source.path(), 90)?;
+        let err = decode_video_tensor(
+            MediaSource::Uri(rotated.path().to_str().unwrap().into()),
+            VideoStreamRequest {
+                device: Some(0),
+                autorotate: true,
+                ..Default::default()
+            },
+        )
+        .err()
+        .context("expected an error")?;
+        assert!(
+            format!("{err:#}").contains("does not support autorotate"),
+            "{err:#}"
+        );
+        Ok(())
+    }
+
+    /// `plan_media` refuses GPU-resident output with autorotate on a rotated
+    /// stream, as decode does, and accepts it on an unrotated one (nothing to
+    /// rotate). Planning opens no decoder, so this needs no GPU.
+    #[test]
+    fn test_plan_autorotate_with_cuda_output_is_rejected() -> anyhow::Result<()> {
+        init_logger();
+        let source = generate_test_video_file(&TestVideoParameters {
+            duration: Duration::from_secs(1),
+            pixel_format: Some("yuv420p".to_string()),
+            ..Default::default()
+        })?;
+        let rotated = crate::util::test_utils::make_rotated_video(source.path(), 90)?;
+        let plan = |file: &tempfile::NamedTempFile| {
+            plan_media(
+                MediaDecodeRequest {
+                    source: uri(file),
+                    start_time: None,
+                    end_time: None,
+                    video_stream: Some(VideoStreamRequest {
+                        device: Some(0),
+                        autorotate: true,
+                        ..Default::default()
+                    }),
+                    audio_streams: None,
+                    max_output_bytes: None,
+                },
+                None,
+            )
+        };
+        let err = plan(&rotated).err().context("expected an error")?;
+        assert!(
+            format!("{err:#}").contains("does not support autorotate"),
+            "{err:#}"
+        );
+        assert_eq!(plan(&source)?[0].shape, vec![30, 480, 640, 3]);
+        Ok(())
+    }
+
+    /// With NVDEC decoding and autorotate, a resize is done after the
+    /// rotation (NVDEC's pre-resize would scale the unrotated axes), so the
+    /// output matches the software decoder's.
+    #[test]
+    #[ignore = "requires an NVIDIA GPU with NVDEC"]
+    fn test_autorotate_resize_with_nvdec_matches_software() -> anyhow::Result<()> {
+        init_logger();
+        let source = generate_test_video_file(&TestVideoParameters {
+            duration: Duration::from_secs(1),
+            pixel_format: Some("yuv420p".to_string()),
+            ..Default::default()
+        })?;
+        let rotated = crate::util::test_utils::make_rotated_video(source.path(), 90)?;
+        let path: String = rotated.path().to_str().unwrap().into();
+        let decode = |hardware_acceleration| {
+            decode_video_tensor(
+                MediaSource::Uri(path.clone()),
+                VideoStreamRequest {
+                    hardware_acceleration: Some(hardware_acceleration),
+                    autorotate: true,
+                    width: Some(240),
+                    height: Some(320),
+                    ..Default::default()
+                },
+            )
+        };
+        let (nvdec, _) = decode(true)?;
+        let (software, _) = decode(false)?;
+        assert_eq!(nvdec.size(), software.size());
+        assert_eq!(nvdec.size()[1..3], [320, 240]);
+        // NVDEC and libavcodec decode H.264 bit-exactly; the same filter
+        // graph then rotates and scales both.
+        let max_diff: f64 = nvdec
+            .to_kind(tch::Kind::Int16)
+            .f_sub(&software.to_kind(tch::Kind::Int16))?
+            .abs()
+            .max()
+            .to_kind(tch::Kind::Float)
+            .try_into()?;
+        assert!(max_diff <= 1.0, "max diff {max_diff}");
         Ok(())
     }
 
@@ -5563,6 +7267,7 @@ mod tests {
                 end_time: None,
                 video_stream: Some(VideoStreamRequest::default()),
                 audio_streams: None,
+                max_output_bytes: None,
             },
             None,
         )?;
@@ -5576,6 +7281,7 @@ mod tests {
                     ..Default::default()
                 }),
                 audio_streams: None,
+                max_output_bytes: None,
             },
             None,
         )?;
@@ -5650,6 +7356,7 @@ mod tests {
                     ..Default::default()
                 }),
                 audio_streams: None,
+                max_output_bytes: None,
             },
             None,
         ) {
@@ -5694,6 +7401,7 @@ mod tests {
                     ..Default::default()
                 }),
                 audio_streams: None,
+                max_output_bytes: None,
             },
             None,
         )?;
@@ -5708,6 +7416,7 @@ mod tests {
                     ..Default::default()
                 }),
                 audio_streams: None,
+                max_output_bytes: None,
             },
             None,
         )?;
@@ -5758,6 +7467,7 @@ mod tests {
                 ..Default::default()
             }),
             audio_streams: None,
+            max_output_bytes: None,
         };
 
         let sw = decode_media(request(false), None)?;
@@ -5855,6 +7565,7 @@ mod tests {
                 ..Default::default()
             }),
             audio_streams: None,
+            max_output_bytes: None,
         };
 
         let sdr_request = MediaDecodeRequest {
@@ -5866,6 +7577,7 @@ mod tests {
                 ..Default::default()
             }),
             audio_streams: None,
+            max_output_bytes: None,
         };
 
         let hdr_result = decode_media(hdr_request, None)?;
@@ -5903,16 +7615,20 @@ mod tests {
         Ok(())
     }
 
-    /// Decodes only the video stream of `path` and returns its output tensor
-    /// and per-frame pts.
-    fn decode_video_tensor(source: MediaSource) -> anyhow::Result<(tch::Tensor, Vec<f64>)> {
+    /// Decodes only the video stream of `source` with `request` and returns
+    /// its output tensor and per-frame pts.
+    fn decode_video_tensor(
+        source: MediaSource,
+        request: VideoStreamRequest,
+    ) -> anyhow::Result<(tch::Tensor, Vec<f64>)> {
         let mut streams = decode_media(
             MediaDecodeRequest {
                 source,
                 start_time: None,
                 end_time: None,
-                video_stream: Some(VideoStreamRequest::default()),
+                video_stream: Some(request),
                 audio_streams: None,
+                max_output_bytes: None,
             },
             None,
         )?;
@@ -5923,44 +7639,193 @@ mod tests {
         ))
     }
 
+    /// Guards `AVTENSOR_DISABLE_DIRECT_PATH`, which is process-wide. Tests
+    /// that set it hold the write lock; tests whose decode must take the
+    /// direct path (because only it works, or because they check that it
+    /// ran) hold the read lock. Other tests decoding in parallel may briefly
+    /// take the graph path, which is benign: both paths are correct.
+    static DIRECT_PATH_ENV: std::sync::RwLock<()> = std::sync::RwLock::new(());
+
+    /// Runs `f` with the direct paths disabled, forcing the filter graph.
+    /// The variable is cleared even if `f` panics.
+    fn with_direct_path_disabled<T>(f: impl FnOnce() -> T) -> T {
+        struct Restore;
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                std::env::remove_var("AVTENSOR_DISABLE_DIRECT_PATH");
+            }
+        }
+        // Declared before `_restore`, so it is released after the variable
+        // is cleared.
+        let _guard = DIRECT_PATH_ENV.write().unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("AVTENSOR_DISABLE_DIRECT_PATH", "1");
+        let _restore = Restore;
+        f()
+    }
+
+    #[test]
+    fn test_with_direct_path_disabled_clears_on_panic() {
+        let result = std::panic::catch_unwind(|| {
+            with_direct_path_disabled(|| {
+                assert!(!direct_paths_enabled());
+                panic!("decode failed");
+            })
+        });
+        assert!(result.is_err());
+        let _guard = DIRECT_PATH_ENV.read().unwrap_or_else(|e| e.into_inner());
+        assert!(direct_paths_enabled());
+    }
+
     /// The direct swscale path must produce output identical to the filter
-    /// graph, both for untagged and BT.709-tagged sources.
-    #[test_case(None, None; "untagged")]
-    #[test_case(Some("bt709"), Some("tv"); "bt709_tv")]
+    /// graph: for untagged and BT.709-tagged sources, for 10-bit sources, and
+    /// for HDR sources decoded with `HdrMode::Raw`, which take the direct
+    /// path too (including the less common FCC matrix, and an HDR source with
+    /// no matrix tag, which both paths decode as BT.2020). Each source is
+    /// converted on one swscale thread (the default) and slice-threaded
+    /// (`number_of_threads=0`), and the test checks that the direct path ran.
+    #[test_case(None, None, None, HdrMode::Tonemap; "untagged")]
+    #[test_case(Some("bt709"), Some("tv"), None, HdrMode::Tonemap; "bt709_tv")]
+    #[test_case(Some("bt709"), Some("tv"), Some("yuv420p10le"), HdrMode::Tonemap; "bt709_10bit")]
+    #[test_case(Some("bt2020nc"), Some("tv"), Some("yuv420p10le"), HdrMode::Raw; "hlg_raw")]
+    #[test_case(Some("fcc"), Some("tv"), Some("yuv420p10le"), HdrMode::Raw; "fcc_raw")]
+    #[test_case(None, Some("tv"), Some("yuv420p10le"), HdrMode::Raw; "untagged_matrix_hlg_raw")]
     fn test_direct_scale_matches_filter_graph(
         colorspace: Option<&str>,
         color_range: Option<&str>,
+        pixel_format: Option<&str>,
+        hdr_mode: HdrMode,
     ) -> anyhow::Result<()> {
         init_logger();
 
+        let hdr = hdr_mode == HdrMode::Raw;
         let test_video = generate_test_video_file(&TestVideoParameters {
             colorspace: colorspace.map(String::from),
             color_range: color_range.map(String::from),
+            pixel_format: pixel_format.map(String::from),
+            color_primaries: hdr.then(|| "bt2020".to_string()),
+            color_trc: hdr.then(|| "arib-std-b67".to_string()),
             ..Default::default()
         })?;
         let path: String = test_video.path().to_str().unwrap().into();
+        let request = |number_of_threads| VideoStreamRequest {
+            hdr_mode,
+            number_of_threads,
+            ..Default::default()
+        };
 
-        // Default parameters (640 px wide) are eligible for the direct path.
-        let (direct, direct_pts) = decode_video_tensor(MediaSource::Uri(path.clone()))?;
+        direct_scale_stats::take();
+        let (graph, graph_pts) = with_direct_path_disabled(|| {
+            decode_video_tensor(MediaSource::Uri(path.clone()), request(None))
+        })?;
+        assert_eq!(direct_scale_stats::take().frames, 0);
 
-        // Force the filter-graph path. The env var may briefly affect tests
-        // decoding in parallel, which is benign: both paths are correct.
-        std::env::set_var("AVTENSOR_DISABLE_DIRECT_PATH", "1");
-        let graph = decode_video_tensor(MediaSource::Uri(path));
-        std::env::remove_var("AVTENSOR_DISABLE_DIRECT_PATH");
-        let (graph, graph_pts) = graph?;
+        for (number_of_threads, threads) in [(None, 1), (Some(0), filter_graph_threads())] {
+            // Default parameters (640 px wide) are eligible for the direct
+            // path; hold the lock so no other test disables it meanwhile.
+            let (direct, direct_pts) = {
+                let _guard = DIRECT_PATH_ENV.read().unwrap_or_else(|e| e.into_inner());
+                decode_video_tensor(MediaSource::Uri(path.clone()), request(number_of_threads))?
+            };
+            let stats = direct_scale_stats::take();
+            assert!(stats.frames > 0, "the decode did not take the direct path");
+            assert_eq!(stats.threads, threads as i64);
 
-        assert_eq!(direct.size(), graph.size());
-        assert_eq!(direct_pts, graph_pts);
-        let max_diff: f64 = direct
-            .f_sub(&graph)?
-            .abs()
-            .max()
-            .to_kind(tch::Kind::Float)
-            .try_into()?;
-        assert_eq!(
-            max_diff, 0.0,
-            "direct swscale output must be identical to the filter graph"
+            assert_eq!(direct.size(), graph.size());
+            assert_eq!(direct_pts, graph_pts);
+            let max_diff: f64 = direct
+                .f_sub(&graph)?
+                .abs()
+                .max()
+                .to_kind(tch::Kind::Float)
+                .try_into()?;
+            assert_eq!(
+                max_diff, 0.0,
+                "direct swscale output must be identical to the filter graph \
+                 (number_of_threads={number_of_threads:?})"
+            );
+        }
+        Ok(())
+    }
+
+    /// The direct path's swscale pool follows `number_of_threads`: one
+    /// thread by default (like the single-threaded conversion before the
+    /// pool), the filter graph's cap for 0 (auto), N for an explicit N
+    /// (capped the same way), and always one for XYZ sources.
+    #[test]
+    fn test_direct_scaler_threads_follow_request() -> anyhow::Result<()> {
+        init_logger();
+
+        let cap = filter_graph_threads();
+        assert_eq!(direct_scaler_threads(None), 1);
+        assert_eq!(direct_scaler_threads(Some(1)), 1);
+        assert_eq!(direct_scaler_threads(Some(0)), cap);
+        assert_eq!(direct_scaler_threads(Some(2)), 2.min(cap));
+        assert_eq!(direct_scaler_threads(Some(10_000)), cap);
+
+        let yuv = generate_test_video_file(&TestVideoParameters {
+            duration: Duration::from_secs(1),
+            ..Default::default()
+        })?;
+        let xyz = generate_xyz12_video_file()?;
+        let _guard = DIRECT_PATH_ENV.read().unwrap_or_else(|e| e.into_inner());
+        for (video, number_of_threads, threads) in [
+            (&yuv, None, 1),
+            (&yuv, Some(1), 1),
+            (&yuv, Some(0), cap),
+            (&yuv, Some(2), 2.min(cap)),
+            (&xyz, Some(0), 1),
+        ] {
+            let path = video.path().to_str().unwrap().into();
+            let request = VideoStreamRequest {
+                number_of_threads,
+                ..Default::default()
+            };
+            direct_scale_stats::take();
+            let _ = decode_video_tensor(MediaSource::Uri(path), request)?;
+            let stats = direct_scale_stats::take();
+            assert!(stats.frames > 0, "the decode did not take the direct path");
+            assert_eq!(
+                stats.threads,
+                threads as i64,
+                "number_of_threads={number_of_threads:?}, {:?}",
+                video.path()
+            );
+        }
+        Ok(())
+    }
+
+    /// Raw-mode HDR sources whose matrix the scale filter rejects (YCgCo,
+    /// ICtCp, ...) must fail as they do in the filter graph, not decode as
+    /// BT.601 on the direct path.
+    #[test_case(8; "ycgco")]
+    #[test_case(12; "chroma_derived_nc")]
+    #[test_case(14; "ictcp")]
+    fn test_raw_hdr_unsupported_matrix_fails(matrix_coefficients: u8) -> anyhow::Result<()> {
+        init_logger();
+
+        let hlg = generate_test_video_file(&TestVideoParameters {
+            duration: Duration::from_secs(1),
+            colorspace: Some("bt2020nc".to_string()),
+            color_range: Some("tv".to_string()),
+            pixel_format: Some("yuv420p10le".to_string()),
+            color_primaries: Some("bt2020".to_string()),
+            color_trc: Some("arib-std-b67".to_string()),
+            ..Default::default()
+        })?;
+        let retagged = retag_matrix_coefficients(hlg.path(), matrix_coefficients)?;
+        let path: String = retagged.path().to_str().unwrap().into();
+        let request = |hdr_mode| VideoStreamRequest {
+            hdr_mode,
+            ..Default::default()
+        };
+        // Tone mapping converts the matrix in zscale, which accepts these.
+        let _ = decode_video_tensor(MediaSource::Uri(path.clone()), request(HdrMode::Tonemap))?;
+        // The stream stays in the graph, which fails to set up, as on main.
+        let err = decode_video_tensor(MediaSource::Uri(path), request(HdrMode::Raw))
+            .expect_err("raw decode of an unsupported matrix must fail");
+        assert!(
+            format!("{err:#}").contains("Failed to initialize filter"),
+            "{err:#}"
         );
         Ok(())
     }
@@ -5984,6 +7849,7 @@ mod tests {
                     ..Default::default()
                 }),
                 audio_streams: None,
+                max_output_bytes: None,
             },
             None,
         )?;
@@ -6090,6 +7956,7 @@ mod tests {
                     ..Default::default()
                 }),
                 audio_streams: None,
+                max_output_bytes: None,
             },
             None,
         )?;
@@ -6188,6 +8055,7 @@ mod tests {
                         ..Default::default()
                     }),
                     audio_streams: None,
+                    max_output_bytes: None,
                 },
                 None,
             )?;
@@ -6240,6 +8108,7 @@ mod tests {
                 ..Default::default()
             }),
             audio_streams: None,
+            max_output_bytes: None,
         };
         let plan = plan_media(make_request(), None)?;
         let data = decode_media(make_request(), None)?
@@ -6279,6 +8148,48 @@ mod tests {
         Ok(())
     }
 
+    /// A raw-mode HDR stream that takes the direct path and then switches to
+    /// a matrix the scale filter rejects must fail on those frames rather
+    /// than convert them as BT.601.
+    #[test]
+    fn test_direct_scale_rejects_unsupported_matrix_mid_stream() -> anyhow::Result<()> {
+        let config = VideoFilterConfig {
+            hdr_mode: HdrMode::Raw,
+            source_color: SourceColorInfo {
+                color_primaries: Some("bt2020".to_string()),
+                color_trc: Some("arib-std-b67".to_string()),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let (width, height) = (64, 48);
+        let mut scaler = DirectVideoScaler::new(&config, width, height);
+        let dest = tch::Tensor::zeros(
+            [1, height as i64, width as i64, 3],
+            (tch::Kind::Uint8, tch::Device::Cpu),
+        );
+        let frame = |colorspace| -> anyhow::Result<AVFrame> {
+            let mut frame = AVFrame::new();
+            frame.set_width(width);
+            frame.set_height(height);
+            frame.set_format(ffi::AV_PIX_FMT_YUV420P10LE);
+            frame.alloc_buffer()?;
+            unsafe {
+                (*frame.as_mut_ptr()).colorspace = colorspace;
+                (*frame.as_mut_ptr()).color_range = ffi::AVCOL_RANGE_MPEG;
+            }
+            Ok(frame)
+        };
+        scaler.scale_into(&frame(ffi::AVCOL_SPC_BT2020_NCL)?, &dest)?;
+        for colorspace in [ffi::AVCOL_SPC_YCGCO, ffi::AVCOL_SPC_ICTCP] {
+            let err = scaler
+                .scale_into(&frame(colorspace)?, &dest)
+                .expect_err("unsupported matrix must not convert");
+            assert!(err.to_string().contains("unsupported YUV matrix"), "{err}");
+        }
+        Ok(())
+    }
+
     /// GPU-resident output converts with NPP, so an explicit accurate
     /// conversion is rejected before any CUDA machinery is touched.
     #[test]
@@ -6296,6 +8207,7 @@ mod tests {
                     ..Default::default()
                 }),
                 audio_streams: None,
+                max_output_bytes: None,
             },
             None,
         ) {
@@ -6307,6 +8219,48 @@ mod tests {
             "unexpected error: {err:#}"
         );
         Ok(())
+    }
+
+    /// The scale filter rejects BT.2020 constant-luminance input, so the
+    /// direct path is the only one that converts it. swscale has the same
+    /// coefficients for both BT.2020 matrices, so a `bt2020c` source must
+    /// convert exactly like its `bt2020nc` twin.
+    #[test]
+    fn test_direct_scale_bt2020c_uses_bt2020_coefficients() -> anyhow::Result<()> {
+        init_logger();
+
+        let non_constant_luminance = generate_test_video_file(&TestVideoParameters {
+            colorspace: Some("bt2020nc".to_string()),
+            color_range: Some("tv".to_string()),
+            pixel_format: Some("yuv420p10le".to_string()),
+            color_primaries: Some("bt2020".to_string()),
+            color_trc: Some("arib-std-b67".to_string()),
+            ..Default::default()
+        })?;
+        // H.273 matrix coefficients 10: BT.2020 constant luminance.
+        let constant_luminance = retag_matrix_coefficients(non_constant_luminance.path(), 10)?;
+        // The graph cannot convert bt2020c, so keep the direct path enabled.
+        let _guard = DIRECT_PATH_ENV.read().unwrap_or_else(|e| e.into_inner());
+        let decode = |video: &tempfile::NamedTempFile| -> anyhow::Result<tch::Tensor> {
+            let path = video.path().to_str().unwrap().into();
+            let request = VideoStreamRequest {
+                hdr_mode: HdrMode::Raw,
+                ..Default::default()
+            };
+            Ok(decode_video_tensor(MediaSource::Uri(path), request)?.0)
+        };
+        assert!(decode(&constant_luminance)?.equal(&decode(&non_constant_luminance)?));
+        Ok(())
+    }
+
+    /// XYZ sources scale on one swscale thread, since every slice worker
+    /// would convert the whole frame from XYZ; other formats use the pool.
+    #[test]
+    fn test_scaler_threads() {
+        assert_eq!(scaler_threads(ffi::AV_PIX_FMT_XYZ12LE, 16), 1);
+        assert_eq!(scaler_threads(ffi::AV_PIX_FMT_XYZ12BE, 16), 1);
+        assert_eq!(scaler_threads(ffi::AV_PIX_FMT_YUV420P10LE, 16), 16);
+        assert_eq!(scaler_threads(ffi::AV_PIX_FMT_YUV420P, 16), 16);
     }
 
     /// The direct audio path must produce output identical to the `anull`
@@ -6330,6 +8284,7 @@ mod tests {
                     end_time: None,
                     video_stream: None,
                     audio_streams: Some(vec![AudioStreamRequest::default()]),
+                    max_output_bytes: None,
                 },
                 None,
             )?;
@@ -6341,12 +8296,7 @@ mod tests {
 
         let direct = decode_audio(path.clone())?;
 
-        // Force the filter-graph path. The env var may briefly affect tests
-        // decoding in parallel, which is benign: both paths are correct.
-        std::env::set_var("AVTENSOR_DISABLE_DIRECT_PATH", "1");
-        let graph = decode_audio(path);
-        std::env::remove_var("AVTENSOR_DISABLE_DIRECT_PATH");
-        let graph = graph?;
+        let graph = with_direct_path_disabled(|| decode_audio(path))?;
 
         assert_eq!(direct.size(), graph.size());
         let max_diff: f64 = direct
@@ -6385,6 +8335,7 @@ mod tests {
                         ..Default::default()
                     }),
                     audio_streams: None,
+                    max_output_bytes: None,
                 },
                 None,
             )?;
@@ -6444,9 +8395,11 @@ mod tests {
 
         let test_video = generate_test_video_file(&TestVideoParameters::default())?;
         let bytes = std::fs::read(test_video.path())?;
-        let (from_bytes, _) = decode_video_tensor(MediaSource::Bytes(bytes))?;
-        let (from_file, _) =
-            decode_video_tensor(MediaSource::Uri(test_video.path().to_str().unwrap().into()))?;
+        let (from_bytes, _) = decode_video_tensor(MediaSource::Bytes(bytes), Default::default())?;
+        let (from_file, _) = decode_video_tensor(
+            MediaSource::Uri(test_video.path().to_str().unwrap().into()),
+            Default::default(),
+        )?;
 
         assert_eq!(from_bytes.size(), from_file.size());
         let max_diff: f64 = from_bytes
@@ -6465,8 +8418,10 @@ mod tests {
 
         let params = TestVideoParameters::default();
         let test_video = generate_test_video_file(&params)?;
-        let (data, pts) =
-            decode_video_tensor(MediaSource::Uri(test_video.path().to_str().unwrap().into()))?;
+        let (data, pts) = decode_video_tensor(
+            MediaSource::Uri(test_video.path().to_str().unwrap().into()),
+            Default::default(),
+        )?;
 
         assert_eq!(
             pts.len(),
@@ -6588,6 +8543,7 @@ mod tests {
                 sample_rate: Some(16000),
                 ..Default::default()
             }]),
+            max_output_bytes: None,
         };
         // CFR video lands exactly on the plan; AAC frame padding makes the
         // audio tail slightly short of it.
@@ -6615,6 +8571,7 @@ mod tests {
             end_time: Some(3.0),
             video_stream: Some(VideoStreamRequest::default()),
             audio_streams: Some(vec![AudioStreamRequest::default()]),
+            max_output_bytes: None,
         };
         let plans = assert_plan_bounds_decode(make_request, false)?;
         for plan in &plans {
@@ -6635,6 +8592,7 @@ mod tests {
             end_time: Some(2.0),
             video_stream: None,
             audio_streams: Some(vec![AudioStreamRequest::default()]),
+            max_output_bytes: None,
         };
         let plans = assert_plan_bounds_decode(make_request, true)?;
         assert_eq!(plans[0].shape, vec![1, 96000]);
@@ -6652,6 +8610,7 @@ mod tests {
             end_time: None,
             video_stream: Some(VideoStreamRequest::default()),
             audio_streams: Some(vec![AudioStreamRequest::default()]),
+            max_output_bytes: None,
         };
         assert_plan_bounds_decode(make_request, false)?;
         Ok(())
@@ -6667,6 +8626,7 @@ mod tests {
             end_time: Some(2.0),
             video_stream: Some(VideoStreamRequest::default()),
             audio_streams: None,
+            max_output_bytes: None,
         };
         let plan_err = plan_media(make_request(), None).unwrap_err();
         let decode_err = decode_media(make_request(), None).err().unwrap();
@@ -6734,10 +8694,124 @@ mod tests {
             end_time: None,
             video_stream: Some(VideoStreamRequest::default()),
             audio_streams: None,
+            max_output_bytes: None,
         };
         let plans = assert_plan_bounds_decode(make_request, true)?;
         assert_eq!(plans[0].shape[1..], [480, 640, 3]);
         Ok(())
+    }
+
+    /// With `autorotate`, frames are rotated as ffmpeg's `-autorotate` does;
+    /// compared here against the unrotated decode rotated in torch.
+    #[test_case(90, 1, true ; "90")]
+    #[test_case(-90, -1, true ; "minus 90")]
+    #[test_case(180, 2, false ; "180")]
+    fn test_decode_autorotate(degrees: i32, quarter_turns: i64, swaps: bool) -> anyhow::Result<()> {
+        init_logger();
+        let params = TestVideoParameters {
+            duration: Duration::from_secs(1),
+            ..Default::default()
+        };
+        let source = generate_test_video_file(&params)?;
+        let rotated = crate::util::test_utils::make_rotated_video(source.path(), degrees)?;
+        let path: String = rotated.path().to_str().unwrap().into();
+        let decode = |autorotate: bool| {
+            decode_video_tensor(
+                MediaSource::Uri(path.clone()),
+                VideoStreamRequest {
+                    autorotate,
+                    ..Default::default()
+                },
+            )
+        };
+        let (coded, coded_pts) = decode(false)?;
+        let (shown, shown_pts) = decode(true)?;
+        // Exact equality with the rotated coded frames relies on this
+        // fixture (even-sized and 8-bit; testsrc encodes as 4:4:4, and
+        // even-sized 4:2:0 also works): only then does the RGB conversion
+        // commute with the rotation. With odd-sized 4:2:0, >8-bit sources
+        // or float32 output, autorotated frames still match the CLI's
+        // `-autorotate` but not `rot90`, so a fixture change here needs a
+        // comparison against the CLI instead.
+        assert_eq!(coded.size()[1..], [480, 640, 3]);
+        let expected_hw = if swaps { [640, 480] } else { [480, 640] };
+        assert_eq!(shown.size()[1..3], expected_hw);
+        assert_eq!(shown_pts, coded_pts);
+        // Counterclockwise display rotation; torch.rot90 turns from the
+        // first dim towards the second, i.e. counterclockwise on [H, W].
+        let expected = coded.rot90(quarter_turns, [1, 2]);
+        let max_diff: f64 = shown
+            .to_kind(tch::Kind::Int16)
+            .f_sub(&expected.to_kind(tch::Kind::Int16))?
+            .abs()
+            .max()
+            .to_kind(tch::Kind::Float)
+            .try_into()?;
+        assert_eq!(
+            max_diff, 0.0,
+            "autorotated frames must be the coded frames rotated"
+        );
+
+        // width/height refer to the rotated frame.
+        let (resized, _) = decode_video_tensor(
+            MediaSource::Uri(path.clone()),
+            VideoStreamRequest {
+                autorotate: true,
+                width: Some(expected_hw[1] as u32 / 2),
+                height: Some(expected_hw[0] as u32 / 2),
+                ..Default::default()
+            },
+        )?;
+        assert_eq!(
+            resized.size()[1..3],
+            [expected_hw[0] / 2, expected_hw[1] / 2]
+        );
+        Ok(())
+    }
+
+    /// The display matrix `av_display_rotation_set(degrees)` gives (a
+    /// clockwise rotation), then mirrored by `av_display_matrix_flip`.
+    fn matrix(degrees: f64, hflip: bool, vflip: bool) -> [i32; 9] {
+        let mut m = [0i32; 9];
+        unsafe {
+            ffi::av_display_rotation_set(m.as_mut_ptr(), degrees);
+            ffi::av_display_matrix_flip(m.as_mut_ptr(), hflip as i32, vflip as i32);
+        }
+        m
+    }
+
+    /// The filters FFmpeg 7.1's CLI inserts for each matrix (checked against
+    /// `configure_input_video_filter` with the same matrices).
+    #[test]
+    fn test_autorotate_filters() {
+        let f = |d, h, v| autorotate_filters(&matrix(d, h, v));
+        assert_eq!(f(0.0, false, false), Vec::<String>::new());
+        assert_eq!(f(90.0, false, false), ["transpose=clock"]);
+        assert_eq!(f(-90.0, false, false), ["transpose=cclock"]);
+        assert_eq!(f(180.0, false, false), ["hflip", "vflip"]);
+        assert_eq!(f(45.0, false, false), ["rotate=45.000000*PI/180"]);
+        // Mirrored matrices.
+        assert_eq!(f(0.0, true, false), ["hflip"]);
+        assert_eq!(f(0.0, false, true), ["vflip"]);
+        assert_eq!(f(90.0, true, false), ["transpose=cclock_flip"]);
+        assert_eq!(f(90.0, false, true), ["transpose=clock_flip"]);
+        assert_eq!(f(180.0, true, false), ["vflip"]);
+        // Mirrored near-zero angles (the CLI's `-display_rotation r
+        // -display_vflip` sets matrix(-r, false, true)). The angle is rounded
+        // first: 0.4° rounds to 0 and gets the vflip; 0.6° and 1.4° round to
+        // exactly 1°, which FFmpeg 7.1 neither rotates (`> 1`) nor flips
+        // (`< 1`), so those come out unchanged, as `ffmpeg -autorotate` does.
+        assert_eq!(f(-0.4, false, true), ["vflip"]);
+        assert_eq!(f(-0.6, false, true), Vec::<String>::new());
+        assert_eq!(f(-1.0, false, true), Vec::<String>::new());
+        assert_eq!(f(-1.4, false, true), Vec::<String>::new());
+        assert_eq!(f(1.0, false, true), ["rotate=359.000000*PI/180"]);
+        let swaps = |d, h, v| swaps_dimensions(&f(d, h, v));
+        assert!(swaps(90.0, false, false));
+        assert!(swaps(-90.0, true, false));
+        assert!(!swaps(180.0, false, false));
+        assert!(!swaps(45.0, false, false));
+        assert!(autorotate_filters(&[0; 9]).is_empty());
     }
 
     #[test]
@@ -6777,6 +8851,7 @@ mod tests {
                 end_time: Some(end_time),
                 video_stream: Some(VideoStreamRequest::default()),
                 audio_streams: None,
+                max_output_bytes: None,
             },
             None,
         )?;
