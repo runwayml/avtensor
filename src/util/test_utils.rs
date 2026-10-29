@@ -170,7 +170,8 @@ pub fn generate_test_video(
             .context("Could not convert output file path to string")?,
     ]);
 
-    cmd.status()?;
+    let status = cmd.status().context("running ffmpeg")?;
+    anyhow::ensure!(status.success(), "ffmpeg exited with {status}");
     Ok(())
 }
 
@@ -303,6 +304,36 @@ pub fn generate_bt709_ffv1_video(
     Ok(file)
 }
 
+/// Generates a 1 s lossless (FFV1) `testsrc` video at any size (odd sizes
+/// included) and frame rate, optionally tagged with a YUV matrix.
+pub fn generate_ffv1_video(
+    width: usize,
+    height: usize,
+    frame_rate: u32,
+    pixel_format: &str,
+    colorspace: Option<&str>,
+) -> Result<NamedTempFile, anyhow::Error> {
+    let file = NamedTempFile::with_suffix(".mkv")?;
+    let source = format!("testsrc=s={width}x{height}:r={frame_rate}:d=1");
+    let mut args = vec![
+        "-f",
+        "lavfi",
+        "-i",
+        &source,
+        "-pix_fmt",
+        pixel_format,
+        "-c:v",
+        "ffv1",
+    ];
+    if let Some(colorspace) = colorspace {
+        args.extend(["-colorspace", colorspace]);
+    }
+    let path = file.path().to_str().context("temp path")?.to_string();
+    args.push(&path);
+    run_ffmpeg(&args)?;
+    Ok(file)
+}
+
 /// Generates a short lossless (FFV1) 10-bit 4:2:0 PQ video at any size
 /// (odd sizes included). The transfer is always tagged PQ; the matrix and
 /// primaries are tagged BT.2020 only when requested, to exercise untagged
@@ -365,6 +396,36 @@ pub fn generate_fractional_fps_video(num_frames: usize) -> Result<NamedTempFile,
         &num_frames.to_string(),
         "-c:v",
         "libx264",
+        "-pix_fmt",
+        "yuv420p",
+        file.path().to_str().context("temp path")?,
+    ])?;
+    Ok(file)
+}
+
+/// Generates a 320x240 video of a 16 px wide white bar on black, moving
+/// right at `speed` px/s, at `frame_rate` fps for `duration`. Encoded near
+/// losslessly so the bar's position can be measured from decoded frames.
+pub fn generate_moving_bar_video(
+    frame_rate: u32,
+    speed: u32,
+    duration: Duration,
+) -> Result<NamedTempFile, anyhow::Error> {
+    let file = NamedTempFile::with_suffix(".mp4")?;
+    let secs = duration.as_secs();
+    run_ffmpeg(&[
+        "-f",
+        "lavfi",
+        "-i",
+        &format!(
+            "color=black:s=320x240:r={frame_rate}:d={secs}[bg];\
+             color=white:s=16x240:r={frame_rate}:d={secs}[bar];\
+             [bg][bar]overlay=x='8+t*{speed}':y=0:eval=frame"
+        ),
+        "-c:v",
+        "libx264",
+        "-crf",
+        "10",
         "-pix_fmt",
         "yuv420p",
         file.path().to_str().context("temp path")?,
@@ -495,6 +556,21 @@ pub fn init_logger() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_generate_test_video_reports_ffmpeg_failure() {
+        let output = NamedTempFile::with_suffix(".mp4").unwrap();
+        let result = generate_test_video(
+            &TestVideoParameters {
+                video_codec: "not-a-real-video-codec".to_string(),
+                ..Default::default()
+            },
+            output.path(),
+        );
+
+        let error = result.expect_err("an unavailable encoder must fail generation");
+        assert!(error.to_string().contains("ffmpeg exited with"));
+    }
 
     #[test]
     fn test_generating_multi_channel_test_video() {

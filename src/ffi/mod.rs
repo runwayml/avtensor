@@ -10,7 +10,7 @@ use pyo3_log::Logger;
 use rsmpeg::ffi::{self, av_log_set_level};
 pub use tensor::PyTensor;
 
-use crate::decoder::{self, decode_media, DecodedStream, Frame};
+use crate::decoder::{self, decode_media, interpolate_rgb_pair, DecodedStream, Frame};
 
 /// Different stream types that can be decoded.
 #[pyclass(eq, eq_int)]
@@ -108,6 +108,15 @@ pub struct VideoStreamRequest {
     /// 0.99615).
     #[pyo3(get, set)]
     color_conversion: Option<String>,
+    /// How `fps` resampling builds each output frame: "nearest" (the
+    /// default) keeps the nearest source frame, dropping or repeating
+    /// whole frames; "blend" cross-fades the two neighbouring frames;
+    /// "motion" interpolates along estimated block motion (the model of
+    /// FFmpeg's `minterpolate`). Nearest gives uneven frame spacing for
+    /// non-integer ratios (e.g. 30 -> 24 fps); blend and motion keep it
+    /// even. Motion costs about 1.2-1.6x nearest's decode time.
+    #[pyo3(get, set)]
+    fps_conversion: Option<String>,
 }
 
 impl VideoStreamRequest {
@@ -127,7 +136,7 @@ impl VideoStreamRequest {
 #[pymethods]
 impl VideoStreamRequest {
     #[new]
-    #[pyo3(signature = (*, index=None, width=None, height=None, fps=None, number_of_threads=None, hardware_acceleration=None, dimension_order=None, device=None, dtype=None, hdr_mode=None, color_conversion=None))]
+    #[pyo3(signature = (*, index=None, width=None, height=None, fps=None, number_of_threads=None, hardware_acceleration=None, dimension_order=None, device=None, dtype=None, hdr_mode=None, color_conversion=None, fps_conversion=None))]
     #[allow(clippy::too_many_arguments)]
     pub fn py_new(
         index: Option<usize>,
@@ -141,6 +150,7 @@ impl VideoStreamRequest {
         dtype: Option<String>,
         hdr_mode: Option<String>,
         color_conversion: Option<String>,
+        fps_conversion: Option<String>,
     ) -> Self {
         VideoStreamRequest {
             index,
@@ -154,6 +164,7 @@ impl VideoStreamRequest {
             dtype,
             hdr_mode,
             color_conversion,
+            fps_conversion,
         }
     }
 }
@@ -200,6 +211,7 @@ impl VideoStreamRequest {
                 .as_deref()
                 .map(decoder::ColorConversion::try_from)
                 .transpose()?,
+            fps_conversion: decoder::FpsConversion::try_from(self.fps_conversion.as_deref())?,
         })
     }
 }
@@ -913,6 +925,25 @@ fn decode_asset(
     })
 }
 
+/// Frames at phases `alphas` between two RGB frames (uint8 CPU tensors of
+/// one shape, `[3, H, W]` or `[H, W, 3]`), by the motion-compensated
+/// interpolation of `fps_conversion="motion"`; returns uint8 `[N, 3, H, W]`.
+#[pyfunction]
+#[pyo3(signature = (prev, next, alphas))]
+fn interpolate_frames(
+    py: Python<'_>,
+    prev: PyTensor,
+    next: PyTensor,
+    alphas: Vec<f64>,
+) -> PyResult<PyTensor> {
+    let (prev, next) = (prev.0, next.0);
+    // Release the GIL: the work is pure CPU on tensors we own references to.
+    let out = py
+        .allow_threads(move || interpolate_rgb_pair(&prev, &next, &alphas))
+        .map_err(|e| PyValueError::new_err(format!("Failed to interpolate frames: {:?}", e)))?;
+    Ok(PyTensor(out))
+}
+
 /// A Python module implemented in Rust.
 #[pymodule]
 fn avtensor(m: &Bound<'_, PyModule>) -> PyResult<()> {
@@ -936,6 +967,7 @@ fn avtensor(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(probe_asset, m)?)?;
     m.add_function(wrap_pyfunction!(plan_asset, m)?)?;
     m.add_function(wrap_pyfunction!(decode_asset, m)?)?;
+    m.add_function(wrap_pyfunction!(interpolate_frames, m)?)?;
 
     // Configure FFmpeg to only log error messages to stderr
     // to avoid unwanted output when this is being used from Python.

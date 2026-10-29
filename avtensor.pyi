@@ -46,6 +46,11 @@ class VideoStreamRequest:
     # per channel on 4:2:0 sources and scales float32 by 255/256. "accurate"
     # is not supported with device="cuda".
     color_conversion: Literal["fast", "accurate"] | None
+    # How `fps` resampling builds each output frame: "nearest" (default)
+    # keeps the nearest source frame (uneven spacing for e.g. 30 -> 24 fps);
+    # "blend" cross-fades neighbouring frames; "motion" interpolates along
+    # estimated block motion (about 1.2-1.6x the cost of "nearest").
+    fps_conversion: Literal["nearest", "blend", "motion"] | None
 
     def __init__(
         self,
@@ -61,6 +66,7 @@ class VideoStreamRequest:
         dtype: str | None = None,
         hdr_mode: Literal["tonemap", "raw"] | None = None,
         color_conversion: Literal["fast", "accurate"] | None = None,
+        fps_conversion: Literal["nearest", "blend", "motion"] | None = None,
     ): ...
 
 class LoudnessNormalization:
@@ -228,4 +234,23 @@ def plan_asset(
     """Returns the buffers decode_asset(request) would allocate, without
     decoding: same stream selection, duration, seek window, fps and size
     handling."""
+    ...
+
+def interpolate_frames(
+    prev: torch.Tensor, next: torch.Tensor, alphas: list[float]
+) -> torch.Tensor:
+    """Frames at phases ``alphas`` (each strictly between 0 and 1; 0 = prev,
+    1 = next) between two RGB frames, by the motion-compensated
+    interpolation behind ``VideoStreamRequest(fps_conversion="motion")``.
+
+    ``prev`` / ``next``: uint8 CPU tensors of one shape, ``[3, H, W]`` or
+    ``[H, W, 3]``, any strides. Returns uint8 ``[len(alphas), 3, H, W]``.
+    Motion is estimated once per pair. Phases are quantised to 1/256 and
+    clamped inside (0, 1): 1e-4 becomes 1/256, anything >= 255/256 becomes
+    255/256. Frames pass through BT.709 limited-range yuv444p and back, so
+    only rounding is lost; frames that need no interpolation (a phase of
+    exactly 0 or 1) should be taken from the inputs directly rather than
+    passed here. No torch op runs on the pixel data (the pixels are moved
+    by plain copy loops), so the cost does not depend on torch's intra-op
+    thread settings; the GIL is released for the duration."""
     ...
