@@ -303,6 +303,36 @@ pub fn generate_bt709_ffv1_video(
     Ok(file)
 }
 
+/// Generates a short lossless (FFV1) 10-bit 4:2:0 PQ video at any size
+/// (odd sizes included). The transfer is always tagged PQ; the matrix and
+/// primaries are tagged BT.2020 only when requested, to exercise untagged
+/// HDR. The tags are set on the frames with `setparams`, because Matroska
+/// does not keep FFmpeg's `-color_*` output options for FFV1.
+pub fn generate_pq_ffv1_video(
+    width: usize,
+    height: usize,
+    tag_matrix: bool,
+    tag_primaries: bool,
+) -> Result<NamedTempFile, anyhow::Error> {
+    let file = NamedTempFile::with_suffix(".mkv")?;
+    // `testsrc` (unlike `testsrc2`) keeps odd sizes through the 4:2:0
+    // conversion.
+    let source = format!("testsrc=s={width}x{height}:r=24:d=0.25");
+    let mut params = vec!["color_trc=smpte2084", "range=tv"];
+    if tag_matrix {
+        params.push("colorspace=bt2020nc");
+    }
+    if tag_primaries {
+        params.push("color_primaries=bt2020");
+    }
+    let filter = format!("format=yuv420p10le,setparams={}", params.join(":"));
+    let path = file.path().to_str().context("temp path")?.to_string();
+    run_ffmpeg(&[
+        "-f", "lavfi", "-i", &source, "-vf", &filter, "-c:v", "ffv1", &path,
+    ])?;
+    Ok(file)
+}
+
 /// Generates a uniform 8-bit gray PNG (FFmpeg tags it `gbr`).
 pub fn generate_gray_png(level: u8) -> Result<NamedTempFile, anyhow::Error> {
     let file = NamedTempFile::with_suffix(".png")?;

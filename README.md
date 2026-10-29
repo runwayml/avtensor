@@ -311,7 +311,7 @@ All attributes default to `None`, meaning "keep the source value".
 | attribute | type | meaning |
 | --- | --- | --- |
 | `index` | `int \| None` | select a specific video stream |
-| `width`, `height` | `int \| None` | rescale output frames |
+| `width`, `height` | `int \| None` | rescale output frames (a lone `width` or `height` keeps the source's coded aspect ratio; sample aspect ratio is not applied) |
 | `fps` | `float \| None` | resample to this frame rate |
 | `number_of_threads` | `int \| None` | FFmpeg decoder threads (default: 1; `0` = FFmpeg auto) |
 | `hardware_acceleration` | `bool \| None` | decode on the GPU's NVDEC engine (see [GPU-accelerated decoding](#gpu-accelerated-decoding-nvdec)) |
@@ -397,11 +397,17 @@ provider-specific support — the URL is handed to FFmpeg's http protocol.
   primaries — are automatically tone-mapped
   (`zscale` → `tonemap=hable` → `zscale`) so the returned RGB tensors are
   sRGB/BT.709, consistent with SDR sources.
+- HDR streams (PQ/HLG transfer or BT.2020 primaries) missing a matrix or
+  primaries tag are treated as BT.2020 (non-constant luminance), in both
+  `hdr_mode`s. Untagged SDR keeps swscale's BT.601 default.
 - `float32` output is clamped to `[0, 1]`. zimg does not clip out-of-gamut
   YUV, and tone-mapped HDR can exceed 1.0 (in either `color_conversion` mode).
 - `color_conversion="accurate"` converts with zimg and resizes after the
-  conversion to RGB. Odd-size 4:2:0/4:2:2 frames are upsampled to 4:4:4 first,
-  because zimg rejects them otherwise.
+  conversion to RGB (for tone-mapped HDR, in the first, linearizing step).
+  zimg upsamples subsampled chroma with bicubic rather than swscale's
+  bilinear. That is more accurate on natural content, but can ring slightly
+  at saturated hard edges. Odd-size 4:2:0/4:2:2 frames are upsampled to
+  4:4:4 first, because zimg rejects them otherwise.
 
 ## Troubleshooting
 
