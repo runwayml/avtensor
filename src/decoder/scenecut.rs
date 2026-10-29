@@ -38,7 +38,7 @@
 
 use std::collections::VecDeque;
 
-use super::motion::Plane;
+use super::motion::{Depth, Plane};
 
 /// Target thumbnail width; the box filter is the largest integer factor that
 /// keeps at least this many columns.
@@ -84,6 +84,9 @@ const FLAT_NORM: f32 = 20.0;
 pub(crate) struct CutDetector {
     width: usize,
     height: usize,
+    /// Luma sample depth; 16-bit frames are thumbnailed from their high byte,
+    /// so the thresholds stay in 8-bit levels.
+    depth: Depth,
     /// Box-filter factor from the frame to the thumbnail.
     factor: usize,
     thumb_w: usize,
@@ -94,12 +97,14 @@ pub(crate) struct CutDetector {
 }
 
 impl CutDetector {
-    /// A detector for frames whose luma plane is `width` x `height`.
-    pub fn new(width: usize, height: usize) -> Self {
+    /// A detector for frames whose luma plane is `width` x `height` samples
+    /// of `depth`.
+    pub fn new(width: usize, height: usize, depth: Depth) -> Self {
         let factor = (width / THUMB_WIDTH).max(1);
         Self {
             width,
             height,
+            depth,
             factor,
             thumb_w: (width / factor).max(1),
             thumb_h: (height / factor).max(1),
@@ -166,11 +171,27 @@ impl CutDetector {
     fn thumbnail(&self, luma: Plane) -> Vec<f32> {
         let (f, tw, th) = (self.factor, self.thumb_w, self.thumb_h);
         let mut sums = vec![0u32; tw * th];
+        let (cols, bytes) = ((tw * f).min(self.width), self.depth.bytes());
         for y in 0..(th * f).min(self.height) {
-            let row = &luma.data[y * luma.stride..][..(tw * f).min(self.width)];
+            let row = &luma.data[y * luma.stride..][..cols * bytes];
             let out = &mut sums[(y / f) * tw..][..tw];
-            for (chunk, sum) in row.chunks(f).zip(out.iter_mut()) {
-                *sum += chunk.iter().map(|&v| v as u32).sum::<u32>();
+            match self.depth {
+                Depth::U8 => {
+                    for (chunk, sum) in row.chunks(f).zip(out.iter_mut()) {
+                        *sum += chunk.iter().map(|&v| v as u32).sum::<u32>();
+                    }
+                }
+                // Little-endian samples: the high byte is the second of each pair.
+                Depth::U16 => {
+                    for (chunk, sum) in row.chunks(2 * f).zip(out.iter_mut()) {
+                        *sum += chunk
+                            .iter()
+                            .skip(1)
+                            .step_by(2)
+                            .map(|&v| v as u32)
+                            .sum::<u32>();
+                    }
+                }
             }
         }
         let scale = 1.0 / (f * f) as f32;
@@ -276,7 +297,7 @@ mod tests {
     #[test]
     fn test_hard_cut_is_detected() {
         let (w, h) = (480, 270);
-        let mut det = CutDetector::new(w, h);
+        let mut det = CutDetector::new(w, h, Depth::U8);
         let mut cuts = Vec::new();
         for i in 0..40 {
             let seed = if i < 20 { 0.0 } else { 1.7 };
@@ -292,7 +313,7 @@ mod tests {
     #[test]
     fn test_cut_with_short_history() {
         let (w, h) = (256, 144);
-        let mut det = CutDetector::new(w, h);
+        let mut det = CutDetector::new(w, h, Depth::U8);
         for i in 0..=MIN_HISTORY {
             let img = image(w, h, |x, y| pattern(x + 2.0 * i as f64, y, 0.0));
             assert!(!push(&mut det, &img, w));
@@ -306,7 +327,7 @@ mod tests {
     #[test]
     fn test_fast_motion_and_flash_are_not_cuts() {
         let (w, h) = (480, 270);
-        let mut det = CutDetector::new(w, h);
+        let mut det = CutDetector::new(w, h, Depth::U8);
         for i in 0..60 {
             let gain = if i == 30 { 1.6 } else { 1.0 + 0.004 * i as f64 };
             let img = image(w, h, |x, y| {
@@ -322,7 +343,7 @@ mod tests {
     #[test]
     fn test_repeated_frames() {
         let (w, h) = (480, 270);
-        let mut det = CutDetector::new(w, h);
+        let mut det = CutDetector::new(w, h, Depth::U8);
         let mut cuts = Vec::new();
         for i in 0..40 {
             let (t, seed) = ((i / 2) as f64, if i < 21 { 0.0 } else { 1.1 });
@@ -337,7 +358,7 @@ mod tests {
     #[test]
     fn test_tiny_frames() {
         let (w, h) = (12, 10);
-        let mut det = CutDetector::new(w, h);
+        let mut det = CutDetector::new(w, h, Depth::U8);
         for v in 40..43 {
             assert!(!push(&mut det, &vec![v; w * h], w));
         }
@@ -347,10 +368,39 @@ mod tests {
     #[test]
     fn test_reset_forgets_previous_frame() {
         let (w, h) = (256, 144);
-        let mut det = CutDetector::new(w, h);
+        let mut det = CutDetector::new(w, h, Depth::U8);
         push(&mut det, &image(w, h, |x, y| pattern(x, y, 0.0)), w);
         det.reset();
         assert!(!push(&mut det, &image(w, h, |x, y| pattern(x, y, 2.3)), w));
+    }
+
+    /// A 16-bit luma plane is thumbnailed from its high byte: the same frames
+    /// as 8-bit (each sample v stored as v * 257) give the same decisions.
+    #[test]
+    fn test_16bit_frames_match_8bit() {
+        let (w, h) = (240, 136);
+        let a = image(w, h, |x, y| pattern(x, y, 0.0));
+        let b = image(w, h, |x, y| pattern(x, y, 5.0));
+        let deep = |img: &[u8]| -> Vec<u8> {
+            img.iter()
+                .flat_map(|&v| (v as u16 * 257).to_le_bytes())
+                .collect()
+        };
+        let mut d8 = CutDetector::new(w, h, Depth::U8);
+        let mut d16 = CutDetector::new(w, h, Depth::U16);
+        for img in [&a, &a, &a, &a, &a, &b, &b] {
+            let shallow = d8.push(Plane {
+                data: img,
+                stride: w,
+            });
+            let deep_img = deep(img);
+            let wide = d16.push(Plane {
+                data: &deep_img,
+                stride: 2 * w,
+            });
+            assert_eq!(shallow, wide);
+            assert_eq!(d8.prev, d16.prev);
+        }
     }
 
     #[test]

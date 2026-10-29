@@ -595,6 +595,28 @@ pub fn generate_pq_ffv1_video(
     Ok(file)
 }
 
+/// Generates a 1 s lossless (FFV1) 10-bit 4:2:0 luma ramp at 50 fps: each
+/// row runs through all 877 limited-range codes (64..=940) across its 1024
+/// columns, and the ramp shifts 3 columns per frame, so frames differ and a
+/// cross-fade of two of them still spans every code. Chroma is neutral.
+/// `pq` tags the frames PQ / BT.2020 (with `setparams`, as in
+/// [`generate_pq_ffv1_video`]); otherwise they are BT.709.
+pub fn generate_10bit_ramp_video(pq: bool) -> Result<NamedTempFile, anyhow::Error> {
+    let file = NamedTempFile::with_suffix(".mkv")?;
+    let tags = if pq {
+        "color_trc=smpte2084:colorspace=bt2020nc:color_primaries=bt2020:range=tv"
+    } else {
+        "color_trc=bt709:colorspace=bt709:color_primaries=bt709:range=tv"
+    };
+    let filter = format!(
+        "color=c=black:s=1024x64:r=50:d=1,format=yuv420p10le,\
+         geq=lum='64+mod(X+3*N\\,1024)*876/1023':cb=512:cr=512,setparams={tags}"
+    );
+    let path = file.path().to_str().context("temp path")?.to_string();
+    run_ffmpeg(&["-f", "lavfi", "-i", &filter, "-c:v", "ffv1", &path])?;
+    Ok(file)
+}
+
 /// Generates a uniform 8-bit gray PNG (FFmpeg tags it `gbr`).
 pub fn generate_gray_png(level: u8) -> Result<NamedTempFile, anyhow::Error> {
     let file = NamedTempFile::with_suffix(".png")?;
