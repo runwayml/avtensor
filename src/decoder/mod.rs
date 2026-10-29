@@ -30,6 +30,7 @@ mod cuda;
 mod io;
 mod motion;
 mod pairwise;
+mod scenecut;
 
 pub use pairwise::interpolate_rgb_pair;
 
@@ -108,10 +109,11 @@ struct FilterContext<'graph> {
     buffersink_ctx: AVFilterContextMut<'graph>,
 }
 
-/// Frame-rate conversion by motion interpolation ([`FpsConversion::Motion`]).
-/// The stream's filter graph resizes/tone maps into 8-bit planar YUV; the
-/// resampler retimes and interpolates; a second small graph converts the
-/// result to the output pixel format.
+/// Interpolating frame-rate conversion ([`FpsConversion::Blend`] and
+/// [`FpsConversion::Motion`]). The stream's filter graph resizes/tone maps
+/// into 8-bit planar YUV; the resampler retimes, detects scene cuts and
+/// interpolates; a second small graph converts the result to the output
+/// pixel format.
 struct MotionStage<'graph> {
     resampler: motion::Resampler,
     output: FilterContext<'graph>,
@@ -219,6 +221,8 @@ pub struct VideoStreamRequest {
     /// How `frame_rate` resampling builds each output frame. Ignored when
     /// `frame_rate` is unset.
     pub fps_conversion: FpsConversion,
+    /// Scene-cut handling for the interpolating `fps_conversion` modes.
+    pub scene_cuts: SceneCuts,
     /// Apply the stream's display-matrix rotation, as the ffmpeg CLI's
     /// `-autorotate` does: multiples of 90° transpose or flip the frame (and
     /// swap the output dimensions for 90°/270°), any other angle rotates it
@@ -2507,7 +2511,7 @@ fn filter_frame(
         frame.set_time_base(buffersink_ctx.get_time_base());
         let frames = resampler
             .push(frame)
-            .map_err(|e| FilterFrameError::Unexpected(e.context("Motion interpolation failed")))?;
+            .map_err(|e| FilterFrameError::Unexpected(e.context("Frame interpolation failed")))?;
         emit(frames, &mut filtered_frames)?;
     }
     if flush {
@@ -3713,19 +3717,49 @@ pub enum FpsConversion {
     /// so motion steps go 1x, 1x, 1x, 2x).
     #[default]
     Nearest,
-    /// Cross-fade the two source frames around each output timestamp
-    /// (FFmpeg `framerate`). Even timing at near-`Nearest` cost, but moving
-    /// edges show as double images.
+    /// Cross-fade the two source frames around each output timestamp. Even
+    /// timing at little more than `Nearest`'s cost, but moving edges show as
+    /// double images.
     Blend,
     /// Motion-compensated interpolation (block matching with overlapped
     /// block motion compensation; the model of FFmpeg's `minterpolate`
     /// defaults, implemented in [`motion`] for speed). Even timing without
-    /// double images, at about 1.2-1.6x `Nearest`'s cost. Falls back to the
-    /// nearest frame at detected scene changes; works on 8-bit YUV, so
-    /// deeper sources are reduced to 8 bits before interpolation.
+    /// double images, at about 1.2-1.6x `Nearest`'s cost.
     Motion,
+    // `Blend` and `Motion` both run in the [`MotionStage`]: they work on
+    // 8-bit YUV, so deeper sources are reduced to 8 bits before
+    // interpolation, and they take the nearer source frame across detected
+    // scene cuts (see [`SceneCuts`]).
     // `Blend` and `Motion` fall back to `Nearest` when the source rate is an
     // integer multiple of the target (see `is_integer_downsample`).
+}
+
+/// Scene-cut handling for [`FpsConversion::Blend`] and
+/// [`FpsConversion::Motion`]. Output frames between two source frames on
+/// opposite sides of a cut would mix two unrelated shots, so with
+/// detection on they repeat the nearer source frame instead (as `Nearest`
+/// would). Frame count and timestamps are the same either way.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SceneCuts {
+    /// Detect cuts (see [`scenecut`]) and never interpolate across them.
+    #[default]
+    Detect,
+    /// Interpolate every output frame, even across cuts.
+    Off,
+}
+
+impl TryFrom<Option<&str>> for SceneCuts {
+    type Error = anyhow::Error;
+
+    fn try_from(value: Option<&str>) -> Result<Self, Self::Error> {
+        match value {
+            None | Some("detect") => Ok(Self::Detect),
+            Some("off") => Ok(Self::Off),
+            Some(other) => Err(anyhow::anyhow!(
+                "scene_cuts must be \"detect\" or \"off\", got {other:?}"
+            )),
+        }
+    }
 }
 
 impl TryFrom<Option<&str>> for FpsConversion {
@@ -3765,6 +3799,8 @@ pub struct VideoFilterConfig {
     source_format: SourceFormat,
     /// How `frame_rate` resampling builds each output frame.
     fps_conversion: FpsConversion,
+    /// Scene-cut handling for the interpolating `fps_conversion` modes.
+    scene_cuts: SceneCuts,
     /// The request's `number_of_threads`; sizes the direct path's swscale
     /// pool (see [`direct_scaler_threads`]).
     number_of_threads: Option<usize>,
@@ -3782,8 +3818,8 @@ impl Display for VideoFilterConfig {
         }
         // Nearest-frame selection runs first so dropped frames are never
         // scaled. The interpolating modes need every source frame and their
-        // cost grows with pixel count, so they run after the resize;
-        // `Motion` runs outside the graph (see `MotionStage`).
+        // cost grows with pixel count, so they run after the resize and tone
+        // mapping, outside the graph (see `MotionStage`).
         if let (Some(frame_rate), FpsConversion::Nearest) = (self.frame_rate, self.fps_conversion) {
             filters.push(format!("fps={}", frame_rate));
         }
@@ -3862,13 +3898,6 @@ impl Display for VideoFilterConfig {
             filters.push("zscale=p=bt709:t=bt709:m=bt709:range=tv".to_string());
         }
 
-        // After tone mapping and before the accurate RGB conversion:
-        // `framerate` takes YUV only, and 8-bit PQ/HLG code values would band
-        // once linearized.
-        if let (Some(frame_rate), FpsConversion::Blend) = (self.frame_rate, self.fps_conversion) {
-            filters.push(format!("framerate=fps={}", frame_rate));
-        }
-
         if accurate {
             // Tone-mapped frames are already RGB at the output size here.
             if !tonemap {
@@ -3913,9 +3942,9 @@ impl Display for VideoFilterConfig {
 
 impl VideoFilterConfig {
     /// Whether frame-rate conversion runs in a [`MotionStage`] after the
-    /// filter graph rather than inside it.
+    /// filter graph rather than inside it (the interpolating modes).
     fn uses_motion_stage(&self) -> bool {
-        self.frame_rate.is_some() && self.fps_conversion == FpsConversion::Motion
+        self.frame_rate.is_some() && self.fps_conversion != FpsConversion::Nearest
     }
 
     /// Graph feeding a [`MotionStage`]: this config's resize and tone
@@ -3946,6 +3975,7 @@ impl Default for VideoFilterConfig {
             color_conversion: Default::default(),
             source_format: Default::default(),
             fps_conversion: Default::default(),
+            scene_cuts: Default::default(),
             number_of_threads: Default::default(),
             rotate: Default::default(),
         }
@@ -3968,6 +3998,7 @@ impl TryFrom<&VideoStreamRequest> for VideoFilterConfig {
             hdr_mode: req.hdr_mode,
             color_conversion: ColorConversion::resolve(req.color_conversion, req.dtype)?,
             fps_conversion: req.fps_conversion,
+            scene_cuts: req.scene_cuts,
             number_of_threads: req.number_of_threads,
             ..Default::default()
         })
@@ -4187,9 +4218,9 @@ fn init_filters(
                     .context("Failed to initialize filter")?;
                 motion = Some(
                     init_motion_stage(motion_graph, &buffersink_ctx, config)
-                        .context("Failed to initialize motion interpolation")?,
+                        .context("Failed to initialize frame interpolation")?,
                 );
-                log::debug!("Initialized motion interpolation for stream {stream_index}");
+                log::debug!("Initialized frame interpolation for stream {stream_index}");
                 (Some(buffersrc_ctx), Some(buffersink_ctx))
             }
             _ => {
@@ -4260,7 +4291,7 @@ fn init_motion_stage<'graph>(
 ) -> Result<MotionStage<'graph>, anyhow::Error> {
     let frame_rate = config
         .frame_rate
-        .context("motion interpolation needs a frame rate")?;
+        .context("frame interpolation needs a frame rate")?;
     // The `fps` filter's rate and time base for the same value, so output
     // timestamps match `Nearest`'s.
     let out_tb = av_inv_q(av_d2q(frame_rate, i32::MAX));
@@ -4269,10 +4300,17 @@ fn init_motion_stage<'graph>(
         input_sink.get_h(),
         input_sink.get_format(),
     );
+    let synthesis = match config.fps_conversion {
+        FpsConversion::Blend => motion::Synthesis::Blend,
+        FpsConversion::Motion => motion::Synthesis::Motion,
+        FpsConversion::Nearest => bail!("nearest-frame conversion runs in the filter graph"),
+    };
     let resampler = motion::Resampler::new(
         motion::Layout::new(width, height, format)?,
         input_sink.get_time_base(),
         out_tb,
+        synthesis,
+        config.scene_cuts == SceneCuts::Detect,
     );
 
     let sar = input_sink.get_sample_aspect_ratio();
@@ -4629,10 +4667,10 @@ mod tests {
     use crate::util::{
         mel::{create_mel_spectrogram, MelSpectrogramConfig},
         test_utils::{
-            generate_bt709_ffv1_video, generate_gray_png, generate_limited_range_luma_ramp,
-            generate_moving_bar_video, generate_pq_ffv1_video, generate_test_video_file,
-            generate_xyz12_video_file, init_logger, retag_matrix_coefficients, ChannelLayout,
-            TestVideoParameters, JITTER_AND_GAPS,
+            generate_bt709_ffv1_video, generate_gray_png, generate_hard_cut_video,
+            generate_limited_range_luma_ramp, generate_moving_bar_video, generate_pq_ffv1_video,
+            generate_test_video_file, generate_xyz12_video_file, init_logger,
+            retag_matrix_coefficients, ChannelLayout, TestVideoParameters, JITTER_AND_GAPS,
         },
     };
 
@@ -4922,9 +4960,61 @@ mod tests {
         Ok(())
     }
 
-    /// Motion interpolation works for every source chroma layout and HDR
-    /// tone mapping, with any output size and dtype, and keeps `Nearest`'s
-    /// frame count and timestamps.
+    /// The output frame that falls between two shots (source time 22.92
+    /// frames, shots meet between 22 and 23) is the nearer source frame with
+    /// scene-cut detection on, which is also what `Nearest` picks, and a mix
+    /// of the shots with it off. Frame count and timestamps match `Nearest`.
+    #[test_case(FpsConversion::Blend ; "blend")]
+    #[test_case(FpsConversion::Motion ; "motion")]
+    fn test_fps_conversion_scene_cut(fps_conversion: FpsConversion) -> anyhow::Result<()> {
+        init_logger();
+        let video = generate_hard_cut_video()?;
+        let decode = |fps_conversion, scene_cuts| {
+            decode_media(
+                MediaDecodeRequest {
+                    source: MediaSource::Uri(video.path().to_str().unwrap().into()),
+                    start_time: None,
+                    end_time: None,
+                    video_stream: Some(VideoStreamRequest {
+                        frame_rate: Some(24.0),
+                        fps_conversion,
+                        scene_cuts,
+                        ..Default::default()
+                    }),
+                    audio_streams: None,
+                    max_output_bytes: None,
+                },
+                None,
+            )
+            .map(|mut streams| streams.remove(0))
+        };
+        let nearest = decode(FpsConversion::Nearest, SceneCuts::Detect)?;
+        let detect = decode(fps_conversion, SceneCuts::Detect)?;
+        let off = decode(fps_conversion, SceneCuts::Off)?;
+        let frame =
+            |s: &DecodedStream, i: i64| s.data.as_ref().unwrap().get(i).to_kind(tch::Kind::Float);
+        let mad = |a: &tch::Tensor, b: &tch::Tensor| {
+            (a - b).abs().mean(tch::Kind::Float).double_value(&[])
+        };
+        for s in [&detect, &off] {
+            assert_eq!(
+                s.data.as_ref().unwrap().size(),
+                nearest.data.as_ref().unwrap().size()
+            );
+            assert_eq!(s.frame_pts, nearest.frame_pts);
+        }
+        // Output 11 is source 23 (first frame of shot B) for `Nearest`.
+        let (shot_a, shot_b) = (frame(&nearest, 10), frame(&nearest, 11));
+        assert!(mad(&shot_a, &shot_b) > 30.0, "test clip has no cut");
+        let at_cut = |s: &DecodedStream| mad(&frame(s, 11), &shot_b);
+        assert!(at_cut(&detect) < 1.0, "detect: {}", at_cut(&detect));
+        assert!(at_cut(&off) > 5.0, "off: {}", at_cut(&off));
+        Ok(())
+    }
+
+    /// Motion and blend interpolation work for every source chroma layout
+    /// and HDR tone mapping, with any output size and dtype, and keep
+    /// `Nearest`'s frame count and timestamps.
     #[test_case("yuv420p", None, OutputDtype::Uint8 ; "yuv420p")]
     #[test_case("yuv422p10le", None, OutputDtype::Uint8 ; "yuv422p10le")]
     #[test_case("yuv444p", Some((150, 98)), OutputDtype::Uint8 ; "yuv444p resized odd width")]
@@ -4979,28 +5069,40 @@ mod tests {
             .map(|mut streams| streams.remove(0))
         };
         let nearest = decode(FpsConversion::Nearest)?;
-        let motion = decode(FpsConversion::Motion)?;
-        let (n, m) = (nearest.data.unwrap(), motion.data.unwrap());
-        assert_eq!(m.size(), n.size());
-        assert_eq!(motion.frame_pts, nearest.frame_pts);
-        // The first frame lands on a source frame and passes through; later
-        // ones are interpolated but stay close to the nearest source frame
-        // (testsrc moves only a little per frame).
-        let diff = |i: i64| -> f64 {
-            (m.get(i).to_kind(tch::Kind::Float) - n.get(i).to_kind(tch::Kind::Float))
-                .abs()
-                .mean(tch::Kind::Float)
-                .double_value(&[])
-        };
-        let scale = if dtype == OutputDtype::Float32 {
-            1.0 / 255.0
-        } else {
-            1.0
-        };
-        // 10-bit sources pass through 8 bits, so allow a quantization step.
-        assert!(diff(0) < 1.0 * scale, "first frame differs by {}", diff(0));
-        for i in 1..m.size()[0] {
-            assert!(diff(i) < 20.0 * scale, "frame {i} differs by {}", diff(i));
+        let n = nearest.data.unwrap();
+        // Blend runs through the same stage as motion.
+        for fps_conversion in [FpsConversion::Motion, FpsConversion::Blend] {
+            let converted = decode(fps_conversion)?;
+            let m = converted.data.unwrap();
+            assert_eq!(m.size(), n.size());
+            assert_eq!(converted.frame_pts, nearest.frame_pts);
+            // The first frame lands on a source frame and passes through;
+            // later ones are interpolated but stay close to the nearest
+            // source frame (testsrc moves only a little per frame).
+            let diff = |i: i64| -> f64 {
+                (m.get(i).to_kind(tch::Kind::Float) - n.get(i).to_kind(tch::Kind::Float))
+                    .abs()
+                    .mean(tch::Kind::Float)
+                    .double_value(&[])
+            };
+            let scale = if dtype == OutputDtype::Float32 {
+                1.0 / 255.0
+            } else {
+                1.0
+            };
+            // 10-bit sources pass through 8 bits, so allow a quantization step.
+            assert!(
+                diff(0) < 1.0 * scale,
+                "{fps_conversion:?}: first frame differs by {}",
+                diff(0)
+            );
+            for i in 1..m.size()[0] {
+                assert!(
+                    diff(i) < 20.0 * scale,
+                    "{fps_conversion:?}: frame {i} differs by {}",
+                    diff(i)
+                );
+            }
         }
         Ok(())
     }
@@ -5144,8 +5246,7 @@ mod tests {
         let nearest = decode(FpsConversion::Nearest)?;
         let converted = decode(fps_conversion)?;
         assert_eq!(converted.data.unwrap().size(), nearest.data.unwrap().size());
-        // Same timestamps; `framerate` keeps the source time base, so they
-        // can differ from `fps`'s 1/24 time base in the last bit.
+        // Same timestamps (allowing for float rounding).
         assert_eq!(converted.frame_pts.len(), nearest.frame_pts.len());
         for (a, b) in converted.frame_pts.iter().zip(&nearest.frame_pts) {
             assert!((a - b).abs() < 1e-9, "{a} vs {b}");
@@ -5746,6 +5847,7 @@ mod tests {
             color_conversion: ColorConversion::Fast,
             source_format: SourceFormat::default(),
             fps_conversion: FpsConversion::Nearest,
+            scene_cuts: SceneCuts::Detect,
             number_of_threads: None,
             rotate: vec![],
         },
@@ -5878,8 +5980,8 @@ mod tests {
             fps_conversion: FpsConversion::Blend,
             ..Default::default()
         },
-        "scale=width=640:height=360,framerate=fps=24,format=pix_fmts=rgb24";
-        "blend fps conversion runs after the resize"
+        "scale=width=640:height=360,format=pix_fmts=rgb24";
+        "blend fps conversion runs outside the graph"
     )]
     #[test_case(
         VideoFilterConfig {
