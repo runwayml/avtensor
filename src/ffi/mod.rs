@@ -118,6 +118,13 @@ pub struct VideoStreamRequest {
     /// even. Motion costs about 1.2-1.6x nearest's decode time.
     #[pyo3(get, set)]
     fps_conversion: Option<String>,
+    /// Scene-cut handling for `fps_conversion="blend"`/`"motion"`:
+    /// "detect" (the default) finds hard cuts and takes the nearer source
+    /// frame for output frames that fall between the two shots, instead of
+    /// mixing them; "off" interpolates across cuts. Frame count and
+    /// timestamps are the same either way.
+    #[pyo3(get, set)]
+    scene_cuts: Option<String>,
     /// Apply the stream's display-matrix rotation, as the ffmpeg CLI's
     /// `-autorotate` does (90°/270° swap the output width and height; other
     /// angles rotate within the coded size). `width`/`height` refer to the
@@ -160,7 +167,7 @@ impl VideoStreamRequest {
 #[pymethods]
 impl VideoStreamRequest {
     #[new]
-    #[pyo3(signature = (*, index=None, width=None, height=None, fps=None, number_of_threads=None, hardware_acceleration=None, dimension_order=None, device=None, dtype=None, hdr_mode=None, color_conversion=None, fps_conversion=None, autorotate=None, fps_mode=None))]
+    #[pyo3(signature = (*, index=None, width=None, height=None, fps=None, number_of_threads=None, hardware_acceleration=None, dimension_order=None, device=None, dtype=None, hdr_mode=None, color_conversion=None, fps_conversion=None, scene_cuts=None, autorotate=None, fps_mode=None))]
     #[allow(clippy::too_many_arguments)]
     pub fn py_new(
         index: Option<usize>,
@@ -175,6 +182,7 @@ impl VideoStreamRequest {
         hdr_mode: Option<String>,
         color_conversion: Option<String>,
         fps_conversion: Option<String>,
+        scene_cuts: Option<String>,
         autorotate: Option<bool>,
         fps_mode: Option<String>,
     ) -> Self {
@@ -191,6 +199,7 @@ impl VideoStreamRequest {
             hdr_mode,
             color_conversion,
             fps_conversion,
+            scene_cuts,
             autorotate,
             fps_mode,
         }
@@ -240,6 +249,7 @@ impl VideoStreamRequest {
                 .map(decoder::ColorConversion::try_from)
                 .transpose()?,
             fps_conversion: decoder::FpsConversion::try_from(self.fps_conversion.as_deref())?,
+            scene_cuts: decoder::SceneCuts::try_from(self.scene_cuts.as_deref())?,
             autorotate: self.autorotate.unwrap_or(false),
             fps_mode: match self.fps_mode.as_deref() {
                 None | Some("filter") => decoder::FpsMode::Filter,
