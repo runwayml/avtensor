@@ -617,6 +617,19 @@ pub fn generate_10bit_ramp_video(pq: bool) -> Result<NamedTempFile, anyhow::Erro
     Ok(file)
 }
 
+/// Generates a 1 s lossless (FFV1) 10-bit 4:2:0 PQ / BT.2020 video at 50 fps
+/// with `testsrc2`'s texture and motion, tagged with `setparams` (as in
+/// [`generate_pq_ffv1_video`]). Unlike a smooth ramp, its edges and fine
+/// detail resample differently in swscale and zscale.
+pub fn generate_textured_pq_video() -> Result<NamedTempFile, anyhow::Error> {
+    let file = NamedTempFile::with_suffix(".mkv")?;
+    let filter = "testsrc2=s=320x180:r=50:d=1,format=yuv420p10le,\
+                  setparams=color_trc=smpte2084:colorspace=bt2020nc:color_primaries=bt2020:range=tv";
+    let path = file.path().to_str().context("temp path")?.to_string();
+    run_ffmpeg(&["-f", "lavfi", "-i", filter, "-c:v", "ffv1", &path])?;
+    Ok(file)
+}
+
 /// Generates a uniform 8-bit gray PNG (FFmpeg tags it `gbr`).
 pub fn generate_gray_png(level: u8) -> Result<NamedTempFile, anyhow::Error> {
     let file = NamedTempFile::with_suffix(".png")?;

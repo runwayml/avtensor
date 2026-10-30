@@ -3729,9 +3729,8 @@ pub enum FpsConversion {
     Motion,
     // `Blend` and `Motion` both run in the [`MotionStage`] and take the
     // nearer source frame across detected scene cuts (see [`SceneCuts`]).
-    // With float32 output, `Blend` keeps sources deeper than 8 bits at 16
-    // bits; `Motion` works on 8-bit YUV, so it reduces them to 8 bits before
-    // interpolation.
+    // `Blend` keeps sources deeper than 8 bits at 16 bits; `Motion` works on
+    // 8-bit YUV, so it reduces them to 8 bits before interpolation.
     // `Blend` and `Motion` fall back to `Nearest` when the source rate is an
     // integer multiple of the target (see `is_integer_downsample`).
 }
@@ -3953,12 +3952,20 @@ impl VideoFilterConfig {
     /// mapping, without frame-rate conversion, ending in the planar YUV
     /// format `working_format` that interpolation works in.
     fn motion_input(&self, working_format: &str) -> Self {
+        let tonemap = self.source_color.is_hdr() && self.hdr_mode == HdrMode::Tonemap;
         Self {
             frame_rate: None,
             pixel_format: working_format.to_string(),
-            // This graph ends in YUV, not RGB: the RGB conversion (and with it
-            // `color_conversion`) belongs to the stage's output graph.
-            color_conversion: ColorConversion::Fast,
+            // This graph ends in YUV, not RGB: the RGB conversion belongs to
+            // the stage's output graph, which applies `color_conversion`.
+            // Tone mapping runs here, though, so it keeps the requested
+            // conversion: `Accurate` resizes and linearizes in zscale, as the
+            // same request without frame-rate conversion does.
+            color_conversion: if tonemap {
+                self.color_conversion
+            } else {
+                ColorConversion::Fast
+            },
             ..self.clone()
         }
     }
@@ -4273,12 +4280,12 @@ fn cap_graph_threads(filter_graph: &mut AVFilterGraph) {
 /// output size), so those use 4:4:4.
 ///
 /// Samples are 8-bit, except that [`FpsConversion::Blend`] keeps sources
-/// deeper than 8 bits (10-bit, HDR) at 16 bits when the output is deeper
-/// than 8 bits too ([`OutputDtype::Float32`]), as the in-graph `framerate`
+/// deeper than 8 bits (10-bit, HDR) at 16 bits, as the in-graph `framerate`
 /// filter did: their passthrough and blended frames keep the source's
-/// precision. With 8-bit output the extra bits would be dropped anyway, so
-/// the cheaper 8-bit format is used. [`FpsConversion::Motion`] interpolates
-/// 8-bit frames.
+/// precision. That holds for `uint8` output too: an 8-bit working format
+/// would round the source to 8-bit YUV and the RGB conversion would round
+/// again, while 16-bit YUV rounds once, as a decode without frame-rate
+/// conversion does. [`FpsConversion::Motion`] interpolates 8-bit frames.
 fn motion_working_format(config: &VideoFilterConfig, dec_ctx: &AVCodecContext) -> &'static str {
     let resized = config.width.is_some_and(|w| w != dec_ctx.width as usize)
         || config.height.is_some_and(|h| h != dec_ctx.height as usize);
@@ -4289,11 +4296,7 @@ fn motion_working_format(config: &VideoFilterConfig, dec_ctx: &AVCodecContext) -
         _ if resized || tonemapped => "yuv444p",
         format => format,
     };
-    let deep_output = config.pix_fmt().is_some_and(|f| pixel_format_depth(f) > 8);
-    if config.fps_conversion == FpsConversion::Blend
-        && deep_output
-        && pixel_format_depth(source) > 8
-    {
+    if config.fps_conversion == FpsConversion::Blend && pixel_format_depth(source) > 8 {
         deep_working_format(format)
     } else {
         format
@@ -5226,6 +5229,104 @@ mod tests {
             blended > 2 * 256,
             "blended frame has {blended} levels, no more than 8 bits"
         );
+        Ok(())
+    }
+
+    /// `blend` keeps a 10-bit source at 16 bits for `uint8` output too, so
+    /// the YUV -> RGB conversion rounds once: output frames that land on a
+    /// source frame are bit-identical to that frame decoded without
+    /// frame-rate conversion. Through an 8-bit working format the source is
+    /// rounded to 8-bit YUV first, and about a quarter of the ramp's pixels
+    /// come out more than one level off.
+    #[test_case(false, HdrMode::Tonemap ; "10-bit sdr")]
+    #[test_case(true, HdrMode::Raw ; "pq raw")]
+    fn test_fps_conversion_blend_uint8_rounds_10bit_once(
+        pq: bool,
+        hdr_mode: HdrMode,
+    ) -> anyhow::Result<()> {
+        init_logger();
+        let video = crate::util::test_utils::generate_10bit_ramp_video(pq)?;
+        let decode = |frame_rate, fps_conversion| {
+            decode_media(
+                MediaDecodeRequest {
+                    source: MediaSource::Uri(video.path().to_str().unwrap().into()),
+                    start_time: None,
+                    end_time: None,
+                    video_stream: Some(VideoStreamRequest {
+                        frame_rate,
+                        hdr_mode,
+                        fps_conversion,
+                        ..Default::default()
+                    }),
+                    audio_streams: None,
+                    max_output_bytes: None,
+                },
+                None,
+            )
+            .map(|mut streams| streams.remove(0).data.unwrap())
+        };
+        let source = decode(None, FpsConversion::Nearest)?;
+        let blend = decode(Some(24.0), FpsConversion::Blend)?;
+        // 50 -> 24 fps: output frames 0 and 12 pass source frames 0 and 25
+        // through.
+        for (out, src) in [(0, 0), (12, 25)] {
+            assert!(
+                blend.get(out).equal(&source.get(src)),
+                "passthrough frame {out} differs from source frame {src}"
+            );
+        }
+        Ok(())
+    }
+
+    /// With HDR tone mapping, the stage's input graph runs the tone-mapping
+    /// chain, which keeps `color_conversion`: float32 output defaults to
+    /// `accurate` (bicubic resize and linearization in zscale), so `blend`
+    /// passthrough frames match the same request without frame-rate
+    /// conversion. With the chain in its `fast` form (swscale resizes in YUV
+    /// before linearizing), edges of a textured frame are off by up to the
+    /// full range; a smooth ramp would not show it. What remains (~0.045) is
+    /// the tone-mapped frames' round trip through YUV, which `framerate` in
+    /// the graph had too.
+    #[test_case(None ; "native size")]
+    #[test_case(Some((160, 90)) ; "resized")]
+    fn test_fps_conversion_blend_tone_mapping_keeps_color_conversion(
+        size: Option<(u32, u32)>,
+    ) -> anyhow::Result<()> {
+        init_logger();
+        let video = crate::util::test_utils::generate_textured_pq_video()?;
+        let decode = |frame_rate, fps_conversion| {
+            decode_media(
+                MediaDecodeRequest {
+                    source: MediaSource::Uri(video.path().to_str().unwrap().into()),
+                    start_time: None,
+                    end_time: None,
+                    video_stream: Some(VideoStreamRequest {
+                        frame_rate,
+                        width: size.map(|(w, _)| w),
+                        height: size.map(|(_, h)| h),
+                        dtype: OutputDtype::Float32,
+                        fps_conversion,
+                        ..Default::default()
+                    }),
+                    audio_streams: None,
+                    max_output_bytes: None,
+                },
+                None,
+            )
+            .map(|mut streams| streams.remove(0).data.unwrap())
+        };
+        let source = decode(None, FpsConversion::Nearest)?;
+        let blend = decode(Some(24.0), FpsConversion::Blend)?;
+        for (out, src) in [(0, 0), (12, 25)] {
+            let diff = (blend.get(out) - source.get(src))
+                .abs()
+                .max()
+                .double_value(&[]);
+            assert!(
+                diff < 0.1,
+                "passthrough frame {out} differs from source frame {src} by {diff}"
+            );
+        }
         Ok(())
     }
 
@@ -6162,6 +6263,37 @@ mod tests {
         "yuv422p",
         "setparams=colorspace=bt2020nc,zscale=t=linear:npl=100,format=gbrpf32le,tonemap=hable:desat=0,zscale=p=bt709:t=bt709:m=bt709:range=tv,format=pix_fmts=yuv422p";
         "after HDR tone mapping"
+    )]
+    #[test_case(
+        VideoFilterConfig {
+            frame_rate: Some(24.0),
+            width: Some(640),
+            height: Some(360),
+            color_conversion: ColorConversion::Accurate,
+            source_color: SourceColorInfo {
+                color_trc: Some("smpte2084".to_string()),
+                color_primaries: Some("bt2020".to_string()),
+                ..Default::default()
+            },
+            fps_conversion: FpsConversion::Blend,
+            ..Default::default()
+        },
+        "yuv444p16le",
+        "setparams=colorspace=bt2020nc,zscale=t=linear:npl=100:f=bicubic:w=640:h=360,format=gbrpf32le,tonemap=hable:desat=0,zscale=p=bt709:t=bt709:m=bt709:range=tv,zscale=f=bicubic,format=pix_fmts=yuv444p16le";
+        "accurate tone mapping keeps its zscale resize"
+    )]
+    #[test_case(
+        VideoFilterConfig {
+            frame_rate: Some(24.0),
+            width: Some(640),
+            height: Some(360),
+            color_conversion: ColorConversion::Accurate,
+            fps_conversion: FpsConversion::Blend,
+            ..Default::default()
+        },
+        "yuv444p16le",
+        "scale=width=640:height=360,format=pix_fmts=yuv444p16le";
+        "accurate sdr conversion is left to the output graph"
     )]
     fn test_motion_input_filter(filter: VideoFilterConfig, working_format: &str, expected: &str) {
         assert!(filter.uses_motion_stage());

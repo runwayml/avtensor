@@ -131,6 +131,11 @@ pans and lighting changes don't count as cuts. `scene_cuts="off"`
 interpolates across cuts instead. Frame count and timestamps are the same as
 `"nearest"` in every mode.
 
+`"blend"` works at the source's bit depth: 10/12-bit and HDR sources are
+cross-faded at 16 bits, so frames that land on a source frame match a decode
+without `fps`, for `uint8` and `float32` output alike. `"motion"` works in
+8-bit YUV and reduces deeper sources to 8 bits first.
+
 ### Decode a time window (seek)
 
 ```python
