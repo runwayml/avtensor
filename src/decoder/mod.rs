@@ -111,7 +111,8 @@ struct FilterContext<'graph> {
 
 /// Interpolating frame-rate conversion ([`FpsConversion::Blend`] and
 /// [`FpsConversion::Motion`]). The stream's filter graph resizes/tone maps
-/// into 8-bit planar YUV; the resampler retimes, detects scene cuts and
+/// into planar YUV (see [`motion_working_format`]); the resampler retimes,
+/// detects scene cuts and
 /// interpolates; a second small graph converts the result to the output
 /// pixel format.
 struct MotionStage<'graph> {
@@ -3726,10 +3727,10 @@ pub enum FpsConversion {
     /// defaults, implemented in [`motion`] for speed). Even timing without
     /// double images, at about 1.2-1.6x `Nearest`'s cost.
     Motion,
-    // `Blend` and `Motion` both run in the [`MotionStage`]: they work on
-    // 8-bit YUV, so deeper sources are reduced to 8 bits before
-    // interpolation, and they take the nearer source frame across detected
-    // scene cuts (see [`SceneCuts`]).
+    // `Blend` and `Motion` both run in the [`MotionStage`] and take the
+    // nearer source frame across detected scene cuts (see [`SceneCuts`]).
+    // `Blend` keeps sources deeper than 8 bits at 16 bits; `Motion` works on
+    // 8-bit YUV, so it reduces them to 8 bits before interpolation.
     // `Blend` and `Motion` fall back to `Nearest` when the source rate is an
     // integer multiple of the target (see `is_integer_downsample`).
 }
@@ -3948,15 +3949,23 @@ impl VideoFilterConfig {
     }
 
     /// Graph feeding a [`MotionStage`]: this config's resize and tone
-    /// mapping, without frame-rate conversion, ending in the 8-bit planar
-    /// YUV format `working_format` that motion interpolation works in.
+    /// mapping, without frame-rate conversion, ending in the planar YUV
+    /// format `working_format` that interpolation works in.
     fn motion_input(&self, working_format: &str) -> Self {
+        let tonemap = self.source_color.is_hdr() && self.hdr_mode == HdrMode::Tonemap;
         Self {
             frame_rate: None,
             pixel_format: working_format.to_string(),
-            // This graph ends in YUV, not RGB: the RGB conversion (and with it
-            // `color_conversion`) belongs to the stage's output graph.
-            color_conversion: ColorConversion::Fast,
+            // This graph ends in YUV, not RGB: the RGB conversion belongs to
+            // the stage's output graph, which applies `color_conversion`.
+            // Tone mapping runs here, though, so it keeps the requested
+            // conversion: `Accurate` resizes and linearizes in zscale, as the
+            // same request without frame-rate conversion does.
+            color_conversion: if tonemap {
+                self.color_conversion
+            } else {
+                ColorConversion::Fast
+            },
             ..self.clone()
         }
     }
@@ -4263,21 +4272,59 @@ fn cap_graph_threads(filter_graph: &mut AVFilterGraph) {
     unsafe { (*filter_graph.as_mut_ptr()).nb_threads = filter_graph_threads() };
 }
 
-/// The 8-bit planar YUV format a [`MotionStage`] interpolates in. Keeps the
+/// The planar YUV format a [`MotionStage`] interpolates in. Keeps the
 /// source's chroma subsampling when frames keep their size, so nothing is
 /// resampled. A resize or HDR tone mapping already resamples chroma, and
 /// subsampling at the output size would leave less chroma detail than the
 /// other conversions (which upsample the source chroma straight to the
 /// output size), so those use 4:4:4.
+///
+/// Samples are 8-bit, except that [`FpsConversion::Blend`] keeps sources
+/// deeper than 8 bits (10-bit, HDR) at 16 bits, as the in-graph `framerate`
+/// filter did: their passthrough and blended frames keep the source's
+/// precision. That holds for `uint8` output too: an 8-bit working format
+/// would round the source to 8-bit YUV and the RGB conversion would round
+/// again, while 16-bit YUV rounds once, as a decode without frame-rate
+/// conversion does. [`FpsConversion::Motion`] interpolates 8-bit frames.
 fn motion_working_format(config: &VideoFilterConfig, dec_ctx: &AVCodecContext) -> &'static str {
     let resized = config.width.is_some_and(|w| w != dec_ctx.width as usize)
         || config.height.is_some_and(|h| h != dec_ctx.height as usize);
     let tonemapped = config.source_color.is_hdr() && config.hdr_mode == HdrMode::Tonemap;
     let source = buffersrc_pixel_format(dec_ctx);
-    match motion::working_pixel_format(source) {
+    let format = match motion::working_pixel_format(source) {
         "yuvj420p" | "yuvj422p" | "yuvj444p" if resized || tonemapped => "yuvj444p",
         _ if resized || tonemapped => "yuv444p",
         format => format,
+    };
+    if config.fps_conversion == FpsConversion::Blend && pixel_format_depth(source) > 8 {
+        deep_working_format(format)
+    } else {
+        format
+    }
+}
+
+/// Largest component depth (bits) of `pix_fmt`; 8 when unknown.
+fn pixel_format_depth(pix_fmt: AVPixelFormat) -> i32 {
+    let desc = unsafe { ffi::av_pix_fmt_desc_get(pix_fmt) };
+    if desc.is_null() {
+        return 8;
+    }
+    let desc = unsafe { &*desc };
+    desc.comp[..desc.nb_components as usize]
+        .iter()
+        .map(|c| c.depth)
+        .max()
+        .unwrap_or(8)
+}
+
+/// The 16-bit counterpart of an 8-bit working format. Deeper sources carry
+/// their range in the frame properties (there are no 16-bit `yuvj`
+/// formats), so a full-range `yuvj` format maps to the limited-range name.
+fn deep_working_format(format: &'static str) -> &'static str {
+    match format {
+        "yuv422p" | "yuvj422p" => "yuv422p16le",
+        "yuv444p" | "yuvj444p" => "yuv444p16le",
+        _ => "yuv420p16le",
     }
 }
 
@@ -4311,7 +4358,7 @@ fn init_motion_stage<'graph>(
         out_tb,
         synthesis,
         config.scene_cuts == SceneCuts::Detect,
-    );
+    )?;
 
     let sar = input_sink.get_sample_aspect_ratio();
     let mut args = format!(
@@ -4330,7 +4377,7 @@ fn init_motion_stage<'graph>(
     if let Some(name) = ffi_color_name(unsafe { ffi::av_color_range_name(range) }) {
         args.push_str(&format!(":range={name}"));
     }
-    // The RGB conversion of the interpolated frames. They are SDR YUV at the
+    // The RGB conversion of the interpolated frames. They are YUV at the
     // output size (the input graph already resized and tone mapped), so only
     // the conversion settings and the frames' own layout carry over: the
     // HDR tags must not, or the output graph would tone map a second time.
@@ -4637,6 +4684,9 @@ impl VideoFilterSpec for VideoFilterConfig {
             "yuvj420p" => Some(ffi::AV_PIX_FMT_YUVJ420P),
             "yuvj422p" => Some(ffi::AV_PIX_FMT_YUVJ422P),
             "yuvj444p" => Some(ffi::AV_PIX_FMT_YUVJ444P),
+            "yuv420p16le" => Some(ffi::AV_PIX_FMT_YUV420P16LE),
+            "yuv422p16le" => Some(ffi::AV_PIX_FMT_YUV422P16LE),
+            "yuv444p16le" => Some(ffi::AV_PIX_FMT_YUV444P16LE),
             _ => None, // Default to None if no pixel format is specified
         }
     }
@@ -5090,7 +5140,8 @@ mod tests {
             } else {
                 1.0
             };
-            // 10-bit sources pass through 8 bits, so allow a quantization step.
+            // Motion reduces 10-bit sources to 8 bits, so allow a quantization
+            // step.
             assert!(
                 diff(0) < 1.0 * scale,
                 "{fps_conversion:?}: first frame differs by {}",
@@ -5103,6 +5154,178 @@ mod tests {
                     diff(i)
                 );
             }
+        }
+        Ok(())
+    }
+
+    /// `blend` keeps a 10-bit source's depth (its working format is 16-bit).
+    /// With float32 output, output frames that land on a source frame equal
+    /// that frame decoded without frame-rate conversion, and blended frames
+    /// keep far more than 8 bits of levels. Each ramp row holds 877 distinct
+    /// 10-bit codes; through an 8-bit working format only ~220 survive.
+    #[test_case(false, HdrMode::Tonemap ; "10-bit sdr")]
+    #[test_case(true, HdrMode::Raw ; "pq raw")]
+    #[test_case(true, HdrMode::Tonemap ; "pq tone mapped")]
+    fn test_fps_conversion_blend_keeps_10bit_depth(
+        pq: bool,
+        hdr_mode: HdrMode,
+    ) -> anyhow::Result<()> {
+        init_logger();
+        let video = crate::util::test_utils::generate_10bit_ramp_video(pq)?;
+        let decode = |frame_rate, fps_conversion| {
+            decode_media(
+                MediaDecodeRequest {
+                    source: MediaSource::Uri(video.path().to_str().unwrap().into()),
+                    start_time: None,
+                    end_time: None,
+                    video_stream: Some(VideoStreamRequest {
+                        frame_rate,
+                        dtype: OutputDtype::Float32,
+                        hdr_mode,
+                        fps_conversion,
+                        ..Default::default()
+                    }),
+                    audio_streams: None,
+                    max_output_bytes: None,
+                },
+                None,
+            )
+            .map(|mut streams| streams.remove(0))
+        };
+        let source = decode(None, FpsConversion::Nearest)?.data.unwrap();
+        let nearest = decode(Some(24.0), FpsConversion::Nearest)?;
+        let blend = decode(Some(24.0), FpsConversion::Blend)?;
+        let b = blend.data.unwrap();
+        assert_eq!(b.size(), nearest.data.unwrap().size());
+        assert_eq!(blend.frame_pts, nearest.frame_pts);
+        // Distinct G values (planar [T, C, H, W]) in a frame's first row, in
+        // 16-bit steps.
+        let levels = |frame: tch::Tensor| -> usize {
+            let row = frame.get(1).get(0).f_mul_scalar(65535.0).unwrap().round();
+            let mut v = Vec::<f32>::try_from(row.to_kind(tch::Kind::Float)).unwrap();
+            v.sort_by(f32::total_cmp);
+            v.dedup();
+            v.len()
+        };
+        let max_diff = |a: tch::Tensor, b: tch::Tensor| (a - b).abs().max().double_value(&[]);
+        let source_levels = levels(source.get(0));
+        assert!(source_levels > 600, "fixture has {source_levels} levels");
+        // 50 -> 24 fps: output frames 0 and 12 land exactly on source frames
+        // 0 and 25 and pass through.
+        for (out, src) in [(0, 0), (12, 25)] {
+            let diff = max_diff(b.get(out), source.get(src));
+            assert!(diff < 1e-3, "passthrough frame {out} differs by {diff}");
+            assert_eq!(levels(b.get(out)), levels(source.get(src)), "frame {out}");
+        }
+        // Output frame 6 (source time 12.5 frames) is an even blend of
+        // source frames 12 and 13.
+        let blended = levels(b.get(6));
+        log::info!("blend levels: source {source_levels}, blended {blended}");
+        assert!(
+            max_diff(b.get(6), source.get(12)) > 1e-3,
+            "frame 6 was not blended"
+        );
+        assert!(
+            blended > 2 * 256,
+            "blended frame has {blended} levels, no more than 8 bits"
+        );
+        Ok(())
+    }
+
+    /// `blend` keeps a 10-bit source at 16 bits for `uint8` output too, so
+    /// the YUV -> RGB conversion rounds once: output frames that land on a
+    /// source frame are bit-identical to that frame decoded without
+    /// frame-rate conversion. Through an 8-bit working format the source is
+    /// rounded to 8-bit YUV first, and about a quarter of the ramp's pixels
+    /// come out more than one level off.
+    #[test_case(false, HdrMode::Tonemap ; "10-bit sdr")]
+    #[test_case(true, HdrMode::Raw ; "pq raw")]
+    fn test_fps_conversion_blend_uint8_rounds_10bit_once(
+        pq: bool,
+        hdr_mode: HdrMode,
+    ) -> anyhow::Result<()> {
+        init_logger();
+        let video = crate::util::test_utils::generate_10bit_ramp_video(pq)?;
+        let decode = |frame_rate, fps_conversion| {
+            decode_media(
+                MediaDecodeRequest {
+                    source: MediaSource::Uri(video.path().to_str().unwrap().into()),
+                    start_time: None,
+                    end_time: None,
+                    video_stream: Some(VideoStreamRequest {
+                        frame_rate,
+                        hdr_mode,
+                        fps_conversion,
+                        ..Default::default()
+                    }),
+                    audio_streams: None,
+                    max_output_bytes: None,
+                },
+                None,
+            )
+            .map(|mut streams| streams.remove(0).data.unwrap())
+        };
+        let source = decode(None, FpsConversion::Nearest)?;
+        let blend = decode(Some(24.0), FpsConversion::Blend)?;
+        // 50 -> 24 fps: output frames 0 and 12 pass source frames 0 and 25
+        // through.
+        for (out, src) in [(0, 0), (12, 25)] {
+            assert!(
+                blend.get(out).equal(&source.get(src)),
+                "passthrough frame {out} differs from source frame {src}"
+            );
+        }
+        Ok(())
+    }
+
+    /// With HDR tone mapping, the stage's input graph runs the tone-mapping
+    /// chain, which keeps `color_conversion`: float32 output defaults to
+    /// `accurate` (bicubic resize and linearization in zscale), so `blend`
+    /// passthrough frames match the same request without frame-rate
+    /// conversion. With the chain in its `fast` form (swscale resizes in YUV
+    /// before linearizing), edges of a textured frame are off by up to the
+    /// full range; a smooth ramp would not show it. What remains (~0.045) is
+    /// the tone-mapped frames' round trip through YUV, which `framerate` in
+    /// the graph had too.
+    #[test_case(None ; "native size")]
+    #[test_case(Some((160, 90)) ; "resized")]
+    fn test_fps_conversion_blend_tone_mapping_keeps_color_conversion(
+        size: Option<(u32, u32)>,
+    ) -> anyhow::Result<()> {
+        init_logger();
+        let video = crate::util::test_utils::generate_textured_pq_video()?;
+        let decode = |frame_rate, fps_conversion| {
+            decode_media(
+                MediaDecodeRequest {
+                    source: MediaSource::Uri(video.path().to_str().unwrap().into()),
+                    start_time: None,
+                    end_time: None,
+                    video_stream: Some(VideoStreamRequest {
+                        frame_rate,
+                        width: size.map(|(w, _)| w),
+                        height: size.map(|(_, h)| h),
+                        dtype: OutputDtype::Float32,
+                        fps_conversion,
+                        ..Default::default()
+                    }),
+                    audio_streams: None,
+                    max_output_bytes: None,
+                },
+                None,
+            )
+            .map(|mut streams| streams.remove(0).data.unwrap())
+        };
+        let source = decode(None, FpsConversion::Nearest)?;
+        let blend = decode(Some(24.0), FpsConversion::Blend)?;
+        for (out, src) in [(0, 0), (12, 25)] {
+            let diff = (blend.get(out) - source.get(src))
+                .abs()
+                .max()
+                .double_value(&[]);
+            assert!(
+                diff < 0.1,
+                "passthrough frame {out} differs from source frame {src} by {diff}"
+            );
         }
         Ok(())
     }
@@ -6040,6 +6263,37 @@ mod tests {
         "yuv422p",
         "setparams=colorspace=bt2020nc,zscale=t=linear:npl=100,format=gbrpf32le,tonemap=hable:desat=0,zscale=p=bt709:t=bt709:m=bt709:range=tv,format=pix_fmts=yuv422p";
         "after HDR tone mapping"
+    )]
+    #[test_case(
+        VideoFilterConfig {
+            frame_rate: Some(24.0),
+            width: Some(640),
+            height: Some(360),
+            color_conversion: ColorConversion::Accurate,
+            source_color: SourceColorInfo {
+                color_trc: Some("smpte2084".to_string()),
+                color_primaries: Some("bt2020".to_string()),
+                ..Default::default()
+            },
+            fps_conversion: FpsConversion::Blend,
+            ..Default::default()
+        },
+        "yuv444p16le",
+        "setparams=colorspace=bt2020nc,zscale=t=linear:npl=100:f=bicubic:w=640:h=360,format=gbrpf32le,tonemap=hable:desat=0,zscale=p=bt709:t=bt709:m=bt709:range=tv,zscale=f=bicubic,format=pix_fmts=yuv444p16le";
+        "accurate tone mapping keeps its zscale resize"
+    )]
+    #[test_case(
+        VideoFilterConfig {
+            frame_rate: Some(24.0),
+            width: Some(640),
+            height: Some(360),
+            color_conversion: ColorConversion::Accurate,
+            fps_conversion: FpsConversion::Blend,
+            ..Default::default()
+        },
+        "yuv444p16le",
+        "scale=width=640:height=360,format=pix_fmts=yuv444p16le";
+        "accurate sdr conversion is left to the output graph"
     )]
     fn test_motion_input_filter(filter: VideoFilterConfig, working_format: &str, expected: &str) {
         assert!(filter.uses_motion_stage());

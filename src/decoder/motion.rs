@@ -51,15 +51,16 @@ const PRED_COST: u32 = 64;
 /// plus the window margin plus a full motion vector (2 * SEARCH) outside.
 const PAD: usize = 128;
 
-/// A borrowed 8-bit image plane: `height` rows of `width` bytes, `stride`
-/// bytes apart.
+/// A borrowed image plane: `height` rows of `width` samples, `stride` bytes
+/// apart. Samples are bytes, or little-endian `u16` pairs for a
+/// [`Depth::U16`] layout.
 #[derive(Clone, Copy)]
 pub(crate) struct Plane<'a> {
     pub data: &'a [u8],
     pub stride: usize,
 }
 
-/// A mutable 8-bit image plane, laid out like [`Plane`].
+/// A mutable image plane, laid out like [`Plane`].
 pub(crate) struct PlaneMut<'a> {
     pub data: &'a mut [u8],
     pub stride: usize,
@@ -138,12 +139,35 @@ impl PaddedFrame {
     }
 }
 
-/// Frame geometry: luma size and chroma subsampling (log2, 4:2:0 = (1, 1)).
+/// Sample depth of a [`Layout`]'s planes.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum Depth {
+    /// 8-bit samples (`yuv4xxp`, `yuvj4xxp`).
+    #[default]
+    U8,
+    /// 16-bit little-endian samples (`yuv4xxp16le`), for sources deeper
+    /// than 8 bits. Only [`Synthesis::Blend`] and the cut detector take
+    /// them; [`Interpolator`] works on 8-bit frames.
+    U16,
+}
+
+impl Depth {
+    pub fn bytes(self) -> usize {
+        match self {
+            Self::U8 => 1,
+            Self::U16 => 2,
+        }
+    }
+}
+
+/// Frame geometry: luma size, chroma subsampling (log2, 4:2:0 = (1, 1)) and
+/// sample depth.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Layout {
     pub width: usize,
     pub height: usize,
     pub chroma_shift: (u32, u32),
+    pub depth: Depth,
 }
 
 impl Layout {
@@ -458,32 +482,52 @@ pub(crate) fn working_pixel_format(pix_fmt: ffi::AVPixelFormat) -> &'static str 
 }
 
 impl Layout {
-    /// Geometry of `width` x `height` frames in planar 8-bit YUV `pix_fmt`.
+    /// Geometry of `width` x `height` frames in `pix_fmt`: planar YUV with
+    /// 8-bit or 16-bit little-endian samples.
     pub fn new(
         width: i32,
         height: i32,
         pix_fmt: ffi::AVPixelFormat,
     ) -> Result<Self, anyhow::Error> {
         let desc = unsafe { ffi::av_pix_fmt_desc_get(pix_fmt) };
-        let supported = !desc.is_null() && {
-            let desc = unsafe { &*desc };
-            desc.nb_components == 3
-                && desc.flags & (ffi::AV_PIX_FMT_FLAG_PLANAR | ffi::AV_PIX_FMT_FLAG_RGB) as u64
-                    == ffi::AV_PIX_FMT_FLAG_PLANAR as u64
-                && desc.comp.iter().take(3).all(|c| c.depth == 8)
-                && matches!(
-                    (desc.log2_chroma_w, desc.log2_chroma_h),
-                    (1, 1) | (1, 0) | (0, 0)
-                )
+        let depth = (!desc.is_null())
+            .then(|| unsafe { &*desc })
+            .filter(|desc| {
+                desc.nb_components == 3
+                    && desc.flags
+                        & (ffi::AV_PIX_FMT_FLAG_PLANAR
+                            | ffi::AV_PIX_FMT_FLAG_RGB
+                            | ffi::AV_PIX_FMT_FLAG_BE) as u64
+                        == ffi::AV_PIX_FMT_FLAG_PLANAR as u64
+                    && matches!(
+                        (desc.log2_chroma_w, desc.log2_chroma_h),
+                        (1, 1) | (1, 0) | (0, 0)
+                    )
+            })
+            .and_then(|desc| {
+                let comps = &desc.comp[..3];
+                let all = |depth: i32, step: i32| {
+                    comps
+                        .iter()
+                        .all(|c| c.depth == depth && c.step == step && c.shift == 0)
+                };
+                if all(8, 1) {
+                    Some(Depth::U8)
+                } else if all(16, 2) {
+                    Some(Depth::U16)
+                } else {
+                    None
+                }
+            });
+        let Some(depth) = depth.filter(|_| width > 0 && height > 0) else {
+            bail!("Frame interpolation needs planar YUV 4:2:0/4:2:2/4:4:4 frames with 8-bit or 16-bit little-endian samples, got pix_fmt {pix_fmt} at {width}x{height}");
         };
-        if !supported || width <= 0 || height <= 0 {
-            bail!("Motion interpolation needs 8-bit planar YUV 4:2:0/4:2:2/4:4:4 frames, got pix_fmt {pix_fmt} at {width}x{height}");
-        }
         let desc = unsafe { &*desc };
         Ok(Self {
             width: width as usize,
             height: height as usize,
             chroma_shift: (desc.log2_chroma_w as u32, desc.log2_chroma_h as u32),
+            depth,
         })
     }
 }
@@ -492,8 +536,8 @@ fn frame_layout(frame: &AVFrame) -> Result<Layout, anyhow::Error> {
     Layout::new(frame.width, frame.height, frame.format)
 }
 
-/// (rows, row bytes) of plane `index` of a frame with `layout`.
-fn plane_size(layout: &Layout, index: usize) -> (usize, usize) {
+/// (rows, samples per row) of plane `index` of a frame with `layout`.
+fn plane_samples(layout: &Layout, index: usize) -> (usize, usize) {
     if index == 0 {
         (layout.height, layout.width)
     } else {
@@ -502,13 +546,19 @@ fn plane_size(layout: &Layout, index: usize) -> (usize, usize) {
     }
 }
 
+/// (rows, row bytes) of plane `index` of a frame with `layout`.
+fn plane_size(layout: &Layout, index: usize) -> (usize, usize) {
+    let (rows, samples) = plane_samples(layout, index);
+    (rows, samples * layout.depth.bytes())
+}
+
 /// Checks that `frame` has exactly `layout`'s geometry and three non-null
 /// planes with `stride >= width`, and returns the plane strides.
 ///
-/// [`Layout::new`] only accepts 8-bit, fully planar YUV formats with 3
-/// components, so for a frame that passes this check every plane `i` is a
+/// [`Layout::new`] only accepts fully planar YUV formats with 3 components of
+/// 8 or 16 bits, so for a frame that passes this check every plane `i` is a
 /// separate array of [`plane_size`]`(layout, i)` rows, `stride` bytes apart,
-/// each row starting with `width` one-byte samples. FFmpeg allocates video
+/// each row starting with `width` bytes of samples. FFmpeg allocates video
 /// frame buffers (`av_frame_get_buffer`, decoder and filter-graph pools) for
 /// at least the frame's full height, so such a plane spans at least
 /// `stride * (rows - 1) + width` bytes from `data[i]`.
@@ -528,7 +578,7 @@ fn plane_strides(frame: &AVFrame, layout: &Layout) -> Result<[usize; 3], anyhow:
     Ok(strides)
 }
 
-/// Borrows the three planes of a planar 8-bit YUV `frame`.
+/// Borrows the three planes of a planar YUV `frame`.
 pub(crate) fn frame_planes<'f>(
     frame: &'f AVFrame,
     layout: &Layout,
@@ -548,7 +598,7 @@ pub(crate) fn frame_planes<'f>(
     }))
 }
 
-/// Mutably borrows the three planes of a planar 8-bit YUV `frame`. Fails
+/// Mutably borrows the three planes of a planar YUV `frame`. Fails
 /// unless the frame's buffers are writable (not shared with another frame).
 pub(crate) fn frame_planes_mut<'f>(
     frame: &'f mut AVFrame,
@@ -661,11 +711,14 @@ impl Resampler {
         out_tb: AVRational,
         synthesis: Synthesis,
         detect_cuts: bool,
-    ) -> Self {
-        Self {
+    ) -> Result<Self, anyhow::Error> {
+        if synthesis == Synthesis::Motion && layout.depth != Depth::U8 {
+            bail!("Motion interpolation needs 8-bit frames, got {layout:?}");
+        }
+        Ok(Self {
             synthesis,
             motion: (synthesis == Synthesis::Motion).then(|| MotionState::new(layout)),
-            cuts: detect_cuts.then(|| CutDetector::new(layout.width, layout.height)),
+            cuts: detect_cuts.then(|| CutDetector::new(layout.width, layout.height, layout.depth)),
             layout,
             in_tb,
             out_tb,
@@ -674,7 +727,7 @@ impl Resampler {
             next_out: None,
             end: 0,
             scene_cut: false,
-        }
+        })
     }
 
     fn in_time(&self, pts: i64) -> i128 {
@@ -871,9 +924,9 @@ impl Resampler {
 }
 
 /// Cross-fades `prev` and `next` into `dst`: `prev` weighted
-/// `ALPHA_ONE - alpha`, `next` weighted `alpha`, rounded to nearest.
+/// `ALPHA_ONE - alpha`, `next` weighted `alpha`, rounded to nearest, at the
+/// layout's sample depth.
 fn blend(layout: &Layout, prev: [Plane; 3], next: [Plane; 3], alpha: u32, dst: [PlaneMut; 3]) {
-    let (wa, wb) = ((ALPHA_ONE - alpha) as u16, alpha as u16);
     for (i, ((a, b), d)) in prev.into_iter().zip(next).zip(dst).enumerate() {
         let (rows, width) = plane_size(layout, i);
         for y in 0..rows {
@@ -882,10 +935,34 @@ fn blend(layout: &Layout, prev: [Plane; 3], next: [Plane; 3], alpha: u32, dst: [
                 &b.data[y * b.stride..][..width],
             );
             let rd = &mut d.data[y * d.stride..][..width];
-            for ((o, &p), &q) in rd.iter_mut().zip(ra).zip(rb) {
-                *o = ((p as u16 * wa + q as u16 * wb + (ALPHA_ONE / 2) as u16) >> 8) as u8;
+            match layout.depth {
+                Depth::U8 => blend_row_u8(ra, rb, alpha, rd),
+                Depth::U16 => blend_row_u16(ra, rb, alpha, rd),
             }
         }
+    }
+}
+
+fn blend_row_u8(a: &[u8], b: &[u8], alpha: u32, dst: &mut [u8]) {
+    let (wa, wb) = ((ALPHA_ONE - alpha) as u16, alpha as u16);
+    for ((o, &p), &q) in dst.iter_mut().zip(a).zip(b) {
+        *o = ((p as u16 * wa + q as u16 * wb + (ALPHA_ONE / 2) as u16) >> 8) as u8;
+    }
+}
+
+/// [`blend_row_u8`] for rows of little-endian `u16` samples; `u32`
+/// accumulation (65535 * 256 fits).
+fn blend_row_u16(a: &[u8], b: &[u8], alpha: u32, dst: &mut [u8]) {
+    let (wa, wb) = (ALPHA_ONE - alpha, alpha);
+    let (dst, a, b) = (
+        dst.as_chunks_mut::<2>().0,
+        a.as_chunks::<2>().0,
+        b.as_chunks::<2>().0,
+    );
+    for ((o, &p), &q) in dst.iter_mut().zip(a).zip(b) {
+        let (p, q) = (u16::from_le_bytes(p) as u32, u16::from_le_bytes(q) as u32);
+        let v = (p * wa + q * wb + ALPHA_ONE / 2) >> 8;
+        *o = (v as u16).to_le_bytes();
     }
 }
 
@@ -1031,10 +1108,11 @@ mod tests {
             width: 48,
             height: 32,
             chroma_shift: (1, 1),
+            depth: Depth::U8,
         };
         let in_tb = AVRational { num: 1, den };
         let out_tb = AVRational { num: 1, den: 24 };
-        let mut resampler = Resampler::new(layout, in_tb, out_tb, Synthesis::Motion, true);
+        let mut resampler = Resampler::new(layout, in_tb, out_tb, Synthesis::Motion, true).unwrap();
         let pts: Vec<i64> = (0..n).map(|i| 3 * step + i * step).collect();
         let mut out = Vec::new();
         for &p in &pts {
@@ -1056,6 +1134,7 @@ mod tests {
             width: 48,
             height: 32,
             chroma_shift: (1, 1),
+            depth: Depth::U8,
         };
         let tb = AVRational { num: 1, den: 48 };
         let mut resampler = Resampler::new(
@@ -1064,7 +1143,8 @@ mod tests {
             AVRational { num: 1, den: 24 },
             Synthesis::Motion,
             true,
-        );
+        )
+        .unwrap();
         let dark = |_: f64, _: f64, _: usize| 40;
         let bright = |_: f64, _: f64, _: usize| 200;
         // A(0) and B(4): the frame between them (pts 1/24) is interpolated.
@@ -1113,6 +1193,7 @@ mod tests {
             width: 100,
             height: 60,
             chroma_shift,
+            depth: Depth::U8,
         };
         let frame = planes(&layout, |x, y, p| pattern(x + 7.0 * p as f64, y));
         for alpha in [1, 64, 128, 255] {
@@ -1131,6 +1212,7 @@ mod tests {
             width: 160,
             height: 96,
             chroma_shift: (1, 1),
+            depth: Depth::U8,
         };
         let (dx, dy) = (12.0, -6.0);
         let at = |t: f64| {
@@ -1178,6 +1260,7 @@ mod tests {
             width,
             height,
             chroma_shift,
+            depth: Depth::U8,
         };
         let prev = planes(&layout, |x, y, _| pattern(x, y));
         let next = planes(&layout, |x, y, _| pattern(x + 3.0, y + 1.0));
@@ -1186,12 +1269,63 @@ mod tests {
         assert_eq!(out.map(|p| p.len()), [width * height, cw * ch, cw * ch]);
     }
 
+    /// 16-bit planar YUV is accepted as [`Depth::U16`]; motion interpolation
+    /// refuses it, blend takes it.
+    #[test]
+    fn test_layout_depth() {
+        let l8 = Layout::new(64, 32, ffi::AV_PIX_FMT_YUV420P).unwrap();
+        let l16 = Layout::new(64, 32, ffi::AV_PIX_FMT_YUV420P16LE).unwrap();
+        assert_eq!((l8.depth, l16.depth), (Depth::U8, Depth::U16));
+        assert_eq!(plane_size(&l16, 0), (32, 128));
+        assert_eq!(plane_size(&l16, 1), (16, 64));
+        // 10-bit samples sit in 16-bit words but are not 16-bit samples.
+        assert!(Layout::new(64, 32, ffi::AV_PIX_FMT_YUV420P10LE).is_err());
+        assert!(Layout::new(64, 32, ffi::AV_PIX_FMT_YUV420P16BE).is_err());
+        let tb = AVRational { num: 1, den: 50 };
+        let out_tb = AVRational { num: 1, den: 24 };
+        assert!(Resampler::new(l16, tb, out_tb, Synthesis::Motion, true).is_err());
+        assert!(Resampler::new(l16, tb, out_tb, Synthesis::Blend, true).is_ok());
+    }
+
+    /// The 16-bit cross-fade rounds like the 8-bit one and covers the full
+    /// sample range without overflow.
+    #[test]
+    fn test_blend_row_u16() {
+        let words = |v: &[u16]| v.iter().flat_map(|w| w.to_le_bytes()).collect::<Vec<u8>>();
+        let a = words(&[0, 1000, 65535, 65535, 40000]);
+        let b = words(&[65535, 1001, 65535, 0, 40000]);
+        let mut out = vec![0u8; a.len()];
+        blend_row_u16(&a, &b, ALPHA_ONE / 2, &mut out);
+        let got: Vec<u16> = out
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|&c| u16::from_le_bytes(c))
+            .collect();
+        assert_eq!(got, [32768, 1001, 65535, 32768, 40000]);
+        // 8-bit values scaled by 257 blend to the 8-bit result scaled by 257
+        // (up to rounding).
+        let (p, q) = (37u8, 201u8);
+        let mut o8 = [0u8];
+        blend_row_u8(&[p], &[q], 77, &mut o8);
+        let mut o16 = [0u8; 2];
+        blend_row_u16(
+            &(p as u16 * 257).to_le_bytes(),
+            &(q as u16 * 257).to_le_bytes(),
+            77,
+            &mut o16,
+        );
+        let v = u16::from_le_bytes(o16) as i32;
+        assert!((v - o8[0] as i32 * 257).abs() <= 257, "{v} vs {}", o8[0]);
+    }
+
     #[test]
     fn test_frame_planes_reject_mismatched_frames() {
         let layout = Layout {
             width: 64,
             height: 32,
             chroma_shift: (1, 1),
+            depth: Depth::U8,
         };
         let frame = av_frame(&layout, 0, 1, |x, y, _| pattern(x, y));
         assert!(frame_planes(&frame, &layout).is_ok());
@@ -1237,6 +1371,7 @@ mod tests {
             width: 256,
             height: 144,
             chroma_shift: (1, 1),
+            depth: Depth::U8,
         };
         // 50 fps -> 24 fps; shot A for frames 0..23, shot B from 23. Output
         // frame 11 sits at source 22.92, between the shots.
@@ -1260,7 +1395,7 @@ mod tests {
                 255 - pattern(y * 3.0 + 11.0, x * 2.0 + 5.0)
             }
         };
-        let mut resampler = Resampler::new(layout, in_tb, out_tb, synthesis, detect);
+        let mut resampler = Resampler::new(layout, in_tb, out_tb, synthesis, detect).unwrap();
         let mut out = Vec::new();
         for i in 0..50 {
             out.extend(
@@ -1317,6 +1452,7 @@ mod tests {
             width: 8,
             height: 4,
             chroma_shift: (1, 1),
+            depth: Depth::U8,
         };
         let a = planes(&layout, |_, _, _| 40);
         let b = planes(&layout, |_, _, _| 200);
