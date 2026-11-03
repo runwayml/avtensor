@@ -275,6 +275,25 @@ pub fn ffmpeg_rgb24_frames(
     Ok(output.stdout.chunks(frame).map(<[u8]>::to_vec).collect())
 }
 
+/// Runs ffmpeg with `args` (inputs and filters) and returns its interleaved
+/// float32 audio samples, as `ffmpeg ... -f f32le -` emits them.
+pub fn ffmpeg_f32le_samples(args: &[&str]) -> Result<Vec<f32>, anyhow::Error> {
+    let output = Command::new(get_ffmpeg_binary())
+        .args(["-hide_banner", "-loglevel", "error"])
+        .args(args)
+        .args(["-f", "f32le", "-"])
+        .output()
+        .context("running ffmpeg")?;
+    anyhow::ensure!(
+        output.status.success(),
+        "ffmpeg exited with {}",
+        output.status
+    );
+    let (samples, rest) = output.stdout.as_chunks::<4>();
+    anyhow::ensure!(rest.is_empty(), "partial sample in ffmpeg output");
+    Ok(samples.iter().map(|&b| f32::from_le_bytes(b)).collect())
+}
+
 /// The default timestamp expression of [`generate_vfr_video_file`]: jitter
 /// plus two gaps, in frames (`N` is the frame index).
 pub const JITTER_AND_GAPS: &str = "N+0.45*sin(N*1.3)+2*gt(N,30)+3*gt(N,60)";
@@ -767,6 +786,67 @@ pub fn make_av_offset_video(
         "copy",
         file.path().to_str().context("temp path")?,
     ])?;
+    Ok(file)
+}
+
+/// Encodes `seconds` of 320x240 video at 24000/1001 fps beside mono 48 kHz
+/// audio that is silent except for a 0.8 click (2 ms) at the start of every
+/// second, so sample positions can be measured exactly. Both are lossless
+/// (H.264 `-qp 0`, FLAC). The audio track, which is one second shorter than
+/// the video, starts `audio_offset` seconds after the video when positive,
+/// or the video starts `-audio_offset` seconds after the audio when
+/// negative. `suffix` picks the container: ".mp4" stores the offset as an
+/// edit list, and its 24000 Hz movie timescale keeps the offset exact;
+/// ".mkv" rounds it to Matroska's 1 ms timestamps.
+pub fn generate_av_click_video(
+    suffix: &str,
+    seconds: u32,
+    audio_offset: f64,
+) -> Result<NamedTempFile, anyhow::Error> {
+    let file = NamedTempFile::with_suffix(suffix)?;
+    let video = format!("testsrc=s=320x240:r=24000/1001:d={seconds}");
+    let audio = format!(
+        "aevalsrc='if(lt(mod(t\\,1)\\,0.002)\\,0.8\\,0)':s=48000:d={}",
+        seconds - 1
+    );
+    let (video_offset, audio_offset) = if audio_offset >= 0.0 {
+        (0.0, audio_offset)
+    } else {
+        (-audio_offset, 0.0)
+    };
+    let (video_offset, audio_offset) = (video_offset.to_string(), audio_offset.to_string());
+    let mut args = vec![
+        "-itsoffset",
+        &video_offset,
+        "-f",
+        "lavfi",
+        "-i",
+        &video,
+        "-itsoffset",
+        &audio_offset,
+        "-f",
+        "lavfi",
+        "-i",
+        &audio,
+        "-map",
+        "0:v",
+        "-map",
+        "1:a",
+        "-c:v",
+        "libx264",
+        "-qp",
+        "0",
+        "-preset",
+        "ultrafast",
+        "-c:a",
+        "flac",
+    ];
+    if suffix == ".mp4" {
+        args.extend(["-movflags", "+faststart", "-movie_timescale", "24000"]);
+    }
+    let path = file.path().to_str().context("temp path")?.to_string();
+    args.push(&path);
+    run_ffmpeg(&args)?;
     Ok(file)
 }
 

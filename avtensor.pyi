@@ -255,6 +255,12 @@ class DecodeResult(TypedDict):
     # Presentation timestamp (seconds) of each frame, as a float64 Tensor of
     # shape [T] - only set for Video Streams
     pts: NotRequired[torch.Tensor]
+    # Presentation timestamp (seconds) of the first audio sample, on the clock
+    # of the video's pts; sample i is at start_time + i / sample_rate. Audio
+    # that starts after the decode's timeline (the earliest stream, or the
+    # window's start) is padded with zeros back to it. None when no sample was
+    # decoded - only set for Audio Streams
+    start_time: NotRequired[float | None]
 
 def decode_asset(
     request: MediaDecodeRequest, *, s3_config: S3Config | None = None

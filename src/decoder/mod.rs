@@ -66,6 +66,8 @@ struct FilteringContext<'graph> {
     /// Presentation timestamp (seconds) of each frame written to
     /// `frame_data`, in write order. Video streams only.
     frame_pts: Vec<f64>,
+    /// When the stream's decoded frames and its output start.
+    start: StreamStart,
     // Whether we should continue to route new packets through the FilteringContext.
     finished: bool,
     /// The CLI's frame-rate sync (`FpsMode::Cli` video streams only), and
@@ -73,11 +75,39 @@ struct FilteringContext<'graph> {
     cfr: Option<CliSync>,
 }
 
+/// Where a stream starts (seconds, stream timestamps): the first frame the
+/// decoder returned, and the first frame written to the output. They differ
+/// when a seek window drops frames before its start. `None` when unknown
+/// (no such frame, or it had no timestamp).
+#[derive(Debug, Default, Clone, Copy)]
+struct StreamStart {
+    decoded: Option<f64>,
+    output: Option<f64>,
+    /// Whether the first frame was written to the output yet.
+    wrote: bool,
+}
+
+impl StreamStart {
+    /// Records the first of `frames` written to the output, unless one was.
+    fn written(&mut self, frames: &[Frame]) {
+        let Some(first) = frames.first().filter(|_| !self.wrote) else {
+            return;
+        };
+        self.wrote = true;
+        let pts = match first {
+            Frame::Video { pts, .. } | Frame::Audio { pts, .. } => *pts,
+        };
+        self.output = (pts != AV_NOPTS_VALUE).then(|| first.pts_seconds());
+    }
+}
+
 /// [`cfr::CfrSync`] plus where the previous emitted frame is.
 struct CliSync {
     sync: cfr::CfrSync,
     /// The CLI's fixes to packet timestamps, before decoding.
     demux: cfr::DemuxFixup,
+    /// The CLI's start (stream seconds), where its output timeline is 0.
+    start_seconds: f64,
     /// Row of the output tensor holding the previous emitted frame.
     previous_row: Option<i64>,
     /// The request's resolved output limit, which growth stays within.
@@ -145,6 +175,10 @@ pub struct DecodedStream {
     /// Presentation timestamp (seconds) for each row of `data`, in order.
     /// Populated for video streams; empty for audio.
     pub frame_pts: Vec<f64>,
+    /// Presentation timestamp (seconds) of the first sample of `data`, on
+    /// the clock of `frame_pts`. Audio streams only; `None` when no sample
+    /// was decoded.
+    pub start_time: Option<f64>,
     pub metadata: StreamMetadata,
 }
 
@@ -341,6 +375,12 @@ pub fn decode_media(
 
     // Plan every stream before allocating any buffer, so a stream over the
     // output limit fails the request before another stream's buffer exists.
+    let timeline_start = planned_timeline_start(
+        &input_format_context,
+        video_stream.as_ref(),
+        audio_streams.as_deref(),
+        &seek,
+    );
     let video_plan = video_stream
         .as_ref()
         .map(|video_stream| {
@@ -351,7 +391,13 @@ pub fn decode_media(
         .iter()
         .flatten()
         .map(|audio_stream| {
-            plan_audio_stream(&input_format_context, audio_stream, &seek, &output_limit)
+            plan_audio_stream(
+                &input_format_context,
+                audio_stream,
+                &seek,
+                timeline_start,
+                &output_limit,
+            )
         })
         .collect::<Result<Vec<_>, _>>()?;
 
@@ -423,6 +469,7 @@ pub fn decode_media(
             metadata: s.metadata.clone(),
             data: None,
             frame_pts: Vec::new(),
+            start_time: None,
         })
         .collect();
 
@@ -526,6 +573,7 @@ pub fn decode_media(
             frame_data,
             frame_data_ptr,
             frame_pts,
+            start,
             cfr,
             ..
         } = filter_ctx;
@@ -549,6 +597,7 @@ pub fn decode_media(
             frame_data,
             frame_data_ptr,
             frame_pts,
+            start,
             cfr,
             &seek,
         )?;
@@ -604,10 +653,21 @@ pub fn decode_media(
             "Received {} frames after flushing the filter graph",
             frames.len(),
         );
+        start.written(&frames);
         // Drop any frames returned by the decoder outside of the seek range.
         let frames = filter_frames_seek(frames, &seek);
         decoded_stream.decoded_frames.extend(frames);
     }
+
+    // Audio is laid onto the timeline the streams share (see
+    // [`align_audio_start`]), and reports its start on the clock of the
+    // video's timestamps: stream time, or with `FpsMode::Cli` the CLI's
+    // output time, which counts from the CLI's start.
+    let origin = timeline_origin(&filter_ctx, &seek);
+    let clock_offset = filter_ctx
+        .iter()
+        .find_map(|f| f.cfr.as_ref().map(|cli| cli.start_seconds))
+        .unwrap_or(0.0);
 
     // Move data buffer from FilteringContext -> DecodedStream.
     // TODO (rikheijdens): Should we have a different variant of the DecodedStream for which
@@ -617,7 +677,9 @@ pub fn decode_media(
         mut frame_data,
         frame_data_ptr,
         mut frame_pts,
+        start,
         stream_type,
+        metadata,
         cfr,
         ..
     } in filter_ctx.into_iter()
@@ -639,17 +701,151 @@ pub fn decode_media(
                 "Failed to trim video frame data Tensor to the correct number of decoded frames",
             )?
             }
-            StreamType::Audio => frame_data
-                .f_narrow(1, 0, min(frame_data_ptr as i64, frame_data.size()[1]))
-                .context(
-                "Failed to trim audio frame data Tensor to the correct number of decoded samples",
-            )?,
+            StreamType::Audio => {
+                let StreamMetadata::Audio { sample_rate } = metadata else {
+                    bail!("audio stream #{stream_index} without audio metadata");
+                };
+                let written = min(frame_data_ptr as i64, frame_data.size()[1]);
+                let stream_start = input_format_context
+                    .streams()
+                    .get(stream_index)
+                    .and_then(known_start_seconds);
+                let (samples, start_time) = align_audio_start(
+                    &mut frame_data,
+                    written,
+                    start,
+                    stream_start,
+                    origin,
+                    &seek,
+                    sample_rate,
+                    &mut decoded_stream.decoded_frames,
+                )?;
+                decoded_stream.start_time = start_time.map(|t| t - clock_offset);
+                frame_data.f_narrow(1, 0, samples).context(
+                    "Failed to trim audio frame data Tensor to the correct number of decoded samples",
+                )?
+            }
         };
         decoded_stream.data = Some(trimmed_data);
         decoded_stream.frame_pts = frame_pts;
     }
 
     Ok(decoded_streams)
+}
+
+/// Where the decode's timeline starts (stream seconds): the earliest first
+/// decoded frame of any stream, or the window's start when that is later.
+/// [`planned_timeline_start`] estimates it for planning.
+fn timeline_origin(filter_ctx: &[FilteringContext<'_>], seek: &Seek) -> Option<f64> {
+    let earliest = filter_ctx
+        .iter()
+        .filter_map(|f| f.start.decoded)
+        .reduce(f64::min)?;
+    Some(clip_to_window(earliest, seek))
+}
+
+/// Lays an audio stream that starts after the timeline's `origin` onto it:
+/// its `written` samples move right by the gap, which is filled with exact
+/// zeros, as FFmpeg's `aresample=async=1:first_pts=0` does. A stream that
+/// starts at or before the origin is left as it is, and so is one that
+/// starts before a window's `start_time` (by the container's `stream_start`
+/// or its first decoded frame): the window cuts that stream, so the time
+/// before its first kept frame held audio, not silence. The buffer keeps its
+/// planned size: samples pushed past its end are dropped, as they are when
+/// the duration estimate is short (with an `end_time`, they lie past the
+/// window's end).
+///
+/// Returns the number of samples in `frame_data` and the timestamp of the
+/// first one (stream seconds). `frames` hold views of `frame_data`, which
+/// are moved with the samples.
+#[allow(clippy::too_many_arguments)]
+fn align_audio_start(
+    frame_data: &mut tch::Tensor,
+    written: i64,
+    start: StreamStart,
+    stream_start: Option<f64>,
+    origin: Option<f64>,
+    seek: &Seek,
+    sample_rate: u32,
+    frames: &mut Vec<Frame>,
+) -> Result<(i64, Option<f64>), anyhow::Error> {
+    let (Some(origin), Some(decoded), Some(first)) = (origin, start.decoded, start.output) else {
+        return Ok((written, start.output));
+    };
+    let in_window =
+        starts_in_window(decoded, seek) && stream_start.is_none_or(|s| starts_in_window(s, seek));
+    let pad = if in_window {
+        leading_pad_samples(first, origin, sample_rate)
+    } else {
+        0
+    };
+    if pad == 0 {
+        return Ok((written, Some(first)));
+    }
+    let capacity = frame_data.size()[1];
+    let pad = pad.min(capacity);
+    let kept = written.min(capacity - pad);
+    if kept < written {
+        log::debug!(
+            "Dropping {} audio samples past the output buffer after a {pad}-sample lead",
+            written - kept
+        );
+    }
+    shift_samples(frame_data, kept, pad)?;
+
+    // Move the frames' views with their samples, dropping any pushed out.
+    let base = frame_data.data_ptr() as usize;
+    let element_size = frame_data.kind().elt_size_in_bytes();
+    let mut moved = Vec::with_capacity(frames.len());
+    for mut frame in frames.drain(..) {
+        if let Frame::Audio { data, .. } = &mut frame {
+            if data.numel() == 0 {
+                // An empty view (written to a full buffer) has no address.
+                moved.push(frame);
+                continue;
+            }
+            let Some(at) = (data.data_ptr() as usize).checked_sub(base) else {
+                bail!("audio frame view outside the output buffer");
+            };
+            let offset = (at / element_size) as i64 + pad;
+            let length = data.size()[1].min(capacity - offset);
+            if length <= 0 {
+                continue;
+            }
+            *data = frame_data.f_narrow(1, offset, length)?;
+        }
+        moved.push(frame);
+    }
+    *frames = moved;
+    Ok((pad + kept, Some(origin)))
+}
+
+/// Moves the first `samples` samples of each channel of a contiguous float
+/// `[C, N]` tensor `pad` samples later, and zeroes the first `pad`.
+fn shift_samples(frame_data: &mut tch::Tensor, samples: i64, pad: i64) -> anyhow::Result<()> {
+    let (channels, capacity) = frame_data.size2()?;
+    anyhow::ensure!(
+        frame_data.kind() == tch::Kind::Float
+            && frame_data.device() == tch::Device::Cpu
+            && frame_data.is_contiguous(),
+        "audio output must be a contiguous float32 CPU tensor"
+    );
+    anyhow::ensure!(
+        samples >= 0 && pad >= 0 && samples + pad <= capacity,
+        "cannot shift {samples} samples by {pad} in a buffer of {capacity}"
+    );
+    let base = frame_data.data_ptr() as *mut f32;
+    for channel in 0..channels {
+        // SAFETY: the tensor is a contiguous [channels, capacity] f32 buffer,
+        // and both ranges lie within this channel's row (checked above).
+        // `copy` allows the overlap.
+        unsafe {
+            let row = base.add((channel * capacity) as usize);
+            std::ptr::copy(row, row.add(pad as usize), samples as usize);
+            std::ptr::write_bytes(row, 0, pad as usize);
+        }
+    }
+    Ok(())
 }
 
 /// Metadata for a probed video stream.
@@ -783,6 +979,12 @@ pub fn plan_media(
         start_time,
         end_time,
     };
+    let timeline_start = planned_timeline_start(
+        &input_format_context,
+        video_stream.as_ref(),
+        audio_streams.as_deref(),
+        &seek,
+    );
     let mut plans = Vec::new();
     if let Some(video_stream) = &video_stream {
         plans.push(plan_video_stream(
@@ -797,6 +999,7 @@ pub fn plan_media(
             &input_format_context,
             audio_stream,
             &seek,
+            timeline_start,
             &output_limit,
         )?);
     }
@@ -1271,6 +1474,7 @@ fn init_video_stream_context(
                     input_format_context.nb_streams == 1,
                 ),
                 demux: cli_demux_fixup(input_format_context, video_stream, start_time),
+                start_seconds: start_time as f64 / 1e6,
                 previous_row: None,
                 output_limit: output_limit.clone(),
                 grew: false,
@@ -1450,11 +1654,14 @@ fn plan_video_stream(
 }
 
 /// Plans the decode of the audio stream selected by `request.index`, whose
-/// buffer may not exceed `max_output_bytes`.
+/// buffer may not exceed `max_output_bytes`. `timeline_start` (from
+/// [`planned_timeline_start`]) sizes the silence that puts a late-starting
+/// stream on the decode's timeline (see [`leading_pad_samples`]).
 fn plan_audio_stream(
     input_format_context: &AVFormatContextInput,
     request: &AudioStreamRequest,
     seek: &Seek,
+    timeline_start: Option<f64>,
     output_limit: &OutputLimit,
 ) -> Result<StreamPlan, anyhow::Error> {
     let audio_index = request
@@ -1494,7 +1701,34 @@ fn plan_audio_stream(
             "Computed an invalid sample count ({num_samples}) for audio stream #{audio_index}"
         ));
     }
-    let shape = vec![num_channels as i64, num_samples as i64];
+    let mut num_samples = num_samples as i64;
+
+    // Room for the silence that puts a stream starting after the timeline
+    // onto it, estimated from the container's start times. Such a stream
+    // starts inside the window, so all of it is decoded, after the silence;
+    // an end time still bounds the whole output, silence included. A
+    // container duration runs from the file's first timestamp to its last,
+    // so it already spans the silence.
+    let start = known_start_seconds(audio_stream);
+    if let (Some(origin), Some(start), DurationSource::Stream) =
+        (timeline_start, start, duration_source)
+    {
+        let pad = if starts_in_window(start, seek) {
+            leading_pad_samples(start, origin, sample_rate as u32)
+        } else {
+            0
+        };
+        if pad > 0 {
+            let mut padded = (stream_duration * sample_rate as f64).ceil() + pad as f64;
+            if let Some(end_time) = seek.end_time {
+                padded = padded.min(((end_time - origin) * sample_rate as f64).ceil());
+            }
+            if padded.is_finite() && padded > num_samples as f64 {
+                num_samples = padded as i64;
+            }
+        }
+    }
+    let shape = vec![num_channels as i64, num_samples];
     check_output_tensor_size(&shape, std::mem::size_of::<f32>(), output_limit)?;
 
     Ok(StreamPlan {
@@ -1761,10 +1995,62 @@ fn validate_fps_mode(request: &VideoStreamRequest, seek: &Seek) -> Result<(), an
 
 /// The stream's first timestamp in seconds (0 when unknown).
 fn stream_start_seconds(stream: &AVStreamRef) -> f64 {
-    if stream.start_time == AV_NOPTS_VALUE {
-        0.0
+    known_start_seconds(stream).unwrap_or(0.0)
+}
+
+/// The stream's first timestamp in seconds, if the container reports one.
+fn known_start_seconds(stream: &AVStreamRef) -> Option<f64> {
+    (stream.start_time != AV_NOPTS_VALUE)
+        .then(|| stream.start_time as f64 * av_q2d(stream.time_base))
+}
+
+/// Where the decode's timeline starts, estimated from the container's start
+/// times for planning: the earliest start of the decoded streams, or the
+/// window's start when that is later. [`decode_media`] uses the timestamps
+/// the decoders return instead.
+fn planned_timeline_start(
+    input_format_context: &AVFormatContextInput,
+    video_stream: Option<&VideoStreamRequest>,
+    audio_streams: Option<&[AudioStreamRequest]>,
+    seek: &Seek,
+) -> Option<f64> {
+    let streams = input_format_context.streams();
+    let indices = video_stream
+        .and_then(|request| request.index)
+        .into_iter()
+        .chain(audio_streams.into_iter().flatten().filter_map(|r| r.index));
+    let earliest = indices
+        .filter_map(|index| streams.get(index).and_then(known_start_seconds))
+        .reduce(f64::min)?;
+    Some(clip_to_window(earliest, seek))
+}
+
+/// `earliest`, or the window's start when that is later.
+fn clip_to_window(earliest: f64, seek: &Seek) -> f64 {
+    match seek.start_time {
+        Some(start_time) => earliest.max(start_time),
+        None => earliest,
+    }
+}
+
+/// Whether audio whose first sample is at `first` (seconds) starts inside
+/// the decode window, so that the time before it holds no audio. Before a
+/// later window start, the window cuts the audio instead: its first frame
+/// at or after `start_time` follows samples the window left out, not
+/// silence, so it is not padded.
+fn starts_in_window(first: f64, seek: &Seek) -> bool {
+    seek.start_time.is_none_or(|start_time| first >= start_time)
+}
+
+/// Samples of silence (at `sample_rate`) that put audio whose first sample is
+/// at `first` seconds onto a timeline that starts at `origin`: none when the
+/// audio starts at or before the origin.
+fn leading_pad_samples(first: f64, origin: f64, sample_rate: u32) -> i64 {
+    let pad = ((first - origin) * sample_rate as f64).round();
+    if pad.is_finite() && pad > 0.0 {
+        pad as i64
     } else {
-        stream.start_time as f64 * av_q2d(stream.time_base)
+        0
     }
 }
 
@@ -1950,6 +2236,7 @@ fn decode_packet(
         frame_data,
         frame_data_ptr,
         frame_pts,
+        start,
         finished,
         cfr,
         ..
@@ -1974,6 +2261,7 @@ fn decode_packet(
                     frame_data,
                     frame_data_ptr,
                     frame_pts,
+                    start,
                     cfr,
                     seek,
                 )
@@ -2023,6 +2311,7 @@ fn decode_packet(
             frame_data,
             frame_data_ptr,
             frame_pts,
+            start,
             cfr,
             seek,
         )
@@ -2117,6 +2406,7 @@ fn receive_and_filter_frames(
     frame_data: &mut tch::Tensor,
     frame_data_ptr: &mut usize,
     frame_pts: &mut Vec<f64>,
+    start: &mut StreamStart,
     cfr: &mut Option<CliSync>,
     seek: &Seek,
 ) -> Result<Vec<Frame>, anyhow::Error> {
@@ -2151,6 +2441,9 @@ fn receive_and_filter_frames(
         };
 
         frame.set_pts(frame.best_effort_timestamp);
+        if start.decoded.is_none() && frame.pts != AV_NOPTS_VALUE {
+            start.decoded = Some(pts_to_seconds(frame.pts, decode_context.pkt_timebase));
+        }
 
         // CLI frame-rate sync: how many times this frame (and the previous
         // one, before it) is emitted. Decided from timestamps alone, before
@@ -2311,6 +2604,7 @@ fn receive_and_filter_frames(
         }
     }
 
+    start.written(&frames);
     Ok(frames)
 }
 
@@ -4255,6 +4549,7 @@ fn init_filters(
             frame_data,
             frame_data_ptr: 0,
             frame_pts: Vec::new(),
+            start: StreamStart::default(),
             finished: false,
             cfr,
         })
@@ -7322,7 +7617,19 @@ mod tests {
             init_video_stream_context(&input_format_context, &video_request, plan, &limit)
         };
         let audio_context = |seek: &Seek| -> anyhow::Result<StreamContext> {
-            let plan = plan_audio_stream(&input_format_context, &audio_request, seek, &limit)?;
+            let timeline_start = planned_timeline_start(
+                &input_format_context,
+                Some(&video_request),
+                Some(std::slice::from_ref(&audio_request)),
+                seek,
+            );
+            let plan = plan_audio_stream(
+                &input_format_context,
+                &audio_request,
+                seek,
+                timeline_start,
+                &limit,
+            )?;
             init_audio_stream_context(&input_format_context, &audio_request, plan)
         };
 
@@ -7460,6 +7767,333 @@ mod tests {
             }
         }
 
+        Ok(())
+    }
+
+    // ---------------------------------------------------------------------
+    // Audio that starts after the video: padded onto the timeline the
+    // streams share. The fixtures (`generate_av_click_video`) carry a click
+    // at the start of every second of audio, so sample positions are exact.
+    // ---------------------------------------------------------------------
+
+    /// 125.125 ms: 6006 samples at 48 kHz, 3 frames at 24000/1001 fps.
+    const AUDIO_OFFSET: f64 = 0.125125;
+
+    fn av_request(
+        file: &tempfile::NamedTempFile,
+        start_time: Option<f64>,
+        end_time: Option<f64>,
+        audio: AudioStreamRequest,
+    ) -> MediaDecodeRequest {
+        MediaDecodeRequest {
+            source: uri(file),
+            start_time,
+            end_time,
+            video_stream: Some(VideoStreamRequest::default()),
+            audio_streams: Some(vec![audio]),
+            max_output_bytes: None,
+        }
+    }
+
+    /// The video's frame pts and the audio stream of a decode.
+    fn decode_av(request: MediaDecodeRequest) -> anyhow::Result<(Vec<f64>, DecodedStream)> {
+        let mut streams = decode_media(request, None)?;
+        assert_eq!(streams.len(), 2, "expected video and audio");
+        let audio = streams.pop().context("audio stream")?;
+        let video = streams.pop().context("video stream")?;
+        assert_eq!(video.stream_type(), StreamType::Video);
+        assert_eq!(audio.stream_type(), StreamType::Audio);
+        Ok((video.frame_pts, audio))
+    }
+
+    /// The mono samples of a decoded audio stream.
+    fn mono_samples(audio: &DecodedStream) -> anyhow::Result<Vec<f32>> {
+        let data = audio.data.as_ref().context("audio data")?;
+        assert_eq!(data.size()[0], 1, "expected mono audio");
+        Ok(Vec::<f32>::try_from(data.get(0))?)
+    }
+
+    /// Sample indices where a click starts.
+    fn click_onsets(samples: &[f32]) -> Vec<usize> {
+        (0..samples.len())
+            .filter(|&i| samples[i].abs() > 0.1 && (i == 0 || samples[i - 1].abs() <= 0.1))
+            .collect()
+    }
+
+    fn leading_zeros(samples: &[f32]) -> usize {
+        samples.iter().take_while(|&&s| s == 0.0).count()
+    }
+
+    /// Audio that starts after the video starts after the video in the
+    /// output too: preceded by exact zeros, as FFmpeg's
+    /// `aresample=async=1:first_pts=0` places it. MP4 stores the offset as
+    /// an edit list, Matroska as the first timestamp (rounded to 1 ms).
+    #[test_case(".mp4", 6006 ; "mp4 edit list")]
+    #[test_case(".mkv", 6000 ; "mkv")]
+    fn test_late_audio_is_padded_onto_the_video_timeline(
+        suffix: &str,
+        expected_pad: usize,
+    ) -> anyhow::Result<()> {
+        init_logger();
+        let file = crate::util::test_utils::generate_av_click_video(suffix, 4, AUDIO_OFFSET)?;
+        let (video_pts, audio) = decode_av(av_request(&file, None, None, Default::default()))?;
+        assert_eq!(video_pts[0], 0.0);
+        assert_eq!(audio.start_time, Some(0.0));
+        let samples = mono_samples(&audio)?;
+
+        // 3 s of audio after the lead; the lead is exact zeros.
+        assert_eq!(samples.len(), expected_pad + 3 * 48000);
+        assert_eq!(leading_zeros(&samples), expected_pad);
+        let onsets = click_onsets(&samples);
+        let expected: Vec<usize> = (0..3).map(|s| expected_pad + s * 48000).collect();
+        assert_eq!(onsets, expected, "clicks at the start of every second");
+
+        // Bit-identical to FFmpeg's alignment of the same stream.
+        let path = file.path().to_str().context("temp path")?;
+        let reference = crate::util::test_utils::ffmpeg_f32le_samples(&[
+            "-i",
+            path,
+            "-map",
+            "0:a",
+            "-af",
+            "aresample=async=1:first_pts=0",
+        ])?;
+        assert!(samples == reference, "differs from FFmpeg's alignment");
+
+        // The same with resampling, which runs through the filter graph:
+        // the lead is in output samples.
+        let (_, resampled) = decode_av(av_request(
+            &file,
+            None,
+            None,
+            AudioStreamRequest {
+                sample_rate: Some(16000),
+                ..Default::default()
+            },
+        ))?;
+        assert_eq!(resampled.start_time, Some(0.0));
+        let resampled = mono_samples(&resampled)?;
+        let pad = expected_pad / 3;
+        assert_eq!(resampled.len(), pad + 3 * 16000);
+        assert_eq!(leading_zeros(&resampled), pad);
+        let onsets = click_onsets(&resampled);
+        assert_eq!(onsets.len(), 3);
+        for (second, onset) in onsets.iter().enumerate() {
+            let expected = pad + second * 16000;
+            assert!(onset.abs_diff(expected) <= 1, "{onsets:?}");
+        }
+        Ok(())
+    }
+
+    /// Audio that starts before the video keeps its samples, unshifted and
+    /// untrimmed; the video's pts carry its later start.
+    #[test]
+    fn test_early_audio_keeps_its_samples() -> anyhow::Result<()> {
+        init_logger();
+        let file = crate::util::test_utils::generate_av_click_video(".mp4", 4, -AUDIO_OFFSET)?;
+        let (video_pts, audio) = decode_av(av_request(&file, None, None, Default::default()))?;
+        assert!(
+            (video_pts[0] - AUDIO_OFFSET).abs() < 1e-9,
+            "{}",
+            video_pts[0]
+        );
+        assert_eq!(audio.start_time, Some(0.0));
+        let samples = mono_samples(&audio)?;
+        assert_eq!(samples.len(), 3 * 48000);
+        assert_eq!(click_onsets(&samples), vec![0, 48000, 96000]);
+
+        // Exactly the stream's own samples.
+        let path = file.path().to_str().context("temp path")?;
+        let reference =
+            crate::util::test_utils::ffmpeg_f32le_samples(&["-i", path, "-map", "0:a"])?;
+        assert!(samples == reference, "differs from the stream's samples");
+        Ok(())
+    }
+
+    /// Audio that starts with the video is decoded exactly as before: no
+    /// lead, the stream's own samples, the same planned buffer.
+    #[test]
+    fn test_audio_without_offset_is_unchanged() -> anyhow::Result<()> {
+        init_logger();
+        let file = crate::util::test_utils::generate_av_click_video(".mp4", 4, 0.0)?;
+        let path = file.path().to_str().context("temp path")?;
+        let reference =
+            crate::util::test_utils::ffmpeg_f32le_samples(&["-i", path, "-map", "0:a"])?;
+        let make_request = || av_request(&file, None, None, Default::default());
+        let (video_pts, audio) = decode_av(make_request())?;
+        assert_eq!(video_pts[0], 0.0);
+        assert_eq!(audio.start_time, Some(0.0));
+        let samples = mono_samples(&audio)?;
+        assert!(samples == reference, "differs from the stream's samples");
+        assert_eq!(click_onsets(&samples), vec![0, 48000, 96000]);
+        let plans = plan_media(make_request(), None)?;
+        assert_eq!(plans[1].shape, vec![1, 3 * 48000]);
+
+        // Lossy audio whose first frame is at 0 (AAC priming trimmed by the
+        // edit list) gets no lead either.
+        let aac = generate_test_video_file(&TestVideoParameters::default())?;
+        let (_, audio) = decode_av(av_request(&aac, None, None, Default::default()))?;
+        assert_eq!(audio.start_time, Some(0.0));
+        let data = audio.data.as_ref().context("audio data")?;
+        assert_eq!(data.size(), vec![1, 5 * 44100]);
+        assert_ne!(f32::try_from(data.get(0).get(0))?, 0.0, "no zero lead");
+        Ok(())
+    }
+
+    /// Seek windows keep audio sample-aligned to the window (whose start is
+    /// the timeline's start) and to the video in it. A window that starts
+    /// before the audio pads from the window's start; one that starts after
+    /// it cuts the audio, which is not padded.
+    #[test_case(".mp4", 6006 ; "mp4")]
+    #[test_case(".mkv", 6000 ; "mkv")]
+    fn test_late_audio_seek_window(suffix: &str, offset_samples: usize) -> anyhow::Result<()> {
+        init_logger();
+        let file = crate::util::test_utils::generate_av_click_video(suffix, 4, AUDIO_OFFSET)?;
+        let decode = |start_time, end_time| {
+            decode_av(av_request(&file, start_time, end_time, Default::default()))
+        };
+
+        // Window from 0.05 s: the audio starts 0.075125 s in (0.075 s in mkv).
+        let (video_pts, audio) = decode(Some(0.05), Some(1.05))?;
+        assert!(video_pts[0] >= 0.05);
+        assert_eq!(audio.start_time, Some(0.05));
+        let samples = mono_samples(&audio)?;
+        let pad = offset_samples - 2400;
+        assert_eq!(samples.len(), 48000, "the window's length");
+        assert_eq!(leading_zeros(&samples), pad);
+        assert_eq!(click_onsets(&samples), vec![pad]);
+
+        // End time only: the window starts at the video.
+        let (_, audio) = decode(None, Some(1.0))?;
+        assert_eq!(audio.start_time, Some(0.0));
+        let samples = mono_samples(&audio)?;
+        assert_eq!(samples.len(), 48000);
+        assert_eq!(leading_zeros(&samples), offset_samples);
+        assert_eq!(click_onsets(&samples), vec![offset_samples]);
+
+        // Window from 1.0 s, inside the audio: no lead, and the reported
+        // start places the samples on the stream's clock (the click at
+        // 1.125125 s), as the video's pts do.
+        let (video_pts, audio) = decode(Some(1.0), Some(2.0))?;
+        assert!(video_pts[0] >= 1.0);
+        let start_time = audio.start_time.context("audio start time")?;
+        assert!((1.0..1.1).contains(&start_time), "{start_time}");
+        let samples = mono_samples(&audio)?;
+        assert_ne!(leading_zeros(&samples), offset_samples);
+        let onsets = click_onsets(&samples);
+        assert_eq!(onsets.len(), 1);
+        let click = start_time + onsets[0] as f64 / 48000.0;
+        let expected = 1.0 + offset_samples as f64 / 48000.0;
+        assert!((click - expected).abs() < 1.5 / 48000.0, "click at {click}");
+        Ok(())
+    }
+
+    /// The padded audio stays within its planned (preallocated) buffer, for
+    /// planning and the output limit alike; padding is planned for, not
+    /// grown into.
+    #[test]
+    fn test_plan_bounds_padded_audio() -> anyhow::Result<()> {
+        init_logger();
+        let file = crate::util::test_utils::generate_av_click_video(".mp4", 4, AUDIO_OFFSET)?;
+        for (start_time, end_time) in [(None, None), (None, Some(1.0)), (Some(0.05), Some(1.05))] {
+            let make_request = || av_request(&file, start_time, end_time, Default::default());
+            let plans = assert_plan_bounds_decode(make_request, true)?;
+            assert_eq!(plans[1].stream_type(), StreamType::Audio);
+        }
+        let plans = plan_media(av_request(&file, None, None, Default::default()), None)?;
+        assert_eq!(plans[1].shape, vec![1, 6006 + 3 * 48000]);
+
+        // The output limit counts the lead: a limit that fits the samples
+        // but not the lead is refused before anything is allocated. (The
+        // video, 96 frames of 16x16 rgb24, is well under either limit.)
+        let limited = |samples: u64| MediaDecodeRequest {
+            video_stream: Some(VideoStreamRequest {
+                width: Some(16),
+                height: Some(16),
+                ..Default::default()
+            }),
+            max_output_bytes: Some(samples * std::mem::size_of::<f32>() as u64),
+            ..av_request(&file, None, None, Default::default())
+        };
+        let allocations = crate::alloc::allocations_on_this_thread;
+        let before = allocations();
+        let err = decode_media(limited(3 * 48000), None)
+            .err()
+            .context("limit")?;
+        assert!(format!("{err:#}").contains("shape [1, 150006]"), "{err:#}");
+        assert_eq!(allocations(), before, "no output buffer may be allocated");
+        assert!(plan_media(limited(3 * 48000), None).is_err());
+        decode_media(limited(6006 + 3 * 48000), None)?;
+        Ok(())
+    }
+
+    /// The frames' views follow their samples; an empty view (written to a
+    /// full buffer) is kept as it is, and views pushed past the end of the
+    /// buffer are dropped.
+    #[test]
+    fn test_align_audio_start_moves_frame_views() -> anyhow::Result<()> {
+        let mut data = tch::Tensor::zeros([1, 8], (tch::Kind::Float, tch::Device::Cpu));
+        data.f_narrow(1, 0, 6)?
+            .f_copy_(&tch::Tensor::from_slice(&[1f32, 2., 3., 4., 5., 6.]).reshape([1, 6]))?;
+        let frame = |data: tch::Tensor| Frame::Audio {
+            sample_rate: 4,
+            nb_samples: data.size()[1] as i32,
+            pts: 0,
+            best_effort_timestamp: 0,
+            time_base: AVRational { num: 1, den: 4 },
+            data,
+        };
+        let mut frames = vec![
+            frame(data.f_narrow(1, 0, 3)?),
+            frame(data.f_narrow(1, 3, 3)?),
+            frame(data.f_narrow(1, 6, 0)?),
+        ];
+        let start = StreamStart {
+            decoded: Some(1.0),
+            output: Some(1.0),
+            wrote: true,
+        };
+        let seek = Seek {
+            start_time: None,
+            end_time: None,
+        };
+        // Audio at 1 s on a timeline from 0.5 s: a 2-sample lead at 4 Hz.
+        let (samples, start_time) =
+            align_audio_start(&mut data, 6, start, None, Some(0.5), &seek, 4, &mut frames)?;
+        assert_eq!((samples, start_time), (8, Some(0.5)));
+        assert_eq!(
+            Vec::<f32>::try_from(data.get(0))?,
+            vec![0., 0., 1., 2., 3., 4., 5., 6.]
+        );
+        let views: Vec<Vec<f32>> = frames
+            .iter()
+            .map(|f| Vec::<f32>::try_from(f.data().get(0)))
+            .collect::<Result<_, _>>()?;
+        assert_eq!(views, vec![vec![1., 2., 3.], vec![4., 5., 6.], vec![]]);
+
+        // A 6-sample lead leaves room for 2 of the 8 samples; the second
+        // frame's samples no longer fit.
+        let (samples, _) =
+            align_audio_start(&mut data, 8, start, None, Some(-0.5), &seek, 4, &mut frames)?;
+        assert_eq!(samples, 8);
+        assert_eq!(
+            Vec::<f32>::try_from(data.get(0))?,
+            vec![0., 0., 0., 0., 0., 0., 0., 0.]
+        );
+        let lengths: Vec<i64> = frames.iter().map(|f| f.data().size()[1]).collect();
+        assert_eq!(lengths, vec![0], "the moved views and the empty one");
+        Ok(())
+    }
+
+    #[test]
+    fn test_shift_samples() -> anyhow::Result<()> {
+        let mut data = tch::Tensor::from_slice(&[1f32, 2., 3., 4., 5., 6., 7., 8.]).reshape([2, 4]);
+        shift_samples(&mut data, 2, 1)?;
+        let rows: Vec<Vec<f32>> = (0..2)
+            .map(|c| Vec::<f32>::try_from(data.get(c)))
+            .collect::<Result<_, _>>()?;
+        assert_eq!(rows, vec![vec![0., 1., 2., 4.], vec![0., 5., 6., 8.]]);
+        assert!(shift_samples(&mut data, 3, 2).is_err());
         Ok(())
     }
 

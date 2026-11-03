@@ -767,6 +767,10 @@ pub enum DecodeResult {
         stream_index: usize,
         /// The sample rate
         sample_rate: usize,
+        /// Presentation timestamp (seconds) of the first sample of `data`,
+        /// on the clock of the video's `pts`; `None` when no sample was
+        /// decoded. Sample `i` is at `start_time + i / sample_rate`.
+        start_time: Option<f64>,
     },
 }
 
@@ -785,6 +789,7 @@ impl DecodeResult {
                 data,
                 decoded_frames,
                 frame_pts,
+                start_time: _,
             } => DecodeResult::Video {
                 data: PyTensor(
                     data.map(|d| {
@@ -826,6 +831,7 @@ impl DecodeResult {
                 data,
                 decoded_frames,
                 frame_pts: _,
+                start_time,
             } => DecodeResult::Audio {
                 data: PyTensor(data.map(Ok).unwrap_or_else(|| {
                     // Audio Frames are captured in [C, T] format, concat along the temporal dimension.
@@ -844,6 +850,7 @@ impl DecodeResult {
                 stream_type,
                 stream_index,
                 sample_rate: sample_rate as usize,
+                start_time,
             },
         })
     }
