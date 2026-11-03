@@ -850,6 +850,33 @@ pub fn generate_av_click_video(
     Ok(file)
 }
 
+/// Encodes 4 s of mono 48 kHz `codec` audio into a `suffix` file, silent
+/// except for a 0.8 click (2 ms) at the start of every second of audio,
+/// with the timestamps rewritten by the `asetpts` expression `pts` (in the
+/// filter's terms: `PTS`, `T`, `TB`), e.g. `PTS+if(gte(T,1.5),0.5/TB,0)`
+/// for a 0.5 s jump after 1.5 s of audio. MPEG-TS files start at 1.4 s.
+pub fn generate_retimed_click_audio(
+    codec: &str,
+    suffix: &str,
+    pts: &str,
+) -> Result<NamedTempFile, anyhow::Error> {
+    let file = NamedTempFile::with_suffix(suffix)?;
+    let filter = format!("asetpts='{pts}'");
+    let path = file.path().to_str().context("temp path")?.to_string();
+    run_ffmpeg(&[
+        "-f",
+        "lavfi",
+        "-i",
+        "aevalsrc='if(lt(mod(t\\,1)\\,0.002)\\,0.8\\,0)':s=48000:d=4",
+        "-af",
+        &filter,
+        "-c:a",
+        codec,
+        &path,
+    ])?;
+    Ok(file)
+}
+
 /// Remuxes `input` with a display-matrix rotation of `degrees`
 /// (counterclockwise, ffprobe's `rotation`).
 pub fn make_rotated_video(input: &Path, degrees: i32) -> Result<NamedTempFile, anyhow::Error> {

@@ -256,10 +256,12 @@ class DecodeResult(TypedDict):
     # shape [T] - only set for Video Streams
     pts: NotRequired[torch.Tensor]
     # Presentation timestamp (seconds) of the first audio sample, on the clock
-    # of the video's pts; sample i is at start_time + i / sample_rate. Audio
-    # that starts after the decode's timeline (the earliest stream, or the
-    # window's start) is padded with zeros back to it. None when no sample was
-    # decoded - only set for Audio Streams
+    # of the video's pts. Audio that starts after the decode's timeline (the
+    # earliest stream, or the window's start) is padded with zeros back to it,
+    # and gaps inside the stream are filled with zeros, so sample i plays at
+    # start_time + i / sample_rate (give or take timestamp rounding and the
+    # stream's own clock drift). None when no sample was decoded - only set
+    # for Audio Streams
     start_time: NotRequired[float | None]
 
 def decode_asset(

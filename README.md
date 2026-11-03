@@ -299,9 +299,18 @@ Matroska), is preceded by exact zeros, as FFmpeg's
 `aresample=async=1:first_pts=0` places it. Sample `i` plays at the result's
 `start_time + i / sample_rate`. Audio that starts before the video is not
 trimmed, and the video's `pts` carry the video's later start. A window that
-starts after the audio does cuts the audio instead, so it is not padded. Only
-the leading offset is filled, not gaps inside the audio stream. `plan_asset`
-includes the padding in the planned shape, and the [output size
+starts after the audio does cuts the audio instead, so it is not padded.
+
+Gaps inside the audio stream, where a frame's timestamp starts more than
+10 ms after the previous frame ends (or two ticks of the stream's time base,
+if coarser), are filled with zeros too, so the audio after them plays at its
+timestamps. Each frame boundary is judged on its own, so audio whose clock
+drifts slowly against its sample rate is never padded, and smaller
+differences, from timestamp rounding, are left alone. Frames that overlap keep
+all their samples, back to back. Gaps are not filled with loudness
+normalization, whose output timestamps are not sample-accurate.
+
+`plan_asset` includes the padding in the planned shape, and the [output size
 limit](#output-size-limit) applies to it.
 
 ### `probe_asset(input: str | bytes) -> MediaMetadata`
