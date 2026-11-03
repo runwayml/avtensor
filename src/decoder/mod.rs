@@ -8367,7 +8367,6 @@ mod tests {
         // FFmpeg also pads the end of some streams) is ours.
         let n = samples.len().min(reference.len());
         assert!(samples[..n] == reference[..n], "differs from FFmpeg");
-        assert!(n + 1024 >= reference.len().min(samples.len() + 1024));
         Ok(())
     }
 
