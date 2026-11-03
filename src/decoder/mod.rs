@@ -821,9 +821,10 @@ fn align_audio_start(
 }
 
 /// Moves the first `samples` samples of each channel of a contiguous float
-/// `[C, N]` tensor `pad` samples later, and zeroes the first `pad`.
+/// `[C, N]` tensor `pad` samples later, and zeroes the first `pad`. Works on
+/// tensor views only, so frame views into the buffer stay valid.
 fn shift_samples(frame_data: &mut tch::Tensor, samples: i64, pad: i64) -> anyhow::Result<()> {
-    let (channels, capacity) = frame_data.size2()?;
+    let (_, capacity) = frame_data.size2()?;
     anyhow::ensure!(
         frame_data.kind() == tch::Kind::Float
             && frame_data.device() == tch::Device::Cpu
@@ -834,17 +835,17 @@ fn shift_samples(frame_data: &mut tch::Tensor, samples: i64, pad: i64) -> anyhow
         samples >= 0 && pad >= 0 && samples + pad <= capacity,
         "cannot shift {samples} samples by {pad} in a buffer of {capacity}"
     );
-    let base = frame_data.data_ptr() as *mut f32;
-    for channel in 0..channels {
-        // SAFETY: the tensor is a contiguous [channels, capacity] f32 buffer,
-        // and both ranges lie within this channel's row (checked above).
-        // `copy` allows the overlap.
-        unsafe {
-            let row = base.add((channel * capacity) as usize);
-            std::ptr::copy(row, row.add(pad as usize), samples as usize);
-            std::ptr::write_bytes(row, 0, pad as usize);
-        }
+    if pad == 0 {
+        return Ok(());
     }
+    if samples > 0 {
+        // The source and destination ranges overlap, so copy the samples
+        // out first; audio buffers are small enough that the copy is cheap.
+        let moved = frame_data.f_narrow(1, 0, samples)?.copy();
+        frame_data.f_narrow(1, pad, samples)?.f_copy_(&moved)?;
+    }
+    // `zero_` works in place and returns the view it zeroed; nothing to keep.
+    let _ = frame_data.f_narrow(1, 0, pad)?.f_zero_()?;
     Ok(())
 }
 
