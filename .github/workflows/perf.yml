@@ -88,7 +88,9 @@ jobs:
           if maturin build --locked --release --strip -o /tmp/wheel-base/ -i "$PWD/.venv/bin/python"; then
             echo "built=true" >> "$GITHUB_OUTPUT"
           else
-            echo "::warning::merge-base failed to build; skipping perf comparison"
+            # e.g. a PR that moves TORCH_VERSION to a torch the merge-base
+            # cannot build against has no baseline to compare with.
+            echo "::warning::merge-base failed to build against torch ${TORCH_VERSION}; skipping perf comparison"
             echo "built=false" >> "$GITHUB_OUTPUT"
           fi
           git checkout --quiet -

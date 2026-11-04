@@ -6322,7 +6322,11 @@ mod tests {
     // TODO (rikheijdens): It is not entirely clear to me why we need more lenient thresholds
     // for the center and LFE channel. Is there any chance we need to normalize the energy/loudness of
     // individual channels?
-    #[test_case(ChannelLayout::Surround5_1, vec![15., 150., 9500., 15., 15.]; "5.1 surround")]
+    // The AAC fixture is encoded and decoded on the host, and FFmpeg's float
+    // AAC paths differ in the last bits between x86_64 and aarch64 (SIMD vs
+    // NEON). Measured distances per channel, x86_64 / aarch64: 13.0 / 13.5,
+    // 143 / 140, 9301 / 9295, 7.7 / 18.0, 11.4 / 20.3 (stable across runs).
+    #[test_case(ChannelLayout::Surround5_1, vec![15., 150., 9500., 25., 25.]; "5.1 surround")]
     fn test_decode_multi_channel_audio(
         channel_layout: ChannelLayout,
         distance_thresholds: Vec<f64>,
@@ -6380,6 +6384,7 @@ mod tests {
         // For the test video, audio across all channels should be duplicated, verify this is the case.
         // To check whether audio is similar we compute mel spectrograms, we then require the euclidean distance
         // between the spectrograms to be below a certain threshold.
+        let mut distances = Vec::new();
         for channel in 1..num_channels {
             let channel_data = data.get(channel as i64);
             let mel_spec = create_mel_spectrogram(&channel_data, &mel_config)?;
@@ -6405,8 +6410,17 @@ mod tests {
                 channel,
                 dist
             );
-            assert!(dist < distance_thresholds[channel - 1], "Sum of absolute differences between mel spectrograms of channel #0 and channel #{channel} is too high: {dist}")
+            distances.push((channel, dist));
         }
+        // Check every channel before failing, so one run reports them all.
+        let too_high: Vec<_> = distances
+            .iter()
+            .filter(|(channel, dist)| *dist >= distance_thresholds[channel - 1])
+            .collect();
+        assert!(
+            too_high.is_empty(),
+            "Sum of absolute differences between mel spectrograms of channel #0 and channels {too_high:?} is too high; all (channel, distance): {distances:?}"
+        );
         Ok(())
     }
 
