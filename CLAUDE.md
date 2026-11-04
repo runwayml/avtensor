@@ -12,7 +12,10 @@ generated locally with FFmpeg; end-to-end cloud-storage tests live in the
 consuming project.
 
 `tch` comes from crates.io; its version maps 1:1 to a libtorch version
-(0.24.0 ↔ torch 2.11, 0.26.0 ↔ torch 2.13). `Cargo.toml` accepts a range
+(0.24.0 ↔ torch 2.11, 0.26.0 ↔ torch 2.13).
+`torch-sys` 0.26.0 is vendored in `third_party/torch-sys` (patched for torch
+2.14, see its `PATCHES.md`) and wired in with `[patch.crates-io]`, so the
+same tree builds against torch 2.13 and 2.14. `Cargo.toml` accepts a range
 so one source tree builds against either torch; `Cargo.lock` holds the
 default. To build against another torch, run
 `cargo update -p tch -p torch-sys --precise <version>` (keep `tch` and

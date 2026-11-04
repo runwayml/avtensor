@@ -1,12 +1,13 @@
 name: Release wheel
 
-# Builds a wheel linked against a specific CUDA build of torch (linking needs
-# no GPU, so standard runners work). Triggered by version tags (v*) or
-# manually with a torch/CUDA override. The full test suite gates the build,
-# and the wheel is attached to the GitHub release.
+# Builds wheels linked against a specific CUDA build of torch (linking needs
+# no GPU, so standard runners work), one per architecture: x86_64 and
+# aarch64, each on a native runner. Triggered by version tags (v*) or
+# manually with a torch/CUDA override. The full test suite gates each build,
+# and the wheels are attached to the GitHub release.
 #
 # Consumers that mirror wheels elsewhere (e.g. an internal package bucket)
-# should copy the release asset from their own infrastructure.
+# should copy the release assets from their own infrastructure.
 
 on:
   push:
@@ -15,29 +16,40 @@ on:
     inputs:
       torch_version:
         description: "torch version to link against"
-        default: "2.13.0"
+        default: "2.14.1"
         required: true
       cuda_tag:
         description: "CUDA tag of the torch build (pip index suffix)"
-        default: "cu130"
+        default: "cu132"
         required: true
 
 env:
   LIBTORCH_USE_PYTORCH: "1"
   LIBTORCH_STATIC: "0"
+  # tch 0.26 targets torch 2.13; the vendored torch-sys (third_party/) builds
+  # against 2.14 too, so its version check is bypassed.
+  LIBTORCH_BYPASS_VERSION_CHECK: "1"
   FFMPEG_PKG_CONFIG_PATH: /opt/ffmpeg/lib/pkgconfig
-  TORCH_VERSION: ${{ inputs.torch_version || '2.13.0' }}
-  CUDA_TAG: ${{ inputs.cuda_tag || 'cu130' }}
+  TORCH_VERSION: ${{ inputs.torch_version || '2.14.1' }}
+  CUDA_TAG: ${{ inputs.cuda_tag || 'cu132' }}
   # Keep in sync with the pin in ci.yml.
   FFMPEG_RELEASE: autobuild-2026-07-31-14-10
-  FFMPEG_BUILD: ffmpeg-n7.1.5-12-g1fdbca85aa-linux64-gpl-shared-7.1
-  FFMPEG_SHA256: df7e15a2d2fe0ee15ae36e0e3b83596dd088ee0a0767874241d9a54380df0add
+  FFMPEG_VERSION: ffmpeg-n7.1.5-12-g1fdbca85aa
 
 jobs:
-  release:
-    runs-on: ubuntu-24.04
-    permissions:
-      contents: write # create the GitHub release
+  wheel:
+    strategy:
+      matrix:
+        include:
+          - arch: x86_64
+            runner: ubuntu-24.04
+            ffmpeg_platform: linux64
+            ffmpeg_sha256: df7e15a2d2fe0ee15ae36e0e3b83596dd088ee0a0767874241d9a54380df0add
+          - arch: aarch64
+            runner: ubuntu-24.04-arm
+            ffmpeg_platform: linuxarm64
+            ffmpeg_sha256: 659a2801655f9ca187efd95e594ddb1eba9f309c809d91d3e95669a4f22469ee
+    runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
 
@@ -51,6 +63,9 @@ jobs:
           echo "$PWD/.venv/bin" >> "$GITHUB_PATH"
 
       - name: Install FFmpeg 7.1 (shared)
+        env:
+          FFMPEG_BUILD: ${{ env.FFMPEG_VERSION }}-${{ matrix.ffmpeg_platform }}-gpl-shared-7.1
+          FFMPEG_SHA256: ${{ matrix.ffmpeg_sha256 }}
         run: |
           curl -fsSL -o /tmp/ffmpeg.tar.xz "https://github.com/BtbN/FFmpeg-Builds/releases/download/${FFMPEG_RELEASE}/${FFMPEG_BUILD}.tar.xz"
           echo "${FFMPEG_SHA256}  /tmp/ffmpeg.tar.xz" | sha256sum -c -
@@ -65,6 +80,8 @@ jobs:
           toolchain: stable
 
       - uses: Swatinem/rust-cache@bc2d2e71bd35c5549942babaa51a89c586b981d1 # v2.8.1
+        with:
+          key: ${{ matrix.arch }}-torch-${{ env.TORCH_VERSION }}
 
       - name: Set library paths
         run: |
@@ -76,7 +93,18 @@ jobs:
         run: make test
 
       - name: Build wheel
-        run: maturin build --release -o wheelhouse/ -i "$PWD/.venv/bin/python"
+        run: maturin build --locked --release -o wheelhouse/ -i "$PWD/.venv/bin/python"
+
+      - name: Check the wheel binds the intended torch
+        run: |
+          uv pip install --python .venv/bin/python --no-deps wheelhouse/avtensor-*.whl
+          python - <<'EOF'
+          import os, torch, avtensor
+          want = os.environ["TORCH_VERSION"]
+          got = torch.__version__.split("+")[0]
+          assert got == want, f"built against torch {got}, expected {want}"
+          print("avtensor imports with torch", torch.__version__)
+          EOF
 
       - name: Stamp commit into wheel name
         run: |
@@ -86,8 +114,30 @@ jobs:
           done
           ls -la wheelhouse/
 
-      - name: Attach wheel to GitHub release
-        if: startsWith(github.ref, 'refs/tags/')
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: wheel-${{ matrix.arch }}
+          path: wheelhouse/*.whl
+          if-no-files-found: error
+
+  release:
+    needs: [wheel]
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write # create the GitHub release
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          pattern: wheel-*
+          path: wheelhouse/
+          merge-multiple: true
+
+      - name: Attach wheels to GitHub release
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release create "${GITHUB_REF_NAME}" wheelhouse/*.whl --title "${GITHUB_REF_NAME}" --generate-notes || gh release upload "${GITHUB_REF_NAME}" wheelhouse/*.whl
+          GH_REPO: ${{ github.repository }}
+        run: |
+          ls -la wheelhouse/
+          gh release create "${GITHUB_REF_NAME}" wheelhouse/*.whl --title "${GITHUB_REF_NAME}" --generate-notes \
+            || gh release upload "${GITHUB_REF_NAME}" wheelhouse/*.whl

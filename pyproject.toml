@@ -1,13 +1,13 @@
 [[tool.uv.index]]
 name = "pytorch"
-url = "https://download.pytorch.org/whl/cu130"
+url = "https://download.pytorch.org/whl/cu132"
 explicit = true
 
 [tool.uv.sources]
 torch = { index = "pytorch" }
 
 [build-system]
-requires = ["maturin>=1.9,<2.0", "torch==2.13.0", "pytorch-triton", "setuptools"]
+requires = ["maturin>=1.9,<2.0", "torch==2.14.1", "pytorch-triton", "setuptools"]
 build-backend = "maturin"
 
 [project]
@@ -31,6 +31,8 @@ Repository = "https://github.com/runwayml/avtensor"
 # See: https://www.maturin.rs/config.html#configuration-keys
 [tool.maturin]
 features = ["pyo3/extension-module"]
+# The vendored torch-sys (see Cargo.toml [patch.crates-io]) must ship in the sdist.
+include = [{ path = "third_party/**/*", format = "sdist" }]
 compatibility = "linux"
 auditwheel = "skip"
 
