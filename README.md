@@ -284,9 +284,34 @@ Decodes the requested streams. Returns one result dict per decoded stream:
 | `stream_index` | index of the stream in the container | index of the stream in the container |
 | `fps` | output frame rate | — |
 | `pts` | `float64` Tensor `[T]`, presentation timestamp of each frame in seconds | — |
+| `start_time` | — | presentation timestamp of the first sample in seconds, on the clock of the video's `pts` (`None` if no sample was decoded) |
 | `sample_rate` | — | output sample rate in Hz |
 
 The GIL is released for the duration of the decode.
+
+#### Audio and video alignment
+
+Audio is laid on the same timeline as the video. The timeline starts at the
+earliest start of the decoded streams, or at the request's `start_time` when
+that is later. Audio that starts after the timeline, for example a track that
+starts 125 ms after the video (an MP4 edit list, or a later first timestamp in
+Matroska), is preceded by exact zeros, as FFmpeg's
+`aresample=async=1:first_pts=0` places it. Sample `i` plays at the result's
+`start_time + i / sample_rate`. Audio that starts before the video is not
+trimmed, and the video's `pts` carry the video's later start. A window that
+starts after the audio does cuts the audio instead, so it is not padded.
+
+Gaps inside the audio stream, where a frame's timestamp starts more than
+10 ms after the previous frame ends (or two ticks of the stream's time base,
+if coarser), are filled with zeros too, so the audio after them plays at its
+timestamps. Each frame boundary is judged on its own, so audio whose clock
+drifts slowly against its sample rate is never padded, and smaller
+differences, from timestamp rounding, are left alone. Frames that overlap keep
+all their samples, back to back. Gaps are not filled with loudness
+normalization, whose output timestamps are not sample-accurate.
+
+`plan_asset` includes the padding in the planned shape, and the [output size
+limit](#output-size-limit) applies to it.
 
 ### `probe_asset(input: str | bytes) -> MediaMetadata`
 
