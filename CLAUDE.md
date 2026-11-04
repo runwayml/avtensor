@@ -11,15 +11,13 @@ required PyO3 workaround). Tests are self-contained — media fixtures are
 generated locally with FFmpeg; end-to-end cloud-storage tests live in the
 consuming project.
 
-`tch` comes from crates.io; its version maps 1:1 to a libtorch version
-(0.24.0 ↔ torch 2.11, 0.26.0 ↔ torch 2.13).
-`torch-sys` 0.26.0 is vendored in `third_party/torch-sys` (patched for torch
-2.14, see its `PATCHES.md`) and wired in with `[patch.crates-io]`, so the
-same tree builds against torch 2.13 and 2.14. `Cargo.toml` accepts a range
-so one source tree builds against either torch; `Cargo.lock` holds the
-default. To build against another torch, run
-`cargo update -p tch -p torch-sys --precise <version>` (keep `tch` and
-`torch-sys` on the same version).
+`tch` versions map 1:1 to a libtorch version (0.24.0 ↔ torch 2.11,
+0.26.0 ↔ torch 2.13, 0.27.0 ↔ torch 2.14). No crates.io release supports
+torch 2.14 yet, so `Cargo.toml` pins `tch` and `torch-sys` 0.27.0 to a commit
+of https://github.com/RikHeijdens/tch-rs (branch `libtorch-2.14`: upstream
+tch-rs plus only the 2.14 binding update). Move back to crates.io once
+upstream releases 2.14 support; keep `tch` and `torch-sys` on the same
+version.
 
 `build.rs` compiles `csrc/tensor_from_blob.cpp` against the libtorch headers
 (located the same way torch-sys locates them); `src/alloc.rs` uses it to give

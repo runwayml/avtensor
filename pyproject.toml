@@ -31,8 +31,6 @@ Repository = "https://github.com/runwayml/avtensor"
 # See: https://www.maturin.rs/config.html#configuration-keys
 [tool.maturin]
 features = ["pyo3/extension-module"]
-# The vendored torch-sys (see Cargo.toml [patch.crates-io]) must ship in the sdist.
-include = [{ path = "third_party/**/*", format = "sdist" }]
 compatibility = "linux"
 auditwheel = "skip"
 

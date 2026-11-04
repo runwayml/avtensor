@@ -70,7 +70,7 @@ Requirements:
 | dependency | version | notes |
 | --- | --- | --- |
 | Python | >= 3.8 (CPython) | wheel is built per Python minor version |
-| PyTorch | 2.14 by default; 2.13 also builds from the same tree (`tch` 0.26 with the vendored torch-sys in `third_party/`); 2.11 via `tch` 0.24 | linked dynamically at build time; building against 2.14 needs `LIBTORCH_BYPASS_VERSION_CHECK=1` |
+| PyTorch | 2.14 (`tch` 0.27, pinned to a fork of tch-rs with 2.14 support until upstream releases it) | linked dynamically at build time; for 2.14.1 set `LIBTORCH_BYPASS_VERSION_CHECK=1` (`tch` 0.27 checks for 2.14.0) |
 | FFmpeg | >= 7.1, shared libraries | needs `zscale`/`tonemap` filters (libzimg) for HDR input and for `color_conversion="accurate"` (the `float32` default; without libzimg, `float32` falls back to `"fast"` with a warning) |
 | Rust | stable toolchain | build-time only |
 

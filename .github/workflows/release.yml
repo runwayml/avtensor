@@ -26,8 +26,8 @@ on:
 env:
   LIBTORCH_USE_PYTORCH: "1"
   LIBTORCH_STATIC: "0"
-  # tch 0.26 targets torch 2.13; the vendored torch-sys (third_party/) builds
-  # against 2.14 too, so its version check is bypassed.
+  # tch 0.27 checks for exactly torch 2.14.0; 2.14.1 has identical operator
+  # declarations, so bypass the check.
   LIBTORCH_BYPASS_VERSION_CHECK: "1"
   FFMPEG_PKG_CONFIG_PATH: /opt/ffmpeg/lib/pkgconfig
   TORCH_VERSION: ${{ inputs.torch_version || '2.14.1' }}

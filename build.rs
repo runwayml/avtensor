@@ -114,7 +114,7 @@ fn main() {
         .warnings(false)
         .includes(&config.include_dirs)
         .file("csrc/tensor_from_blob.cpp");
-    // C++20: torch 2.14's headers require it (2.13 accepts it too).
+    // C++20: torch 2.14's headers require it.
     if env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows") {
         build.flag("/std:c++20");
     } else {
