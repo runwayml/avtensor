@@ -1,6 +1,6 @@
 [package]
 name = "avtensor"
-version = "0.6.0"
+version = "0.7.0"
 edition = "2021"
 description = "High-performance decoding of media assets to torch Tensors"
 repository = "https://github.com/runwayml/avtensor"
@@ -15,7 +15,9 @@ crate-type = ["cdylib", "lib"]
 anyhow = "1.0.98"
 aws-config = "1"
 aws-runtime = "1"
-aws-sdk-s3 = "1"
+# Default features minus `rustls`, which pulls in the legacy hyper 0.14 /
+# rustls 0.21 client next to the current default one (`default-https-client`).
+aws-sdk-s3 = { version = "1", default-features = false, features = ["default-https-client", "http-1x", "rt-tokio", "sigv4a"] }
 bytes = "1"
 derive_builder = "0.20.2"
 env_logger = {version = "0.11.8", features = ["kv"] }
