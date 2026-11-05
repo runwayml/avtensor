@@ -376,7 +376,7 @@ impl PartialEq for AudioStreamRequest {
         }
         match (&self.loudness_normalization, &other.loudness_normalization) {
             (None, None) => true,
-            (Some(l), Some(r)) => Python::with_gil(|py| *l.borrow(py) == *r.borrow(py)),
+            (Some(l), Some(r)) => Python::attach(|py| *l.borrow(py) == *r.borrow(py)),
             _ => false,
         }
     }
@@ -871,7 +871,7 @@ fn probe_asset(
 
     // Release the GIL while probing (it may perform network I/O).
     let probed = py
-        .allow_threads(move || decoder::probe_media(source, s3_config))
+        .detach(move || decoder::probe_media(source, s3_config))
         .map_err(|e| PyValueError::new_err(format!("Failed to probe media: {:?}", e)))?;
 
     Ok(MediaMetadata {
@@ -933,7 +933,7 @@ fn plan_asset(
 
     // Release the GIL while planning (it may perform network I/O).
     let plans = py
-        .allow_threads(move || decoder::plan_media(decoder_request, s3_config))
+        .detach(move || decoder::plan_media(decoder_request, s3_config))
         .map_err(|e| PyValueError::new_err(format!("Failed to plan media: {:?}", e)))?;
     Ok(plans
         .into_iter()
@@ -965,7 +965,7 @@ fn decode_asset(
     let request = decoder_request;
 
     // Release the GIL while decoding.
-    py.allow_threads(move || {
+    py.detach(move || {
         // Decode media.
         let decoded_streams = decode_media(request, s3_config)
             .map_err(|e| PyValueError::new_err(format!("Failed to decode media: {:?}", e)))?
@@ -1007,7 +1007,7 @@ fn interpolate_frames(
     let (prev, next) = (prev.0, next.0);
     // Release the GIL: the work is pure CPU on tensors we own references to.
     let out = py
-        .allow_threads(move || interpolate_rgb_pair(&prev, &next, &alphas))
+        .detach(move || interpolate_rgb_pair(&prev, &next, &alphas))
         .map_err(|e| PyValueError::new_err(format!("Failed to interpolate frames: {:?}", e)))?;
     Ok(PyTensor(out))
 }
@@ -1050,13 +1050,13 @@ fn avtensor(m: &Bound<'_, PyModule>) -> PyResult<()> {
 mod tests {
     //use crate::util::{generate_test_video_file, TestVideoParameters};
 
-    // (rikheijdens): This test is disabled because pyo3::prepare_freethreaded_python() causes the test runner to exit with SIGSEGV on shutdown.
+    // (rikheijdens): This test is disabled because Python::initialize() (formerly prepare_freethreaded_python()) causes the test runner to exit with SIGSEGV on shutdown.
     // #[test]
     // fn test_decode_asset() -> anyhow::Result<()> {
-    //     pyo3::prepare_freethreaded_python();
+    //     Python::initialize();
 
     //     let test_video = generate_test_video_file(TestVideoParameters::default())?;
-    //     Python::with_gil(|py| {
+    //     Python::attach(|py| {
     //         let request = MediaDecodeRequest::py_new(MediaInput::Uri(
     //             test_video.path().to_str().unwrap().into(),
     //         ));

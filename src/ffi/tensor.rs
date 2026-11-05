@@ -24,8 +24,10 @@ pub fn wrap_tch_err(err: tch::TchError) -> PyErr {
     PyErr::new::<PyValueError, _>(format!("{err:?}"))
 }
 
-impl<'source> FromPyObject<'source> for PyTensor {
-    fn extract_bound(ob: &Bound<'source, PyAny>) -> PyResult<Self> {
+impl<'py> FromPyObject<'_, 'py> for PyTensor {
+    type Error = PyErr;
+
+    fn extract(ob: Borrowed<'_, 'py, PyAny>) -> Result<Self, Self::Error> {
         let ptr = ob.as_ptr() as *mut tch::python::CPyObject;
         let tensor = unsafe { tch::Tensor::pyobject_unpack(ptr) };
         tensor
@@ -47,9 +49,11 @@ impl<'py> IntoPyObject<'py> for PyTensor {
         // There is no fallible alternative to ToPyObject/IntoPy at the moment so we return
         // None on errors. https://github.com/PyO3/pyo3/issues/1813
         let v = self.0.pyobject_wrap().map_or_else(
-            |_| py.None(),
-            |ptr| unsafe { PyObject::from_owned_ptr(py, ptr as *mut pyo3::ffi::PyObject) },
+            |_| py.None().into_bound(py),
+            // SAFETY: `pyobject_wrap` returns a new (owned) reference to a
+            // `torch.Tensor`, which `Bound` takes over.
+            |ptr| unsafe { Bound::from_owned_ptr(py, ptr as *mut pyo3::ffi::PyObject) },
         );
-        Ok(v.into_pyobject(py)?)
+        Ok(v)
     }
 }
