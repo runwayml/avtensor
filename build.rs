@@ -114,11 +114,12 @@ fn main() {
         .warnings(false)
         .includes(&config.include_dirs)
         .file("csrc/tensor_from_blob.cpp");
+    // C++20: torch 2.14's headers require it.
     if env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows") {
-        build.flag("/std:c++17");
+        build.flag("/std:c++20");
     } else {
         build
-            .flag("-std=c++17")
+            .flag("-std=c++20")
             .flag(format!("-D_GLIBCXX_USE_CXX11_ABI={}", config.cxx11_abi));
     }
     build.compile("avtensor_blob");

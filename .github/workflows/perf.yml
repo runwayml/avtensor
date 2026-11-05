@@ -27,7 +27,8 @@ env:
   LIBTORCH_STATIC: "0"
   LIBTORCH_BYPASS_VERSION_CHECK: "1"
   FFMPEG_PKG_CONFIG_PATH: /opt/ffmpeg/lib/pkgconfig
-  TORCH_VERSION: "2.13.0"
+  # Keep in sync with release.yml and pyproject.toml.
+  TORCH_VERSION: "2.14.1"
   # Pinned to a dated BtbN autobuild (the `latest` alias is re-published, so
   # its checksum is not stable) and verified against the checksum below.
   # NOTE: BtbN prunes dated autobuilds after ~2-4 weeks; when the download
@@ -87,7 +88,9 @@ jobs:
           if maturin build --locked --release --strip -o /tmp/wheel-base/ -i "$PWD/.venv/bin/python"; then
             echo "built=true" >> "$GITHUB_OUTPUT"
           else
-            echo "::warning::merge-base failed to build; skipping perf comparison"
+            # e.g. a PR that moves TORCH_VERSION to a torch the merge-base
+            # cannot build against has no baseline to compare with.
+            echo "::warning::merge-base failed to build against torch ${TORCH_VERSION}; skipping perf comparison"
             echo "built=false" >> "$GITHUB_OUTPUT"
           fi
           git checkout --quiet -

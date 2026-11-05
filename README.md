@@ -60,13 +60,17 @@ pip install avtensor
 
 To build a reusable wheel for deployment, use
 [maturin](https://www.maturin.rs/): `maturin build --release -o wheelhouse/`.
+Prebuilt Linux wheels (x86_64 and aarch64, CPython 3.12) linked against the
+CUDA build of PyTorch 2.14.1 (cu132) are attached to each
+[GitHub release](https://github.com/runwayml/avtensor/releases). They need
+that exact torch and a shared FFmpeg 7.1 at runtime.
 
 Requirements:
 
 | dependency | version | notes |
 | --- | --- | --- |
 | Python | >= 3.8 (CPython) | wheel is built per Python minor version |
-| PyTorch | 2.13 by default (`tch` 0.26 in `Cargo.lock`); 2.11 via `tch` 0.24 | linked dynamically at build time |
+| PyTorch | 2.14 (`tch` 0.27, pinned to a fork of tch-rs with 2.14 support until upstream releases it) | linked dynamically at build time; for 2.14.1 set `LIBTORCH_BYPASS_VERSION_CHECK=1` (`tch` 0.27 checks for 2.14.0) |
 | FFmpeg | >= 7.1, shared libraries | needs `zscale`/`tonemap` filters (libzimg) for HDR input and for `color_conversion="accurate"` (the `float32` default; without libzimg, `float32` falls back to `"fast"` with a warning) |
 | Rust | stable toolchain | build-time only |
 

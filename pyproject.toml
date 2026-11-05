@@ -1,13 +1,13 @@
 [[tool.uv.index]]
 name = "pytorch"
-url = "https://download.pytorch.org/whl/cu130"
+url = "https://download.pytorch.org/whl/cu132"
 explicit = true
 
 [tool.uv.sources]
 torch = { index = "pytorch" }
 
 [build-system]
-requires = ["maturin>=1.9,<2.0", "torch==2.13.0", "pytorch-triton", "setuptools"]
+requires = ["maturin>=1.9,<2.0", "torch==2.14.1", "pytorch-triton", "setuptools"]
 build-backend = "maturin"
 
 [project]

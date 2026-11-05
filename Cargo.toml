@@ -27,13 +27,13 @@ log = { version = "0.4.27", features = ["kv"] }
 pyo3 = "0.25.0"
 pyo3-log = "0.12.4"
 rsmpeg = { version = "0.17.0", features = ["ffmpeg7_1"] }
-# Each tch release targets one libtorch (0.24 <-> torch 2.11, 0.26 <-> torch 2.13).
-# The source builds against both; Cargo.lock picks the default, and a
-# build for another torch selects its match with
-# `cargo update -p tch -p torch-sys --precise <version>`.
-tch = { version = ">=0.24.0, <0.27", features = ["python-extension"] }
+# Each tch release targets one libtorch. No tch release supports torch 2.14
+# yet, so this pins a fork of upstream tch-rs whose only change is the 2.14
+# binding update (libtorch-2.14 branch, tch 0.27.0). Switch back to crates.io
+# once upstream releases 2.14 support.
+tch = { git = "https://github.com/RikHeijdens/tch-rs", rev = "b75d71aa421ab38983184bd71cd1708dac669fc8", features = ["python-extension"] }
 # Same version as tch; only used for the opaque `C_tensor` handle in src/alloc.rs.
-torch-sys = ">=0.24.0, <0.27"
+torch-sys = { git = "https://github.com/RikHeijdens/tch-rs", rev = "b75d71aa421ab38983184bd71cd1708dac669fc8" }
 tempfile = "3.20.0"
 thiserror = "2.0.15"
 libloading = "0.8"

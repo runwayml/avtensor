@@ -13,11 +13,13 @@ env:
   LIBTORCH_STATIC: "0"
   LIBTORCH_BYPASS_VERSION_CHECK: "1"
   FFMPEG_PKG_CONFIG_PATH: /opt/ffmpeg/lib/pkgconfig
-  TORCH_VERSION: "2.13.0"
+  # Keep in sync with release.yml and pyproject.toml.
+  TORCH_VERSION: "2.14.1"
   # Pinned to a dated BtbN autobuild (the `latest` alias is re-published, so
   # its checksum is not stable) and verified against the checksum below.
   # NOTE: BtbN prunes dated autobuilds after ~2-4 weeks; when the download
-  # 404s, re-pin to a current autobuild (keep perf.yml and release.yml in sync).
+  # 404s, re-pin to a current autobuild (keep perf.yml and release.yml in sync, including release.yml's
+  # aarch64 checksum).
   FFMPEG_RELEASE: autobuild-2026-07-31-14-10
   FFMPEG_BUILD: ffmpeg-n7.1.5-12-g1fdbca85aa-linux64-gpl-shared-7.1
   FFMPEG_SHA256: df7e15a2d2fe0ee15ae36e0e3b83596dd088ee0a0767874241d9a54380df0add
@@ -86,6 +88,58 @@ jobs:
           ruff check benchmarks/
           ruff format --check benchmarks/
           ty check
+
+  # The release builds an aarch64 wheel too; test it on every PR so arm-only
+  # breakage (e.g. NEON rounding in swscale) shows up before a release.
+  build-arm64:
+    runs-on: ubuntu-24.04-arm
+    env:
+      FFMPEG_BUILD: ffmpeg-n7.1.5-12-g1fdbca85aa-linuxarm64-gpl-shared-7.1
+      FFMPEG_SHA256: 659a2801655f9ca187efd95e594ddb1eba9f309c809d91d3e95669a4f22469ee
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - uses: astral-sh/setup-uv@f94ec6bedd8674c4426838e6b50417d36b6ab231 # v5.3.1
+
+      - name: Install torch (CPU)
+        run: |
+          uv venv --python 3.12 .venv
+          uv pip install --python .venv/bin/python --index-url https://download.pytorch.org/whl/cpu "torch==${TORCH_VERSION}"
+          uv pip install --python .venv/bin/python "maturin>=1.9,<2.0"
+          echo "$PWD/.venv/bin" >> "$GITHUB_PATH"
+
+      - name: Install FFmpeg 7.1 (shared)
+        run: |
+          curl -fsSL -o /tmp/ffmpeg.tar.xz "https://github.com/BtbN/FFmpeg-Builds/releases/download/${FFMPEG_RELEASE}/${FFMPEG_BUILD}.tar.xz"
+          echo "${FFMPEG_SHA256}  /tmp/ffmpeg.tar.xz" | sha256sum -c -
+          tar -xf /tmp/ffmpeg.tar.xz -C /tmp
+          sudo mv "/tmp/${FFMPEG_BUILD}" /opt/ffmpeg
+          echo "/opt/ffmpeg/bin" >> "$GITHUB_PATH"
+
+      - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
+        with:
+          toolchain: stable
+
+      - uses: Swatinem/rust-cache@bc2d2e71bd35c5549942babaa51a89c586b981d1 # v2.8.1
+
+      - name: Set library paths
+        run: |
+          TORCH_LIB=$(python -c "import torch, os; print(os.path.join(os.path.dirname(torch.__file__), 'lib'))")
+          echo "LD_LIBRARY_PATH=/opt/ffmpeg/lib:${TORCH_LIB}" >> "$GITHUB_ENV"
+          echo "LIBRARY_PATH=/opt/ffmpeg/lib:${TORCH_LIB}" >> "$GITHUB_ENV"
+
+      - name: Run tests
+        run: make test
+
+      - name: Build wheel
+        run: maturin build --locked --release -o wheelhouse/ -i "$PWD/.venv/bin/python"
+
+      - name: Import the wheel
+        run: |
+          uv pip install --python .venv/bin/python --no-deps wheelhouse/avtensor-*.whl
+          python -c "import torch, avtensor; print('avtensor imports with torch', torch.__version__)"
 
   coverage:
     runs-on: ubuntu-24.04
