@@ -46,7 +46,9 @@ and reproduction steps in [benchmarks/](benchmarks/):
 
 `decode_asset` and `plan_asset` can raise `MissingStreamError` when automatic
 selection finds no requested track, or `DecoderUnavailableError` when decoder
-lookup fails. Both subclass `ValueError` and preserve existing messages.
+lookup fails. `OutputLimitExceededError` reports a stream exceeding the configured
+output-byte limit, including output growth during decoding; it does not indicate
+an allocation failure. All three subclass `ValueError` and preserve existing messages.
 Other failures keep their existing types; a plain `ValueError` can also indicate
 storage, allocation, or internal errors. Planning with an explicit stream index
 does not check decoder availability.

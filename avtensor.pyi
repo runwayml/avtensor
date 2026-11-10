@@ -15,6 +15,9 @@ class MissingStreamError(ValueError):
 class DecoderUnavailableError(ValueError):
     """The installed FFmpeg build has no decoder for the selected stream."""
 
+class OutputLimitExceededError(ValueError):
+    """A stream's planned or growing output exceeds the configured byte limit."""
+
 class StreamType(Enum):
     Video = 0
     Audio = 1

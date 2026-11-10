@@ -14,16 +14,21 @@ use crate::decoder::{self, decode_media, interpolate_rgb_pair, DecodedStream, Fr
 
 pyo3::create_exception!(avtensor, MissingStreamError, PyValueError);
 pyo3::create_exception!(avtensor, DecoderUnavailableError, PyValueError);
+pyo3::create_exception!(avtensor, OutputLimitExceededError, PyValueError);
 
 #[derive(Debug, PartialEq)]
 enum MediaErrorKind {
     MissingStream,
     DecoderUnavailable,
+    OutputLimitExceeded,
 }
 
 fn media_error_kind(error: &anyhow::Error) -> Option<MediaErrorKind> {
     use decoder::StreamSelectionError;
 
+    if error.is::<decoder::OutputLimitExceeded>() {
+        return Some(MediaErrorKind::OutputLimitExceeded);
+    }
     match error.downcast_ref::<StreamSelectionError>() {
         Some(StreamSelectionError::MissingStream(_)) => return Some(MediaErrorKind::MissingStream),
         Some(StreamSelectionError::DecoderUnavailable { .. }) => {
@@ -44,11 +49,12 @@ fn media_error_kind(error: &anyhow::Error) -> Option<MediaErrorKind> {
 
 fn media_error(operation: &str, error: anyhow::Error) -> PyErr {
     // Keep existing text and ValueError catch compatibility. Only the known
-    // stream-selection failures gain more specific Python exception types.
+    // stream-selection and output-limit failures gain specific exception types.
     let message = format!("Failed to {operation} media: {error:?}");
     match media_error_kind(&error) {
         Some(MediaErrorKind::MissingStream) => MissingStreamError::new_err(message),
         Some(MediaErrorKind::DecoderUnavailable) => DecoderUnavailableError::new_err(message),
+        Some(MediaErrorKind::OutputLimitExceeded) => OutputLimitExceededError::new_err(message),
         None => PyValueError::new_err(message),
     }
 }
@@ -1080,6 +1086,10 @@ fn avtensor(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add(
         "DecoderUnavailableError",
         m.py().get_type::<DecoderUnavailableError>(),
+    )?;
+    m.add(
+        "OutputLimitExceededError",
+        m.py().get_type::<OutputLimitExceededError>(),
     )?;
     m.add_function(wrap_pyfunction!(probe_asset, m)?)?;
     m.add_function(wrap_pyfunction!(plan_asset, m)?)?;

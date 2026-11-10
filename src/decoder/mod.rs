@@ -2065,6 +2065,15 @@ struct OutputLimit {
     source: OutputLimitSource,
 }
 
+/// A configured output ceiling was exceeded, before attempting the allocation.
+#[derive(Debug, thiserror::Error)]
+#[error("output tensor for shape {shape:?} would require {bytes} bytes, exceeding {limit}")]
+pub(crate) struct OutputLimitExceeded {
+    shape: Vec<i64>,
+    bytes: u128,
+    limit: OutputLimit,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum OutputLimitSource {
     /// `MediaDecodeRequest.max_output_bytes`.
@@ -2191,9 +2200,12 @@ fn check_output_tensor_size(
             .ok_or_else(|| anyhow!("output tensor size overflow for shape {shape:?}"))?;
     }
     if total > limit.bytes {
-        return Err(anyhow!(
-            "output tensor for shape {shape:?} would require {total} bytes, exceeding {limit}"
-        ));
+        return Err(OutputLimitExceeded {
+            shape: shape.to_vec(),
+            bytes: total,
+            limit: limit.clone(),
+        }
+        .into());
     }
     Ok(())
 }
@@ -7269,6 +7281,7 @@ mod tests {
         let err = ensure_cli_capacity(&mut data, 10, 10, &limit(9 * row_bytes))
             .err()
             .context("growing past the limit must fail")?;
+        assert!(err.is::<OutputLimitExceeded>());
         assert!(
             format!("{err:#}").contains(
                 "would require 120 bytes, exceeding the request's max_output_bytes of 108"
@@ -7423,16 +7436,20 @@ mod tests {
         // 900 frames of 4K rgb24, about 22 GB: over the default, within 64 GiB.
         let shape = [900, 2160, 3840, 3];
         let error = |limit: &OutputLimit| {
-            check_output_tensor_size(&shape, 1, limit)
-                .unwrap_err()
-                .to_string()
+            let error = check_output_tensor_size(&shape, 1, limit).unwrap_err();
+            assert!(error.is::<OutputLimitExceeded>());
+            error.to_string()
         };
         let err = error(&OutputLimit::from_env(None));
         assert!(err.contains("default limit of 17179869184 bytes"), "{err}");
         assert!(err.contains("max_output_bytes"), "{err}");
         assert!(err.contains("AVTENSOR_MAX_OUTPUT_TENSOR_BYTES"), "{err}");
         check_output_tensor_size(&shape, 1, &OutputLimit::from_env(Some("64G".into()))).unwrap();
-        assert!(check_output_tensor_size(&[-1, 2], 1, &OutputLimit::resolve(Some(1))).is_err());
+        for shape in [&[-1, 2][..], &[i64::MAX, i64::MAX, i64::MAX][..]] {
+            let error =
+                check_output_tensor_size(shape, 1, &OutputLimit::resolve(Some(1))).unwrap_err();
+            assert!(!error.is::<OutputLimitExceeded>());
+        }
 
         // A value that is set but too small is named, so the error does not
         // just say to set it.
