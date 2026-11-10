@@ -26,23 +26,28 @@ enum MediaErrorKind {
 fn media_error_kind(error: &anyhow::Error) -> Option<MediaErrorKind> {
     use decoder::StreamSelectionError;
 
-    if error.is::<decoder::OutputLimitExceeded>() {
-        return Some(MediaErrorKind::OutputLimitExceeded);
-    }
-    match error.downcast_ref::<StreamSelectionError>() {
-        Some(StreamSelectionError::MissingStream(_)) => return Some(MediaErrorKind::MissingStream),
-        Some(StreamSelectionError::DecoderUnavailable { .. }) => {
+    // Follow both anyhow context and source links from other error wrappers.
+    for cause in error.chain() {
+        if cause.is::<decoder::OutputLimitExceeded>() {
+            return Some(MediaErrorKind::OutputLimitExceeded);
+        }
+        match cause.downcast_ref::<StreamSelectionError>() {
+            Some(StreamSelectionError::MissingStream(_)) => {
+                return Some(MediaErrorKind::MissingStream)
+            }
+            Some(StreamSelectionError::DecoderUnavailable { .. }) => {
+                return Some(MediaErrorKind::DecoderUnavailable);
+            }
+            None => {}
+        }
+        // Automatic stream selection can return a native decoder-not-found code.
+        // Other FFmpeg errors stay unclassified.
+        if cause
+            .downcast_ref::<rsmpeg::error::RsmpegError>()
+            .is_some_and(|error| error.raw_error() == Some(ffi::AVERROR_DECODER_NOT_FOUND))
+        {
             return Some(MediaErrorKind::DecoderUnavailable);
         }
-        None => {}
-    }
-    // Preserve a native decoder-not-found code anywhere in the error chain,
-    // including automatic stream selection. Other FFmpeg errors stay unclassified.
-    if error
-        .downcast_ref::<rsmpeg::error::RsmpegError>()
-        .is_some_and(|error| error.raw_error() == Some(ffi::AVERROR_DECODER_NOT_FOUND))
-    {
-        return Some(MediaErrorKind::DecoderUnavailable);
     }
     None
 }
@@ -957,7 +962,8 @@ fn probe_asset(
 
 /// Returns the buffers `decode_asset(request)` would allocate, without
 /// decoding. Stream selection, durations, seek window, fps and size requests
-/// are resolved by the same code as `decode_asset`.
+/// are resolved by the same code as `decode_asset`. Default decoder availability
+/// is checked without opening decoders.
 #[pyfunction]
 #[pyo3(signature = (request, *, s3_config=None))]
 fn plan_asset(
@@ -1111,11 +1117,69 @@ mod tests {
     use crate::decoder::StreamSelectionError;
     use rsmpeg::{error::RsmpegError, ffi};
 
+    #[derive(Debug, thiserror::Error)]
+    #[error("wrapped media failure")]
+    struct Wrapped<E: std::error::Error + 'static>(#[source] E);
+
+    fn assert_wrapped_kind(
+        error: impl std::error::Error + Send + Sync + 'static,
+        expected: Option<MediaErrorKind>,
+    ) {
+        let error = anyhow::Error::new(Wrapped(Wrapped(error))).context("preparing media");
+        assert_eq!(media_error_kind(&error), expected);
+    }
+
+    #[test]
+    fn stream_error_categories_survive_source_wrappers() {
+        assert_wrapped_kind(
+            StreamSelectionError::MissingStream("audio"),
+            Some(MediaErrorKind::MissingStream),
+        );
+        assert_wrapped_kind(
+            StreamSelectionError::DecoderUnavailable {
+                kind: "video",
+                index: 0,
+            },
+            Some(MediaErrorKind::DecoderUnavailable),
+        );
+        assert_wrapped_kind(
+            RsmpegError::AVError(ffi::AVERROR_DECODER_NOT_FOUND),
+            Some(MediaErrorKind::DecoderUnavailable),
+        );
+        for code in [libc::ENOMEM, libc::EIO, libc::EACCES, libc::ENOENT] {
+            assert_wrapped_kind(RsmpegError::AVError(-code), None);
+            assert_wrapped_kind(std::io::Error::from_raw_os_error(code), None);
+        }
+    }
+
+    #[test]
+    fn output_limit_category_survives_source_wrappers() -> anyhow::Result<()> {
+        use crate::decoder::{self, AudioStreamRequest, MediaDecodeRequest, MediaSource};
+        use crate::util::test_utils::generate_test_audio_file;
+        use std::time::Duration;
+
+        let audio = generate_test_audio_file(8000, Duration::from_secs(1), "pcm_s16le", ".wav")?;
+        let request = MediaDecodeRequest {
+            source: MediaSource::Uri(audio.path().to_string_lossy().into_owned()),
+            start_time: None,
+            end_time: None,
+            video_stream: None,
+            audio_streams: Some(vec![AudioStreamRequest::default()]),
+            max_output_bytes: Some(1),
+        };
+        let error = decoder::plan_media(request, None).unwrap_err();
+        assert_wrapped_kind(
+            error.downcast::<decoder::OutputLimitExceeded>().unwrap(),
+            Some(MediaErrorKind::OutputLimitExceeded),
+        );
+        Ok(())
+    }
+
     #[test]
     fn stream_error_categories_survive_context() {
         for kind in ["audio", "video"] {
             let error = anyhow::Error::new(StreamSelectionError::MissingStream(kind));
-            assert_eq!(format!("{error:?}"), format!("No {kind} stream found"));
+            assert_eq!(error.to_string(), format!("No {kind} stream found"));
             assert_eq!(
                 media_error_kind(&error.context("selecting a stream")),
                 Some(MediaErrorKind::MissingStream)
@@ -1123,7 +1187,7 @@ mod tests {
             let error =
                 anyhow::Error::new(StreamSelectionError::DecoderUnavailable { kind, index: 2 });
             assert_eq!(
-                format!("{error:?}"),
+                error.to_string(),
                 format!("Failed to find decoder for {kind} stream #2")
             );
             assert_eq!(

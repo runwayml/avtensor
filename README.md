@@ -51,8 +51,11 @@ decoder is unavailable. Missing requested hardware decoders still raise plain
 output-byte limit, including output growth during decoding; it does not indicate
 an allocation failure. All three subclass `ValueError` and preserve existing messages.
 Other failures keep their existing types; a plain `ValueError` can also indicate
-storage, allocation, or internal errors. Planning with an explicit stream index
-does not check decoder availability.
+storage, allocation, or internal errors. Planning now checks default decoder
+availability even with an explicit stream index, rejecting unsupported streams
+that previously could be planned. A successful plan does not guarantee decoding
+will succeed. `probe_asset` and `interpolate_frames` retain their existing
+exception behavior; they do not expose these typed errors.
 
 ## Installation
 
@@ -357,8 +360,9 @@ layout), `dtype`, `fps` or `sample_rate`, and the `duration_s` /
 `shape` is an upper bound on its length, except for video with
 `fps_mode="cli"`: its output grows past the plan when the CLI emits more frames
 (a file with no stored duration plans 1 frame), up to the output size limit.
-Decoders are not opened, so codec and hardware errors only surface at decode
-time.
+Default decoder availability is checked for every selected stream, including
+explicit indices. Decoders are not opened, so initialization, hardware and
+media-data errors can still surface at decode time.
 
 ### `MediaDecodeRequest(input: str | bytes)`
 
@@ -589,7 +593,7 @@ builds and tests fail without them. CI enforces all of the following:
 
 ```bash
 make test              # cargo test --no-default-features (required PyO3 workaround)
-python -m unittest discover -s tests  # Python exceptions; requires the built extension
+make test-python       # Python exceptions; requires the built extension
 cargo fmt --check
 cargo clippy --no-default-features --all-targets -- -D warnings
 

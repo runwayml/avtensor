@@ -291,7 +291,7 @@ def plan_asset(
 ) -> list[PlannedStream]:
     """Returns the buffers decode_asset(request) would allocate, without
     decoding: same stream selection, duration, seek window, fps and size
-    handling."""
+    handling. Checks default decoder availability without opening decoders."""
     ...
 
 def interpolate_frames(

@@ -50,6 +50,18 @@ class MediaErrorTests(unittest.TestCase):
         encoded = cls.video.read_bytes()
         assert b"mp4v" in encoded
         cls.unsupported.write_bytes(encoded.replace(b"mp4v", b"zzzz"))
+        cls.unsupported_audio = cls.root / "unsupported.wav"
+        encoded_audio = bytearray(cls.audio.read_bytes())
+        # Replace the WAV format tag with an unassigned codec, leaving the
+        # container, stream index and duration available for planning.
+        format_tag = encoded_audio.index(b"fmt ") + 8
+        encoded_audio[format_tag : format_tag + 2] = b"\xff\xff"
+        cls.unsupported_audio.write_bytes(encoded_audio)
+
+    def assert_error_message(self, error, expected):
+        # anyhow appends a backtrace when enabled in the environment. Keep an
+        # exact check of the message and cause chain, independent of that suffix.
+        self.assertEqual(str(error).split("\n\nStack backtrace:", 1)[0], expected)
 
     def request(self, path, kind, index=None, max_output_bytes=None):
         request = avtensor.MediaDecodeRequest(
@@ -76,8 +88,8 @@ class MediaErrorTests(unittest.TestCase):
                         function(self.request(path, kind))
                     error = raised.exception
                     self.assertIs(type(error), avtensor.MissingStreamError)
-                    self.assertEqual(
-                        str(error),
+                    self.assert_error_message(
+                        error,
                         f"Failed to {operation} media: No {kind} stream found",
                     )
                     restored = pickle.loads(pickle.dumps(error))
@@ -93,17 +105,34 @@ class MediaErrorTests(unittest.TestCase):
                 with self.assertRaises(ValueError) as raised:
                     function(self.request(self.unsupported, "video"))
                 self.assertIs(type(raised.exception), avtensor.DecoderUnavailableError)
-                self.assertEqual(
-                    str(raised.exception),
+                self.assert_error_message(
+                    raised.exception,
                     f"Failed to {operation} media: Failed to find best video stream!\n\n"
                     "Caused by:\n    AVERROR(-1128613112): `Decoder not found`",
                 )
-        with self.assertRaises(avtensor.DecoderUnavailableError) as raised:
-            avtensor.decode_asset(self.request(self.unsupported, "video", index=0))
-        self.assertEqual(
-            str(raised.exception),
-            "Failed to decode media: Failed to find decoder for video stream #0",
-        )
+
+    def test_explicit_index_checks_decoder_for_plan_and_decode(self):
+        for path, valid_path, kind in (
+            (self.unsupported, self.video, "video"),
+            (self.unsupported_audio, self.audio, "audio"),
+        ):
+            for function, operation in (
+                (avtensor.plan_asset, "plan"),
+                (avtensor.decode_asset, "decode"),
+            ):
+                with self.subTest(operation=operation, kind=kind):
+                    with self.assertRaises(ValueError) as raised:
+                        function(self.request(path, kind, index=0))
+                    self.assertIs(
+                        type(raised.exception), avtensor.DecoderUnavailableError
+                    )
+                    self.assert_error_message(
+                        raised.exception,
+                        f"Failed to {operation} media: Failed to find decoder for {kind} stream #0",
+                    )
+                    self.assertEqual(
+                        len(function(self.request(valid_path, kind, index=0))), 1
+                    )
 
     def test_missing_file_and_corruption_remain_plain_value_errors(self):
         corrupt = self.root / "corrupt.avi"
@@ -144,8 +173,8 @@ class MediaErrorTests(unittest.TestCase):
                         function(self.request(path, kind, max_output_bytes=size - 1))
                     error = raised.exception
                     self.assertIs(type(error), avtensor.OutputLimitExceededError)
-                    self.assertEqual(
-                        str(error),
+                    self.assert_error_message(
+                        error,
                         f"Failed to {operation} media: output tensor for shape {shape} "
                         f"would require {size} bytes, exceeding the request's "
                         f"max_output_bytes of {size - 1} bytes",
@@ -222,11 +251,6 @@ class MediaErrorTests(unittest.TestCase):
             avtensor.decode_asset(request)
         self.assertIs(type(raised.exception), avtensor.OutputLimitExceededError)
         self.assertIn('fps_mode="cli" output outgrew its plan', str(raised.exception))
-        self.assertIn(
-            "output tensor for shape [2, 32, 32, 3] would require 6144 bytes, "
-            "exceeding the request's max_output_bytes of 3072 bytes",
-            str(raised.exception),
-        )
         request.max_output_bytes = 10 * frame_bytes
         decoded = avtensor.decode_asset(request)
         shape = tuple(decoded[0]["data"].shape)

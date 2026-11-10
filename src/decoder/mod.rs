@@ -36,7 +36,7 @@ pub use pairwise::interpolate_rgb_pair;
 
 /// Stream-selection failures that callers can distinguish from host failures.
 #[derive(Debug, thiserror::Error)]
-pub enum StreamSelectionError {
+pub(crate) enum StreamSelectionError {
     #[error("No {0} stream found")]
     MissingStream(&'static str),
     #[error("Failed to find decoder for {kind} stream #{index}")]
@@ -1202,8 +1202,9 @@ pub fn probe_media(
 
 /// Plans a decode without decoding: opens the container, selects streams
 /// exactly as [`decode_media`] does, and returns the buffer each stream would
-/// preallocate (video first, then audio in request order). Decoders are not
-/// opened, so codec and hardware-acceleration errors only surface at decode.
+/// preallocate (video first, then audio in request order). Default decoder
+/// availability is checked, but decoders are not opened; initialization,
+/// hardware-acceleration and media-data errors can still surface at decode.
 pub fn plan_media(
     request: MediaDecodeRequest,
     s3_config: Option<S3Config>,
@@ -1798,6 +1799,10 @@ fn plan_video_stream(
         .get(video_index)
         .context("Failed to get video stream")?;
     let codecpar = video_stream.codecpar();
+    AVCodec::find_decoder(codecpar.codec_id).ok_or(StreamSelectionError::DecoderUnavailable {
+        kind: "video",
+        index: video_index,
+    })?;
     let rotate = requested_rotation(request, &codecpar)?;
     let source_frame_rate = video_stream
         .guess_framerate()
@@ -1921,6 +1926,10 @@ fn plan_audio_stream(
         .get(audio_index)
         .context("Failed to get audio stream")?;
     let codecpar = audio_stream.codecpar();
+    AVCodec::find_decoder(codecpar.codec_id).ok_or(StreamSelectionError::DecoderUnavailable {
+        kind: "audio",
+        index: audio_index,
+    })?;
 
     // Without a duration from either the stream or the container we cannot
     // tell how much to preallocate, so fail with a clear error.
