@@ -177,6 +177,62 @@ class MediaErrorTests(unittest.TestCase):
                         1,
                     )
 
+    def test_output_limit_during_decode_growth(self):
+        # Writing Matroska to a pipe leaves the duration unknown. Planning
+        # reserves one frame; decoding must grow the output as frames arrive.
+        streamed = self.root / "streamed.mkv"
+        encoded = subprocess.run(
+            [
+                "ffmpeg",
+                "-nostdin",
+                "-v",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                "color=c=red:s=32x32:r=4:d=1",
+                "-vf",
+                "setpts=2*PTS",
+                "-fps_mode",
+                "passthrough",
+                "-c:v",
+                "libx264",
+                "-preset",
+                "ultrafast",
+                "-bf",
+                "0",
+                "-map_metadata",
+                "-1",
+                "-f",
+                "matroska",
+                "pipe:1",
+            ],
+            check=True,
+            capture_output=True,
+            timeout=20,
+        )
+        streamed.write_bytes(encoded.stdout)
+        frame_bytes = 32 * 32 * 3
+        request = avtensor.MediaDecodeRequest(
+            str(streamed),
+            video_stream=avtensor.VideoStreamRequest(fps_mode="cli"),
+            max_output_bytes=frame_bytes,
+        )
+        plan = avtensor.plan_asset(request)
+        self.assertEqual(plan[0]["shape"], [1, 3, 32, 32])
+        with self.assertRaises(ValueError) as raised:
+            avtensor.decode_asset(request)
+        self.assertIs(type(raised.exception), avtensor.OutputLimitExceededError)
+        self.assertIn('fps_mode="cli" output outgrew its plan', str(raised.exception))
+        self.assertIn(
+            "output tensor for shape [2, 32, 32, 3] would require 6144 bytes, "
+            "exceeding the request's max_output_bytes of 3072 bytes",
+            str(raised.exception),
+        )
+        request.max_output_bytes = 10 * frame_bytes
+        decoded = avtensor.decode_asset(request)
+        self.assertEqual(tuple(decoded[0]["data"].shape), (7, 3, 32, 32))
+
 
 if __name__ == "__main__":
     unittest.main()

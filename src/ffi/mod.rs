@@ -36,8 +36,8 @@ fn media_error_kind(error: &anyhow::Error) -> Option<MediaErrorKind> {
         }
         None => {}
     }
-    // Automatic stream selection reports the native FFmpeg code. Do not
-    // classify other FFmpeg failures (including I/O and allocation errors).
+    // Preserve a native decoder-not-found code anywhere in the error chain,
+    // including automatic stream selection. Other FFmpeg errors stay unclassified.
     if error
         .downcast_ref::<rsmpeg::error::RsmpegError>()
         .is_some_and(|error| error.raw_error() == Some(ffi::AVERROR_DECODER_NOT_FOUND))
