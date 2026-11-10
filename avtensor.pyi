@@ -9,6 +9,12 @@ else:
 import torch
 from typing_extensions import NotRequired
 
+class MissingStreamError(ValueError):
+    """No stream of the requested media type exists during automatic selection."""
+
+class DecoderUnavailableError(ValueError):
+    """The installed FFmpeg build has no decoder for the selected stream."""
+
 class StreamType(Enum):
     Video = 0
     Audio = 1

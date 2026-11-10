@@ -34,6 +34,15 @@ mod scenecut;
 
 pub use pairwise::interpolate_rgb_pair;
 
+/// Stream-selection failures that callers can distinguish from host failures.
+#[derive(Debug, thiserror::Error)]
+pub enum StreamSelectionError {
+    #[error("No {0} stream found")]
+    MissingStream(&'static str),
+    #[error("Failed to find decoder for {kind} stream #{index}")]
+    DecoderUnavailable { kind: &'static str, index: usize },
+}
+
 struct StreamContext {
     stream_type: StreamType,
     stream_index: usize,
@@ -1384,7 +1393,7 @@ fn select_video_stream(
                     .find_best_stream(ffi::AVMEDIA_TYPE_VIDEO)
                     .context("Failed to find best video stream!")?
                     .map(|(video_index, _codecref)| video_index)
-                    .ok_or(anyhow::anyhow!("No video stream found"))?;
+                    .ok_or(StreamSelectionError::MissingStream("video"))?;
                 Some(VideoStreamRequest {
                     index: Some(index),
                     ..video_stream
@@ -1418,7 +1427,7 @@ fn select_audio_streams(
                             .find_best_stream(ffi::AVMEDIA_TYPE_AUDIO)
                             .context("Failed to find best audio stream!")?
                             .map(|(audio_index, _codecref)| audio_index)
-                            .ok_or(anyhow::anyhow!("No audio stream found"))?
+                            .ok_or(StreamSelectionError::MissingStream("audio"))?
                     }
                 };
 
@@ -1459,8 +1468,12 @@ fn init_video_stream_context(
         .get(video_index)
         .context("Failed to get video stream")?;
     let codecpar = video_stream.codecpar();
-    let default_decoder = AVCodec::find_decoder(codecpar.codec_id)
-        .with_context(|| anyhow!("Failed to find decoder for video stream #{}", video_index))?;
+    let default_decoder = AVCodec::find_decoder(codecpar.codec_id).ok_or(
+        StreamSelectionError::DecoderUnavailable {
+            kind: "video",
+            index: video_index,
+        },
+    )?;
 
     // device="cuda" decodes on NVDEC, so an unset hardware_acceleration is
     // implied; an explicit false contradicts it.
@@ -1999,8 +2012,12 @@ fn init_audio_stream_context(
         .get(audio_index)
         .context("Failed to get audio stream")?;
     let codecpar = audio_stream.codecpar();
-    let decoder = AVCodec::find_decoder(codecpar.codec_id)
-        .with_context(|| anyhow!("Failed to find decoder for audio stream #{}", audio_index))?;
+    let decoder = AVCodec::find_decoder(codecpar.codec_id).ok_or(
+        StreamSelectionError::DecoderUnavailable {
+            kind: "audio",
+            index: audio_index,
+        },
+    )?;
     let mut decode_context = AVCodecContext::new(&decoder);
 
     decode_context

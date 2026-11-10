@@ -89,6 +89,9 @@ jobs:
           ruff format --check benchmarks/
           ty check
 
+      - name: Python exception compatibility
+        run: python -m unittest discover -s tests
+
   # The release builds an aarch64 wheel too; test it on every PR so arm-only
   # breakage (e.g. NEON rounding in swscale) shows up before a release.
   build-arm64:

@@ -42,6 +42,15 @@ and reproduction steps in [benchmarks/](benchmarks/):
   <img alt="Single-decode wall time: avtensor and torchcodec are equal on full-clip decode; avtensor is 1.7-6x faster with decode-time resize" src="benchmarks/assets/single_decode_light.svg">
 </picture>
 
+## Error handling
+
+`decode_asset` and `plan_asset` can raise `MissingStreamError` when automatic
+selection finds no requested track, or `DecoderUnavailableError` when decoder
+lookup fails. Both subclass `ValueError` and preserve existing messages.
+Other failures keep their existing types; a plain `ValueError` can also indicate
+storage, allocation, or internal errors. Planning with an explicit stream index
+does not check decoder availability.
+
 ## Installation
 
 Install from PyPI with `pip install avtensor`. The package is distributed as
@@ -577,6 +586,7 @@ builds and tests fail without them. CI enforces all of the following:
 
 ```bash
 make test              # cargo test --no-default-features (required PyO3 workaround)
+python -m unittest discover -s tests  # Python exceptions; requires the built extension
 cargo fmt --check
 cargo clippy --no-default-features --all-targets -- -D warnings
 

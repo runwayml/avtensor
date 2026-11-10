@@ -12,6 +12,47 @@ pub use tensor::PyTensor;
 
 use crate::decoder::{self, decode_media, interpolate_rgb_pair, DecodedStream, Frame};
 
+pyo3::create_exception!(avtensor, MissingStreamError, PyValueError);
+pyo3::create_exception!(avtensor, DecoderUnavailableError, PyValueError);
+
+#[derive(Debug, PartialEq)]
+enum MediaErrorKind {
+    MissingStream,
+    DecoderUnavailable,
+}
+
+fn media_error_kind(error: &anyhow::Error) -> Option<MediaErrorKind> {
+    use decoder::StreamSelectionError;
+
+    match error.downcast_ref::<StreamSelectionError>() {
+        Some(StreamSelectionError::MissingStream(_)) => return Some(MediaErrorKind::MissingStream),
+        Some(StreamSelectionError::DecoderUnavailable { .. }) => {
+            return Some(MediaErrorKind::DecoderUnavailable);
+        }
+        None => {}
+    }
+    // Automatic stream selection reports the native FFmpeg code. Do not
+    // classify other FFmpeg failures (including I/O and allocation errors).
+    if error
+        .downcast_ref::<rsmpeg::error::RsmpegError>()
+        .is_some_and(|error| error.raw_error() == Some(ffi::AVERROR_DECODER_NOT_FOUND))
+    {
+        return Some(MediaErrorKind::DecoderUnavailable);
+    }
+    None
+}
+
+fn media_error(operation: &str, error: anyhow::Error) -> PyErr {
+    // Keep existing text and ValueError catch compatibility. Only the known
+    // stream-selection failures gain more specific Python exception types.
+    let message = format!("Failed to {operation} media: {error:?}");
+    match media_error_kind(&error) {
+        Some(MediaErrorKind::MissingStream) => MissingStreamError::new_err(message),
+        Some(MediaErrorKind::DecoderUnavailable) => DecoderUnavailableError::new_err(message),
+        None => PyValueError::new_err(message),
+    }
+}
+
 /// Different stream types that can be decoded.
 #[pyclass(eq, eq_int)]
 #[derive(Debug, PartialEq, Clone, Copy)]
@@ -934,7 +975,7 @@ fn plan_asset(
     // Release the GIL while planning (it may perform network I/O).
     let plans = py
         .allow_threads(move || decoder::plan_media(decoder_request, s3_config))
-        .map_err(|e| PyValueError::new_err(format!("Failed to plan media: {:?}", e)))?;
+        .map_err(|error| media_error("plan", error))?;
     Ok(plans
         .into_iter()
         .map(|plan| PlannedStream::from_plan(plan, nhwc))
@@ -968,7 +1009,7 @@ fn decode_asset(
     py.allow_threads(move || {
         // Decode media.
         let decoded_streams = decode_media(request, s3_config)
-            .map_err(|e| PyValueError::new_err(format!("Failed to decode media: {:?}", e)))?
+            .map_err(|error| media_error("decode", error))?
             .into_iter()
             .inspect(|stream| {
                 log::debug!(
@@ -1032,6 +1073,14 @@ fn avtensor(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<S3Config>()?;
     m.add_class::<StreamType>()?;
     m.add_class::<LoudnessNormalization>()?;
+    m.add(
+        "MissingStreamError",
+        m.py().get_type::<MissingStreamError>(),
+    )?;
+    m.add(
+        "DecoderUnavailableError",
+        m.py().get_type::<DecoderUnavailableError>(),
+    )?;
     m.add_function(wrap_pyfunction!(probe_asset, m)?)?;
     m.add_function(wrap_pyfunction!(plan_asset, m)?)?;
     m.add_function(wrap_pyfunction!(decode_asset, m)?)?;
@@ -1048,6 +1097,60 @@ fn avtensor(m: &Bound<'_, PyModule>) -> PyResult<()> {
 
 #[cfg(test)]
 mod tests {
+    use super::{media_error_kind, MediaErrorKind};
+    use crate::decoder::StreamSelectionError;
+    use rsmpeg::{error::RsmpegError, ffi};
+
+    #[test]
+    fn stream_error_categories_survive_context() {
+        for kind in ["audio", "video"] {
+            let error = anyhow::Error::new(StreamSelectionError::MissingStream(kind));
+            assert_eq!(format!("{error:?}"), format!("No {kind} stream found"));
+            assert_eq!(
+                media_error_kind(&error.context("selecting a stream")),
+                Some(MediaErrorKind::MissingStream)
+            );
+            let error =
+                anyhow::Error::new(StreamSelectionError::DecoderUnavailable { kind, index: 2 });
+            assert_eq!(
+                format!("{error:?}"),
+                format!("Failed to find decoder for {kind} stream #2")
+            );
+            assert_eq!(
+                media_error_kind(&error.context("initializing a stream")),
+                Some(MediaErrorKind::DecoderUnavailable)
+            );
+        }
+        let error = anyhow::Error::new(RsmpegError::AVError(ffi::AVERROR_DECODER_NOT_FOUND))
+            .context("Failed to find best video stream!");
+        assert_eq!(
+            media_error_kind(&error),
+            Some(MediaErrorKind::DecoderUnavailable)
+        );
+    }
+
+    #[test]
+    fn host_and_unclassified_errors_keep_their_category() {
+        for code in [libc::ENOMEM, libc::EIO, libc::EACCES, libc::ENOENT] {
+            let error = anyhow::Error::new(RsmpegError::AVError(-code))
+                .context("Failed to find best video stream!");
+            assert_eq!(media_error_kind(&error), None);
+            let error = anyhow::Error::new(std::io::Error::from_raw_os_error(code))
+                .context("opening reader");
+            assert_eq!(media_error_kind(&error), None);
+        }
+        for message in [
+            "No audio stream found",
+            "No video stream found",
+            "Decoder not found",
+            "allocating output Tensor",
+            "filter graph missing for graph-path stream",
+        ] {
+            // Text alone must never select a specialized exception.
+            assert_eq!(media_error_kind(&anyhow::anyhow!(message)), None);
+        }
+    }
+
     //use crate::util::{generate_test_video_file, TestVideoParameters};
 
     // (rikheijdens): This test is disabled because pyo3::prepare_freethreaded_python() causes the test runner to exit with SIGSEGV on shutdown.
