@@ -109,15 +109,30 @@ pub struct VideoStreamRequest {
     /// 0.99615).
     #[pyo3(get, set)]
     color_conversion: Option<String>,
-    /// Resampling kernel for `width`/`height` resizes: "bicubic" (the
-    /// default), "nearest", "bilinear", "lanczos" or "area". Applied by
-    /// swscale with color_conversion="fast" and by zimg with "accurate";
-    /// zimg has no "area" kernel, so that pair is an error. Ignored when
-    /// neither `width` nor `height` is set. Not supported with
-    /// device="cuda" (NVDEC's scaler resizes there); with
-    /// hardware_acceleration=True the whole resize runs on the CPU.
+    /// Resampling kernel for `width`/`height` resizes; unset is bicubic.
+    /// libswscale kernels: "nearest", "fast_bilinear", "bilinear",
+    /// "bicubic", "bicublin", "experimental", "area", "gauss", "sinc",
+    /// "lanczos", "spline". zimg kernels: "nearest", "bilinear", "bicubic",
+    /// "lanczos", "spline16", "spline36". The resize runs in zimg with
+    /// color_conversion="accurate" (except with fps_conversion="blend" or
+    /// "motion" on non-tone-mapped sources) and in libswscale otherwise; a
+    /// kernel that library lacks is an error. Ignored when neither `width`
+    /// nor `height` is set. Not supported with device="cuda" (NVDEC's scaler
+    /// resizes there); with hardware_acceleration=True the whole resize runs
+    /// on the CPU.
     #[pyo3(get, set)]
     resize_filter: Option<String>,
+    /// First kernel parameter: B for "bicubic"/"bicublin" (default 0), the
+    /// taps for "lanczos" (default 3), the sharpness for "gauss" (default
+    /// 3), the exponent for "experimental" (default 1). Needs
+    /// `resize_filter`; an error for other kernels.
+    #[pyo3(get, set)]
+    resize_param_a: Option<f64>,
+    /// Second kernel parameter: C for "bicubic"/"bicublin" (default 0.6 in
+    /// libswscale, 0.5 in zimg). Needs `resize_filter`; an error for other
+    /// kernels.
+    #[pyo3(get, set)]
+    resize_param_b: Option<f64>,
     /// How `fps` resampling builds each output frame: "nearest" (the
     /// default) keeps the nearest source frame, dropping or repeating
     /// whole frames; "blend" cross-fades the two neighbouring frames;
@@ -176,7 +191,7 @@ impl VideoStreamRequest {
 #[pymethods]
 impl VideoStreamRequest {
     #[new]
-    #[pyo3(signature = (*, index=None, width=None, height=None, fps=None, number_of_threads=None, hardware_acceleration=None, dimension_order=None, device=None, dtype=None, hdr_mode=None, color_conversion=None, resize_filter=None, fps_conversion=None, scene_cuts=None, autorotate=None, fps_mode=None))]
+    #[pyo3(signature = (*, index=None, width=None, height=None, fps=None, number_of_threads=None, hardware_acceleration=None, dimension_order=None, device=None, dtype=None, hdr_mode=None, color_conversion=None, resize_filter=None, resize_param_a=None, resize_param_b=None, fps_conversion=None, scene_cuts=None, autorotate=None, fps_mode=None))]
     #[allow(clippy::too_many_arguments)]
     pub fn py_new(
         index: Option<usize>,
@@ -191,6 +206,8 @@ impl VideoStreamRequest {
         hdr_mode: Option<String>,
         color_conversion: Option<String>,
         resize_filter: Option<String>,
+        resize_param_a: Option<f64>,
+        resize_param_b: Option<f64>,
         fps_conversion: Option<String>,
         scene_cuts: Option<String>,
         autorotate: Option<bool>,
@@ -209,6 +226,8 @@ impl VideoStreamRequest {
             hdr_mode,
             color_conversion,
             resize_filter,
+            resize_param_a,
+            resize_param_b,
             fps_conversion,
             scene_cuts,
             autorotate,
@@ -264,6 +283,8 @@ impl VideoStreamRequest {
                 .as_deref()
                 .map(decoder::ResizeFilter::try_from)
                 .transpose()?,
+            resize_param_a: self.resize_param_a,
+            resize_param_b: self.resize_param_b,
             fps_conversion: decoder::FpsConversion::try_from(self.fps_conversion.as_deref())?,
             scene_cuts: decoder::SceneCuts::try_from(self.scene_cuts.as_deref())?,
             autorotate: self.autorotate.unwrap_or(false),

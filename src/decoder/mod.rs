@@ -260,6 +260,12 @@ pub struct VideoStreamRequest {
     /// `device` (NVDEC's own scaler resizes there). With
     /// `hardware_acceleration`, it keeps NVDEC from pre-resizing.
     pub resize_filter: Option<ResizeFilter>,
+    /// Kernel parameters (swscale `param0`/`param1`, zimg
+    /// `param_a`/`param_b`); see [`ResizeFilter`] for what each kernel
+    /// reads. Need `resize_filter`; a parameter the kernel does not read is
+    /// an error.
+    pub resize_param_a: Option<f64>,
+    pub resize_param_b: Option<f64>,
     /// How `frame_rate` resampling builds each output frame. Ignored when
     /// `frame_rate` is unset.
     pub fps_conversion: FpsConversion,
@@ -1695,6 +1701,7 @@ fn init_video_stream_context(
             video_filter.fps_conversion = FpsConversion::Nearest;
         }
     }
+    video_filter.check_resize()?;
 
     log::debug!(
         "Allocating Tensor with shape {:?} to decode video to.",
@@ -1735,7 +1742,7 @@ fn init_video_stream_context(
         stream_type: StreamType::Video,
         stream_index: video_index,
         dec_ctx: decode_context,
-        filter_config: FilterConfig::Video(video_filter),
+        filter_config: FilterConfig::Video(Box::new(video_filter)),
         frame_data: dest,
         metadata: plan.metadata,
         cfr,
@@ -4152,28 +4159,81 @@ impl ColorConversion {
     }
 }
 
-/// Resampling kernel for resizes. The fast conversion resizes in swscale's
-/// `scale` filter (`flags`), the accurate one in zimg (`zscale`'s `filter`).
+/// Resampling kernel for resizes: every libswscale kernel (the `scale`
+/// filter's `flags`) plus zimg's splines (the `zscale` filter's `filter`).
+/// A resize runs in zimg with the accurate conversion and in swscale
+/// otherwise (see [`VideoFilterConfig::resizes_in_zscale`]), so a kernel
+/// only one library has is rejected on the other's path.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ResizeFilter {
     Nearest,
+    FastBilinear,
     Bilinear,
+    /// `resize_param_a`/`resize_param_b` are B and C. Defaults differ:
+    /// swscale B=0, C=0.6; zimg B=0, C=0.5.
     Bicubic,
-    Lanczos,
-    /// Pixel-area averaging. swscale only: rejected with the accurate
-    /// conversion, as zimg has no such kernel.
+    /// swscale's bicubic luma with bilinear chroma; params as `Bicubic`.
+    Bicublin,
+    /// swscale's raised-cosine kernel; `resize_param_a` is its exponent
+    /// (default 1).
+    Experimental,
+    /// Pixel-area averaging when downscaling; swscale upscales it bilinearly.
     Area,
+    /// `resize_param_a` is the sharpness (default 3).
+    Gauss,
+    Sinc,
+    /// `resize_param_a` is the number of taps (default 3).
+    Lanczos,
+    /// swscale's natural bicubic spline.
+    Spline,
+    /// zimg's 4-tap spline.
+    Spline16,
+    /// zimg's 6-tap spline.
+    Spline36,
 }
 
 impl ResizeFilter {
-    /// The `scale` filter's `flags` value.
-    fn swscale_flags(self) -> &'static str {
+    const ALL: [Self; 13] = [
+        Self::Nearest,
+        Self::FastBilinear,
+        Self::Bilinear,
+        Self::Bicubic,
+        Self::Bicublin,
+        Self::Experimental,
+        Self::Area,
+        Self::Gauss,
+        Self::Sinc,
+        Self::Lanczos,
+        Self::Spline,
+        Self::Spline16,
+        Self::Spline36,
+    ];
+
+    /// The request value.
+    fn name(self) -> &'static str {
         match self {
-            Self::Nearest => "neighbor",
+            Self::Nearest => "nearest",
+            Self::FastBilinear => "fast_bilinear",
             Self::Bilinear => "bilinear",
             Self::Bicubic => "bicubic",
-            Self::Lanczos => "lanczos",
+            Self::Bicublin => "bicublin",
+            Self::Experimental => "experimental",
             Self::Area => "area",
+            Self::Gauss => "gauss",
+            Self::Sinc => "sinc",
+            Self::Lanczos => "lanczos",
+            Self::Spline => "spline",
+            Self::Spline16 => "spline16",
+            Self::Spline36 => "spline36",
+        }
+    }
+
+    /// The `scale` filter's `flags` value; `None` when swscale lacks it.
+    fn swscale_flags(self) -> Option<&'static str> {
+        match self {
+            Self::Nearest => Some("neighbor"),
+            Self::Spline16 | Self::Spline36 => None,
+            other => Some(other.name()),
         }
     }
 
@@ -4181,10 +4241,19 @@ impl ResizeFilter {
     fn zscale_filter(self) -> Option<&'static str> {
         match self {
             Self::Nearest => Some("point"),
-            Self::Bilinear => Some("bilinear"),
-            Self::Bicubic => Some("bicubic"),
-            Self::Lanczos => Some("lanczos"),
-            Self::Area => None,
+            Self::Bilinear | Self::Bicubic | Self::Lanczos | Self::Spline16 | Self::Spline36 => {
+                Some(self.name())
+            }
+            _ => None,
+        }
+    }
+
+    /// How many of `resize_param_a`/`resize_param_b` the kernel reads.
+    fn param_count(self) -> usize {
+        match self {
+            Self::Bicubic | Self::Bicublin => 2,
+            Self::Experimental | Self::Gauss | Self::Lanczos => 1,
+            _ => 0,
         }
     }
 }
@@ -4193,17 +4262,19 @@ impl TryFrom<&str> for ResizeFilter {
     type Error = anyhow::Error;
 
     fn try_from(value: &str) -> Result<Self, Self::Error> {
-        match value {
-            "nearest" => Ok(Self::Nearest),
-            "bilinear" => Ok(Self::Bilinear),
-            "bicubic" => Ok(Self::Bicubic),
-            "lanczos" => Ok(Self::Lanczos),
-            "area" => Ok(Self::Area),
-            other => Err(anyhow!(
-                "resize_filter must be \"nearest\", \"bilinear\", \"bicubic\", \
-                 \"lanczos\" or \"area\", got {other:?}"
-            )),
-        }
+        Self::ALL
+            .into_iter()
+            .find(|filter| filter.name() == value)
+            .ok_or_else(|| {
+                let names: Vec<_> = Self::ALL
+                    .iter()
+                    .map(|f| format!("{:?}", f.name()))
+                    .collect();
+                anyhow!(
+                    "resize_filter must be one of {}, got {value:?}",
+                    names.join(", ")
+                )
+            })
     }
 }
 
@@ -4408,6 +4479,8 @@ pub struct VideoFilterConfig {
     /// Resampling kernel for `width`/`height` resizes; `None` leaves the
     /// historical filter strings (bicubic) unchanged.
     resize_filter: Option<ResizeFilter>,
+    /// The kernel's `resize_param_a`/`resize_param_b`.
+    resize_params: [Option<f64>; 2],
     /// Pixel layout of the frames entering the graph (accurate path only).
     source_format: SourceFormat,
     /// How `frame_rate` resampling builds each output frame.
@@ -4451,24 +4524,33 @@ impl Display for VideoFilterConfig {
         // chain: swscale would resize in YUV first, which reintroduces its
         // bias and can hand zimg a subsampled frame it rejects (e.g. 4:2:0 at
         // 853x480).
-        let zscale_size = || {
-            let mut size = String::new();
+        let resizing = self.width.is_some() || self.height.is_some();
+        // The kernel and parameters the resize uses (`check_resize` rejects
+        // a kernel the resizing library lacks).
+        let resize_filter = self.resize_filter.filter(|_| resizing);
+        let resize_params = || {
+            self.resize_params
+                .iter()
+                .enumerate()
+                .filter_map(|(i, param)| param.filter(|_| resizing).map(|p| (i, p)))
+        };
+        // Options of the zscale that resizes: kernel, parameters, size.
+        let zscale_resize = || {
+            let filter = resize_filter
+                .and_then(ResizeFilter::zscale_filter)
+                .unwrap_or("bicubic");
+            let mut options = format!("f={filter}");
+            for (i, param) in resize_params() {
+                options.push_str(&format!(":param_{}={param}", ["a", "b"][i]));
+            }
             if let Some(width) = self.width {
-                size.push_str(&format!(":w={width}"));
+                options.push_str(&format!(":w={width}"));
             }
             if let Some(height) = self.height {
-                size.push_str(&format!(":h={height}"));
+                options.push_str(&format!(":h={height}"));
             }
-            size
+            options
         };
-        let resizing = self.width.is_some() || self.height.is_some();
-        // The kernel of the zscale that resizes (`try_from` rejects a
-        // `resize_filter` zimg lacks).
-        let zscale_resize_filter = self
-            .resize_filter
-            .filter(|_| resizing)
-            .and_then(ResizeFilter::zscale_filter)
-            .unwrap_or("bicubic");
         let source = &self.source_format;
 
         let mut scales = Vec::new();
@@ -4478,8 +4560,11 @@ impl Display for VideoFilterConfig {
         if let Some(height) = self.height {
             scales.push(format!("height={}", height));
         }
-        if let Some(resize_filter) = self.resize_filter.filter(|_| resizing) {
-            scales.push(format!("flags={}", resize_filter.swscale_flags()));
+        if let Some(flags) = resize_filter.and_then(ResizeFilter::swscale_flags) {
+            scales.push(format!("flags={flags}"));
+        }
+        for (i, param) in resize_params() {
+            scales.push(format!("param{i}={param}"));
         }
         if resizing && !accurate {
             filters.push(format!("scale={}", scales.join(":")));
@@ -4511,7 +4596,7 @@ impl Display for VideoFilterConfig {
             // `setparams` above.
             let mut linearize = "zscale=t=linear:npl=100".to_string();
             if accurate {
-                linearize.push_str(&format!(":f={zscale_resize_filter}{}", zscale_size()));
+                linearize.push_str(&format!(":{}", zscale_resize()));
             }
             filters.push(linearize);
             // 2. Convert to float for precision during tone mapping
@@ -4542,7 +4627,7 @@ impl Display for VideoFilterConfig {
             let mut zscale = if tonemap {
                 "zscale=f=bicubic".to_string()
             } else {
-                format!("zscale=f={zscale_resize_filter}{}", zscale_size())
+                format!("zscale={}", zscale_resize())
             };
             // (`min` overrides frame tags, so it must not undo the HDR
             // default set by `setparams`.)
@@ -4595,6 +4680,61 @@ impl VideoFilterConfig {
             ..self.clone()
         }
     }
+
+    /// Whether the resize runs in zimg rather than swscale: with the
+    /// accurate conversion, except in the motion stage's input graph for
+    /// non-tone-mapped sources (see [`Self::motion_input`]).
+    fn resizes_in_zscale(&self) -> bool {
+        let tonemap = self.source_color.is_hdr() && self.hdr_mode == HdrMode::Tonemap;
+        self.color_conversion == ColorConversion::Accurate && (tonemap || !self.uses_motion_stage())
+    }
+
+    /// Rejects a resize kernel or parameter the resize cannot apply. Needs
+    /// the final config (source color, effective `fps_conversion`), which
+    /// decides the library that resizes.
+    fn check_resize(&self) -> anyhow::Result<()> {
+        let [param_a, param_b] = self.resize_params;
+        let Some(filter) = self.resize_filter else {
+            if param_a.is_some() || param_b.is_some() {
+                bail!("resize_param_a/resize_param_b need resize_filter");
+            }
+            return Ok(());
+        };
+        let name = filter.name();
+        for (label, param, index) in [("a", param_a, 0), ("b", param_b, 1)] {
+            let Some(value) = param else { continue };
+            if filter.param_count() <= index {
+                bail!("resize_filter={name:?} does not take resize_param_{label}");
+            }
+            if !value.is_finite() {
+                bail!("resize_param_{label} must be finite, got {value}");
+            }
+        }
+        // swscale asserts on a non-positive Lanczos size.
+        if filter == ResizeFilter::Lanczos && param_a.is_some_and(|taps| taps <= 0.0) {
+            bail!("resize_filter=\"lanczos\" needs resize_param_a (taps) > 0");
+        }
+        if self.width.is_none() && self.height.is_none() {
+            return Ok(());
+        }
+        if self.resizes_in_zscale() {
+            if filter.zscale_filter().is_none() {
+                bail!(
+                    "resize_filter={name:?} is a libswscale kernel, but this request \
+                     resizes in zimg (color_conversion=\"accurate\"); use \
+                     color_conversion=\"fast\" or a zimg kernel"
+                );
+            }
+        } else if filter.swscale_flags().is_none() {
+            bail!(
+                "resize_filter={name:?} is a zimg kernel, but this request resizes \
+                 in libswscale; use color_conversion=\"accurate\" (without \
+                 fps_conversion=\"blend\"/\"motion\" on non-tone-mapped sources) or a \
+                 libswscale kernel"
+            );
+        }
+        Ok(())
+    }
 }
 
 impl Default for VideoFilterConfig {
@@ -4609,6 +4749,7 @@ impl Default for VideoFilterConfig {
             hdr_mode: Default::default(),
             color_conversion: Default::default(),
             resize_filter: Default::default(),
+            resize_params: Default::default(),
             source_format: Default::default(),
             fps_conversion: Default::default(),
             scene_cuts: Default::default(),
@@ -4623,18 +4764,6 @@ impl TryFrom<&VideoStreamRequest> for VideoFilterConfig {
 
     fn try_from(req: &VideoStreamRequest) -> Result<Self, Self::Error> {
         let color_conversion = ColorConversion::resolve(req.color_conversion, req.dtype)?;
-        let resizing = req.width.is_some() || req.height.is_some();
-        if resizing
-            && color_conversion == ColorConversion::Accurate
-            && req
-                .resize_filter
-                .is_some_and(|f| f.zscale_filter().is_none())
-        {
-            bail!(
-                "resize_filter=\"area\" needs color_conversion=\"fast\": the \
-                 accurate conversion resizes in zimg, which has no area kernel"
-            );
-        }
         Ok(VideoFilterConfig {
             frame_rate: req.frame_rate,
             width: req.width.map(|w| w as usize),
@@ -4647,6 +4776,7 @@ impl TryFrom<&VideoStreamRequest> for VideoFilterConfig {
             hdr_mode: req.hdr_mode,
             color_conversion,
             resize_filter: req.resize_filter,
+            resize_params: [req.resize_param_a, req.resize_param_b],
             fps_conversion: req.fps_conversion,
             scene_cuts: req.scene_cuts,
             number_of_threads: req.number_of_threads,
@@ -4860,7 +4990,8 @@ fn init_filters(
             _ if !matches!(direct_path, DirectPath::Disabled) => (None, None),
             FilterConfig::Video(config) if config.uses_motion_stage() => {
                 let working_format = motion_working_format(config, &dec_ctx);
-                let input_config = FilterConfig::Video(config.motion_input(working_format));
+                let input_config =
+                    FilterConfig::Video(Box::new(config.motion_input(working_format)));
                 let FilterContext {
                     buffersrc_ctx,
                     buffersink_ctx,
@@ -5063,7 +5194,7 @@ fn init_filter<'graph>(
         match (dec_ctx.codec_type, &filter_spec) {
             (ffi::AVMEDIA_TYPE_VIDEO, FilterConfig::Video(filter_config)) => {
                 let (buffersrc_ctx, buffersink_ctx) =
-                    init_video_filter(filter_graph, dec_ctx, filter_config)?;
+                    init_video_filter(filter_graph, dec_ctx, filter_config.as_ref())?;
                 (
                     buffersrc_ctx,
                     buffersink_ctx,
@@ -5348,7 +5479,7 @@ impl AudioFilterSpec for AudioFilterConfig {
 }
 
 enum FilterConfig {
-    Video(VideoFilterConfig),
+    Video(Box<VideoFilterConfig>),
     Audio(AudioFilterConfig),
 }
 
@@ -6725,6 +6856,7 @@ mod tests {
             hdr_mode: HdrMode::Tonemap,
             color_conversion: ColorConversion::Fast,
             resize_filter: None,
+            resize_params: [None, None],
             source_format: SourceFormat::default(),
             fps_conversion: FpsConversion::Nearest,
             scene_cuts: SceneCuts::Detect,
@@ -6826,6 +6958,42 @@ mod tests {
         },
         "scale=width=640:height=360:flags=lanczos,format=pix_fmts=rgb24";
         "resize filter sets the scale filter's flags"
+    )]
+    #[test_case(
+        VideoFilterConfig {
+            width: Some(640),
+            height: Some(360),
+            resize_filter: Some(ResizeFilter::Bicubic),
+            resize_params: [Some(0.0), Some(0.5)],
+            ..Default::default()
+        },
+        "scale=width=640:height=360:flags=bicubic:param0=0:param1=0.5,format=pix_fmts=rgb24";
+        "resize params set the scale filter's params"
+    )]
+    #[test_case(
+        VideoFilterConfig {
+            color_conversion: ColorConversion::Accurate,
+            width: Some(853),
+            height: Some(480),
+            resize_filter: Some(ResizeFilter::Lanczos),
+            resize_params: [Some(4.0), None],
+            source_color: SourceColorInfo {
+                colorspace: Some("bt709".to_string()),
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+        "zscale=f=lanczos:param_a=4:w=853:h=480,format=gbrp,format=pix_fmts=rgb24";
+        "resize params set the zscale filter's params"
+    )]
+    #[test_case(
+        VideoFilterConfig {
+            resize_filter: Some(ResizeFilter::Lanczos),
+            resize_params: [Some(4.0), None],
+            ..Default::default()
+        },
+        "format=pix_fmts=rgb24";
+        "resize params without a resize are ignored"
     )]
     #[test_case(
         VideoFilterConfig {
@@ -9990,13 +10158,9 @@ mod tests {
         Ok(())
     }
 
-    /// Decodes the video stream of `path` downscaled to 320x180.
-    fn decode_downscaled(
-        path: &str,
-        resize_filter: Option<ResizeFilter>,
-        color_conversion: Option<ColorConversion>,
-        device: Option<i32>,
-    ) -> anyhow::Result<tch::Tensor> {
+    /// Decodes the video stream of `path` downscaled to 320x180 with the
+    /// other fields of `request`.
+    fn decode_downscaled(path: &str, request: VideoStreamRequest) -> anyhow::Result<tch::Tensor> {
         decode_media(
             MediaDecodeRequest {
                 source: MediaSource::Uri(path.to_string()),
@@ -10005,10 +10169,7 @@ mod tests {
                 video_stream: Some(VideoStreamRequest {
                     width: Some(320),
                     height: Some(180),
-                    resize_filter,
-                    color_conversion,
-                    device,
-                    ..Default::default()
+                    ..request
                 }),
                 audio_streams: None,
                 max_output_bytes: None,
@@ -10020,47 +10181,99 @@ mod tests {
         .context("video stream should have data")
     }
 
+    fn resize_test_video() -> anyhow::Result<tempfile::NamedTempFile> {
+        generate_test_video_file(&TestVideoParameters {
+            width: 640,
+            height: 360,
+            duration: Duration::from_secs(1),
+            pixel_format: Some("yuv420p".to_string()),
+            ..Default::default()
+        })
+    }
+
     /// An explicit bicubic matches the default bit for bit; every other
-    /// kernel changes the resized output.
+    /// kernel the resizing library has changes the output.
     #[test_case(None; "fast")]
     #[test_case(Some(ColorConversion::Accurate); "accurate")]
     fn test_resize_filter_selects_kernel(
         color_conversion: Option<ColorConversion>,
     ) -> anyhow::Result<()> {
         init_logger();
-        let test_video = generate_test_video_file(&TestVideoParameters {
-            width: 640,
-            height: 360,
-            duration: Duration::from_secs(1),
-            pixel_format: Some("yuv420p".to_string()),
-            ..Default::default()
-        })?;
+        let test_video = resize_test_video()?;
         let path = test_video.path().to_str().unwrap();
-        let default = decode_downscaled(path, None, color_conversion, None)?;
-        let bicubic = decode_downscaled(path, Some(ResizeFilter::Bicubic), color_conversion, None)?;
+        let decode = |resize_filter| {
+            decode_downscaled(
+                path,
+                VideoStreamRequest {
+                    resize_filter,
+                    color_conversion,
+                    ..Default::default()
+                },
+            )
+        };
+        let default = decode(None)?;
+        let bicubic = decode(Some(ResizeFilter::Bicubic))?;
         assert!(
             default.equal(&bicubic),
             "explicit bicubic differs from the default"
         );
 
-        let mut kernels = vec![
-            ResizeFilter::Nearest,
-            ResizeFilter::Bilinear,
-            ResizeFilter::Lanczos,
-        ];
-        if color_conversion.is_none() {
-            kernels.push(ResizeFilter::Area);
-        }
-        for kernel in kernels {
-            let output = decode_downscaled(path, Some(kernel), color_conversion, None)?;
+        let available = |kernel: &ResizeFilter| match color_conversion {
+            Some(ColorConversion::Accurate) => kernel.zscale_filter().is_some(),
+            _ => kernel.swscale_flags().is_some(),
+        };
+        for kernel in ResizeFilter::ALL.into_iter().filter(available) {
+            if kernel == ResizeFilter::Bicubic {
+                continue;
+            }
+            let output = decode(Some(kernel))?;
             assert_eq!(output.size(), default.size(), "{kernel:?}");
             assert!(!output.equal(&default), "{kernel:?} matches bicubic");
         }
         Ok(())
     }
 
-    /// zimg has no area kernel, and NVDEC resizes with its own scaler.
-    #[test_case(Some(ColorConversion::Accurate), None, "has no area kernel"; "area with accurate")]
+    /// Parameters reach the kernel: each library's documented defaults
+    /// reproduce the default output bit for bit, and other values change it.
+    #[test_case(None, ResizeFilter::Bicubic, [0.0, 0.6], [0.0, 0.5]; "fast bicubic")]
+    #[test_case(Some(ColorConversion::Accurate), ResizeFilter::Bicubic, [0.0, 0.5], [0.0, 0.6]; "accurate bicubic")]
+    #[test_case(None, ResizeFilter::Lanczos, [3.0, f64::NAN], [5.0, f64::NAN]; "fast lanczos")]
+    #[test_case(Some(ColorConversion::Accurate), ResizeFilter::Lanczos, [3.0, f64::NAN], [5.0, f64::NAN]; "accurate lanczos")]
+    #[test_case(None, ResizeFilter::Gauss, [3.0, f64::NAN], [1.0, f64::NAN]; "fast gauss")]
+    fn test_resize_params_reach_kernel(
+        color_conversion: Option<ColorConversion>,
+        kernel: ResizeFilter,
+        defaults: [f64; 2],
+        other: [f64; 2],
+    ) -> anyhow::Result<()> {
+        init_logger();
+        let test_video = resize_test_video()?;
+        let path = test_video.path().to_str().unwrap();
+        // NaN marks a parameter the kernel does not read.
+        let decode = |[a, b]: [f64; 2]| {
+            decode_downscaled(
+                path,
+                VideoStreamRequest {
+                    resize_filter: Some(kernel),
+                    resize_param_a: Some(a).filter(|a| !a.is_nan()),
+                    resize_param_b: Some(b).filter(|b| !b.is_nan()),
+                    color_conversion,
+                    ..Default::default()
+                },
+            )
+        };
+        let unset = decode([f64::NAN, f64::NAN])?;
+        assert!(
+            decode(defaults)?.equal(&unset),
+            "defaults differ from unset"
+        );
+        assert!(!decode(other)?.equal(&unset), "parameters were ignored");
+        Ok(())
+    }
+
+    /// The checks run on the decode path: a kernel the resizing library
+    /// lacks, and any kernel with `device` (NVDEC resizes there).
+    #[test_case(Some(ColorConversion::Accurate), None, "is a libswscale kernel"; "area with accurate")]
     #[test_case(None, Some(0), "does not support resize_filter"; "device")]
     fn test_resize_filter_rejected(
         color_conversion: Option<ColorConversion>,
@@ -10070,8 +10283,13 @@ mod tests {
         init_logger();
         let test_video = generate_test_video_file(&TestVideoParameters::default())?;
         let path = test_video.path().to_str().unwrap();
-        let err = match decode_downscaled(path, Some(ResizeFilter::Area), color_conversion, device)
-        {
+        let request = VideoStreamRequest {
+            resize_filter: Some(ResizeFilter::Area),
+            color_conversion,
+            device,
+            ..Default::default()
+        };
+        let err = match decode_downscaled(path, request) {
             Ok(_) => anyhow::bail!("expected the request to be rejected"),
             Err(err) => err,
         };
@@ -10080,6 +10298,68 @@ mod tests {
             "unexpected error: {err:#}"
         );
         Ok(())
+    }
+
+    fn resize_config(
+        color_conversion: ColorConversion,
+        filter: Option<ResizeFilter>,
+        params: [Option<f64>; 2],
+    ) -> VideoFilterConfig {
+        VideoFilterConfig {
+            width: Some(320),
+            height: Some(180),
+            color_conversion,
+            resize_filter: filter,
+            resize_params: params,
+            ..Default::default()
+        }
+    }
+
+    #[test_case(resize_config(ColorConversion::Fast, Some(ResizeFilter::Gauss), [Some(2.0), None]); "fast gauss sharpness")]
+    #[test_case(resize_config(ColorConversion::Fast, Some(ResizeFilter::Bicublin), [Some(0.0), Some(0.5)]); "fast bicublin b c")]
+    #[test_case(resize_config(ColorConversion::Accurate, Some(ResizeFilter::Spline36), [None, None]); "accurate spline36")]
+    #[test_case(VideoFilterConfig { width: None, height: None, ..resize_config(ColorConversion::Accurate, Some(ResizeFilter::Area), [None, None]) }; "kernel availability ignored without a resize")]
+    #[test_case(VideoFilterConfig {
+        frame_rate: Some(24.0),
+        fps_conversion: FpsConversion::Motion,
+        source_color: SourceColorInfo {
+            color_trc: Some("smpte2084".to_string()),
+            color_primaries: Some("bt2020".to_string()),
+            ..Default::default()
+        },
+        ..resize_config(ColorConversion::Accurate, Some(ResizeFilter::Spline36), [None, None])
+    }; "accurate tone-mapped motion stage resizes in zimg")]
+    fn test_check_resize_accepts(config: VideoFilterConfig) {
+        config.check_resize().unwrap();
+    }
+
+    #[test_case(resize_config(ColorConversion::Accurate, Some(ResizeFilter::Area), [None, None]), "is a libswscale kernel"; "area with accurate")]
+    #[test_case(resize_config(ColorConversion::Accurate, Some(ResizeFilter::Gauss), [None, None]), "is a libswscale kernel"; "gauss with accurate")]
+    #[test_case(resize_config(ColorConversion::Fast, Some(ResizeFilter::Spline16), [None, None]), "is a zimg kernel"; "spline16 with fast")]
+    #[test_case(VideoFilterConfig {
+        frame_rate: Some(24.0),
+        fps_conversion: FpsConversion::Motion,
+        ..resize_config(ColorConversion::Accurate, Some(ResizeFilter::Spline36), [None, None])
+    }, "is a zimg kernel"; "accurate sdr motion stage resizes in swscale")]
+    #[test_case(resize_config(ColorConversion::Fast, None, [Some(1.0), None]), "need resize_filter"; "param without kernel")]
+    #[test_case(resize_config(ColorConversion::Fast, Some(ResizeFilter::Sinc), [Some(1.0), None]), "does not take resize_param_a"; "param a for sinc")]
+    #[test_case(resize_config(ColorConversion::Fast, Some(ResizeFilter::Lanczos), [Some(3.0), Some(1.0)]), "does not take resize_param_b"; "param b for lanczos")]
+    #[test_case(resize_config(ColorConversion::Fast, Some(ResizeFilter::Lanczos), [Some(0.0), None]), "taps) > 0"; "zero lanczos taps")]
+    #[test_case(resize_config(ColorConversion::Fast, Some(ResizeFilter::Bicubic), [Some(f64::NAN), None]), "must be finite"; "nan param")]
+    fn test_check_resize_rejects(config: VideoFilterConfig, expected: &str) {
+        let err = config.check_resize().unwrap_err();
+        assert!(
+            format!("{err:#}").contains(expected),
+            "unexpected error: {err:#}"
+        );
+    }
+
+    #[test]
+    fn test_resize_filter_names_round_trip() {
+        for filter in ResizeFilter::ALL {
+            assert_eq!(ResizeFilter::try_from(filter.name()).unwrap(), filter);
+        }
+        assert!(ResizeFilter::try_from("neighbor").is_err());
     }
 
     /// The scale filter rejects BT.2020 constant-luminance input, so the
