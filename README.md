@@ -592,8 +592,8 @@ Set the environment variables from [Installation](#installation) first —
 builds and tests fail without them. CI enforces all of the following:
 
 ```bash
-make test              # cargo test --no-default-features (required PyO3 workaround)
-make test-python       # Python exceptions; requires the built extension
+maturin develop --release  # Build/install the current extension in the active venv
+make test                  # Rust tests (--no-default-features) and Python tests
 cargo fmt --check
 cargo clippy --no-default-features --all-targets -- -D warnings
 
