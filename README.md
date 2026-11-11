@@ -132,7 +132,9 @@ both libraries have (`"nearest"`, `"bilinear"`, `"bicubic"`, `"lanczos"`):
 non-tone-mapped sources unless the source rate is an integer multiple of
 `fps`), and float32 output without `color_conversion` (`"accurate"` only when
 FFmpeg has libzimg). The check uses the request alone, so a request is
-accepted or rejected the same way for every file.
+accepted or rejected the same way for every file. The output still follows
+the library: a shared kernel's defaults and parameters differ (bicubic C,
+fractional Lanczos taps), and libswscale resizes YUV where zimg resizes RGB.
 
 | `resize_filter` | libswscale | zimg | `resize_param_a`, `resize_param_b` |
 | --- | --- | --- | --- |

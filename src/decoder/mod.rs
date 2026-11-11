@@ -4162,7 +4162,7 @@ impl ColorConversion {
 /// filter's `flags`) plus zimg's splines (the `zscale` filter's `filter`).
 /// A resize runs in zimg with the accurate conversion (except in the
 /// motion stage's input graph for non-tone-mapped sources) and in swscale
-/// otherwise; [`check_resize`] rejects a kernel the resizing library lacks,
+/// otherwise; `check_resize` rejects a kernel the resizing library lacks,
 /// and one-library kernels whenever the library depends on the source or
 /// build.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
