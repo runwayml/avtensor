@@ -49,6 +49,12 @@ class VideoStreamRequest:
     # per channel on 4:2:0 sources and scales float32 by 255/256. "accurate"
     # is not supported with device="cuda".
     color_conversion: Literal["fast", "accurate"] | None
+    # Resampling kernel for width/height resizes: "bicubic" (default),
+    # "nearest", "bilinear", "lanczos" or "area". swscale applies it with
+    # color_conversion="fast", zimg with "accurate" (no "area" there: an
+    # error). Ignored without width/height; not supported with device="cuda";
+    # with hardware_acceleration=True the whole resize runs on the CPU.
+    resize_filter: Literal["nearest", "bilinear", "bicubic", "lanczos", "area"] | None
     # How `fps` resampling builds each output frame: "nearest" (default)
     # keeps the nearest source frame (uneven spacing for e.g. 30 -> 24 fps);
     # "blend" cross-fades neighbouring frames; "motion" interpolates along
@@ -92,6 +98,7 @@ class VideoStreamRequest:
         dtype: str | None = None,
         hdr_mode: Literal["tonemap", "raw"] | None = None,
         color_conversion: Literal["fast", "accurate"] | None = None,
+        resize_filter: Literal["nearest", "bilinear", "bicubic", "lanczos", "area"] | None = None,
         fps_conversion: Literal["nearest", "blend", "motion"] | None = None,
         scene_cuts: Literal["detect", "off"] | None = None,
         autorotate: bool | None = None,

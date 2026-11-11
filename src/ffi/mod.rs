@@ -109,6 +109,15 @@ pub struct VideoStreamRequest {
     /// 0.99615).
     #[pyo3(get, set)]
     color_conversion: Option<String>,
+    /// Resampling kernel for `width`/`height` resizes: "bicubic" (the
+    /// default), "nearest", "bilinear", "lanczos" or "area". Applied by
+    /// swscale with color_conversion="fast" and by zimg with "accurate";
+    /// zimg has no "area" kernel, so that pair is an error. Ignored when
+    /// neither `width` nor `height` is set. Not supported with
+    /// device="cuda" (NVDEC's scaler resizes there); with
+    /// hardware_acceleration=True the whole resize runs on the CPU.
+    #[pyo3(get, set)]
+    resize_filter: Option<String>,
     /// How `fps` resampling builds each output frame: "nearest" (the
     /// default) keeps the nearest source frame, dropping or repeating
     /// whole frames; "blend" cross-fades the two neighbouring frames;
@@ -167,7 +176,7 @@ impl VideoStreamRequest {
 #[pymethods]
 impl VideoStreamRequest {
     #[new]
-    #[pyo3(signature = (*, index=None, width=None, height=None, fps=None, number_of_threads=None, hardware_acceleration=None, dimension_order=None, device=None, dtype=None, hdr_mode=None, color_conversion=None, fps_conversion=None, scene_cuts=None, autorotate=None, fps_mode=None))]
+    #[pyo3(signature = (*, index=None, width=None, height=None, fps=None, number_of_threads=None, hardware_acceleration=None, dimension_order=None, device=None, dtype=None, hdr_mode=None, color_conversion=None, resize_filter=None, fps_conversion=None, scene_cuts=None, autorotate=None, fps_mode=None))]
     #[allow(clippy::too_many_arguments)]
     pub fn py_new(
         index: Option<usize>,
@@ -181,6 +190,7 @@ impl VideoStreamRequest {
         dtype: Option<String>,
         hdr_mode: Option<String>,
         color_conversion: Option<String>,
+        resize_filter: Option<String>,
         fps_conversion: Option<String>,
         scene_cuts: Option<String>,
         autorotate: Option<bool>,
@@ -198,6 +208,7 @@ impl VideoStreamRequest {
             dtype,
             hdr_mode,
             color_conversion,
+            resize_filter,
             fps_conversion,
             scene_cuts,
             autorotate,
@@ -247,6 +258,11 @@ impl VideoStreamRequest {
                 .color_conversion
                 .as_deref()
                 .map(decoder::ColorConversion::try_from)
+                .transpose()?,
+            resize_filter: self
+                .resize_filter
+                .as_deref()
+                .map(decoder::ResizeFilter::try_from)
                 .transpose()?,
             fps_conversion: decoder::FpsConversion::try_from(self.fps_conversion.as_deref())?,
             scene_cuts: decoder::SceneCuts::try_from(self.scene_cuts.as_deref())?,

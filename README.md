@@ -117,6 +117,15 @@ request = MediaDecodeRequest(
 streams = avtensor.decode_asset(request)
 ```
 
+Resizes use bicubic by default. `resize_filter` picks another kernel:
+`"nearest"`, `"bilinear"`, `"lanczos"` or `"area"`. swscale applies it with the
+default `color_conversion="fast"`, and zimg applies it with `"accurate"`. zimg
+has no area kernel, so `"area"` with `"accurate"` is an error:
+
+```python
+VideoStreamRequest(width=864, height=486, resize_filter="lanczos")
+```
+
 By default `fps` keeps the source frame nearest each output timestamp, which
 spaces frames unevenly for non-integer ratios (30 -> 24 fps keeps 4 of every 5
 frames). `fps_conversion="blend"` cross-fades neighbouring frames instead, and
@@ -226,8 +235,9 @@ request.video_stream = VideoStreamRequest(hardware_acceleration=True)
 Bitstream decoding runs on the GPU's NVDEC engine (FFmpeg's `*_cuvid`
 decoders); frames return to system memory, so filters and tensor conversion
 are unchanged. A requested downscale runs on the GPU before the transfer,
-shrinking the GPU→CPU copy. On 1080p production shots decoded to 256×144
-this measured ~1.7× faster with ~3.4× less CPU than software decode.
+shrinking the GPU→CPU copy, unless `resize_filter` is set (its kernel runs on
+the CPU). On 1080p production shots decoded to 256×144 this measured ~1.7×
+faster with ~3.4× less CPU than software decode.
 
 Caveats: a GPU has a limited number of decode engines, so many concurrent
 decodes can saturate them (software decode scales with cores instead). NVDEC
@@ -379,6 +389,7 @@ All attributes default to `None`, meaning "keep the source value".
 | `device` | `str \| None` | `"cuda"` / `"cuda:N"`: keep frames on the GPU, implies `hardware_acceleration` (see [GPU-accelerated decoding](#gpu-accelerated-decoding-nvdec)) |
 | `dtype` | `str \| None` | `"uint8"` (default) or `"float32"` (`[0, 1]`, NCHW-contiguous, preserves 10/12-bit source depth) |
 | `color_conversion` | `str \| None` | `"fast"` (libswscale default; default for `uint8`) or `"accurate"` (zimg: exact `float32`, round-to-nearest `uint8`, resizes after the RGB conversion; default for `float32` when FFmpeg has libzimg). Not supported with `device="cuda"` |
+| `resize_filter` | `str \| None` | resampling kernel for `width`/`height` resizes: `"bicubic"` (default), `"nearest"`, `"bilinear"`, `"lanczos"` or `"area"` (`"fast"` conversion only). Ignored without `width`/`height`. Not supported with `device="cuda"` |
 | `autorotate` | `bool \| None` | apply the stream's display-matrix rotation as the ffmpeg CLI's `-autorotate` does (90°/270° swap the output width and height); `width`/`height` refer to the rotated frame. Default `False`. Stream-level matrix only: per-frame orientation (JPEG EXIF, H.264/HEVC SEI) is not applied |
 | `fps_mode` | `str \| None` | `"filter"` (default) or `"cli"`: the frames `ffmpeg -i <input> -f rawvideo -` outputs, at the stream's guessed rate, with the CLI's duplication/dropping and MPEG-TS/PS/HLS timestamp-discontinuity correction. Whole-file decodes only, without `fps`, `device` or `hardware_acceleration=True`. Unlike the CLI it autorotates only with `autorotate=True`. |
 
@@ -485,10 +496,11 @@ provider-specific support — the URL is handed to FFmpeg's http protocol.
   YUV, and tone-mapped HDR can exceed 1.0 (in either `color_conversion` mode).
 - `color_conversion="accurate"` converts with zimg and resizes after the
   conversion to RGB (for tone-mapped HDR, in the first, linearizing step).
-  zimg upsamples subsampled chroma with bicubic rather than swscale's
-  bilinear. That is more accurate on natural content, but can ring slightly
-  at saturated hard edges. Odd-size 4:2:0/4:2:2 frames are upsampled to
-  4:4:4 first, because zimg rejects them otherwise.
+  zimg upsamples subsampled chroma with bicubic (or the `resize_filter`
+  kernel, when resizing) rather than swscale's bilinear. That is more
+  accurate on natural content, but can ring slightly at saturated hard edges.
+  Odd-size 4:2:0/4:2:2 frames are upsampled to 4:4:4 first, because zimg
+  rejects them otherwise.
 
 ## Direct conversion path
 
