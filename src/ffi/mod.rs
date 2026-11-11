@@ -114,18 +114,20 @@ pub struct VideoStreamRequest {
     /// "bicubic", "bicublin", "experimental", "area", "gauss", "sinc",
     /// "lanczos", "spline". zimg kernels: "nearest", "bilinear", "bicubic",
     /// "lanczos", "spline16", "spline36". The resize runs in zimg with
-    /// color_conversion="accurate" (except with fps_conversion="blend" or
-    /// "motion" on non-tone-mapped sources) and in libswscale otherwise; a
-    /// kernel that library lacks is an error. Ignored when neither `width`
-    /// nor `height` is set. Not supported with device="cuda" (NVDEC's scaler
-    /// resizes there); with hardware_acceleration=True the whole resize runs
-    /// on the CPU.
+    /// color_conversion="accurate" and in libswscale with "fast"; a kernel
+    /// that library lacks is an error. "accurate" with fps_conversion="blend"
+    /// or "motion", and float32 output without color_conversion, accept only
+    /// "nearest", "bilinear", "bicubic" and "lanczos": the library there
+    /// depends on the source or the FFmpeg build. Ignored when neither
+    /// `width` nor `height` is set. An error with device="cuda" (NVDEC's
+    /// scaler resizes there), even without them; with
+    /// hardware_acceleration=True the whole resize runs on the CPU.
     #[pyo3(get, set)]
     resize_filter: Option<String>,
     /// First kernel parameter: B for "bicubic"/"bicublin" (default 0), the
-    /// taps for "lanczos" (default 3), the sharpness for "gauss" (default
-    /// 3), the exponent for "experimental" (default 1). Needs
-    /// `resize_filter`; an error for other kernels.
+    /// taps for "lanczos" (default 3, at most 32), the sharpness for "gauss"
+    /// (default 3, > 0), the exponent for "experimental" (default 1, > 0).
+    /// Needs `resize_filter`; an error for other kernels.
     #[pyo3(get, set)]
     resize_param_a: Option<f64>,
     /// Second kernel parameter: C for "bicubic"/"bicublin" (default 0.6 in

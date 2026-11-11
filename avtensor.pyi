@@ -69,14 +69,17 @@ class VideoStreamRequest:
     # libswscale: nearest, fast_bilinear, bilinear, bicubic, bicublin,
     # experimental, area, gauss, sinc, lanczos, spline. zimg: nearest,
     # bilinear, bicubic, lanczos, spline16, spline36. The resize runs in zimg
-    # with color_conversion="accurate" (except fps_conversion="blend"/"motion"
-    # on non-tone-mapped sources), in libswscale otherwise; a kernel that
-    # library lacks is an error. Ignored without width/height; not supported
-    # with device="cuda"; with hardware_acceleration=True the whole resize
-    # runs on the CPU.
+    # with color_conversion="accurate", in libswscale with "fast"; a kernel
+    # that library lacks is an error. "accurate" with fps_conversion=
+    # "blend"/"motion", and float32 without color_conversion, accept only
+    # nearest, bilinear, bicubic and lanczos (the library depends on the
+    # source or build). Ignored without width/height; an error with
+    # device="cuda" even then; with hardware_acceleration=True the whole
+    # resize runs on the CPU.
     resize_filter: ResizeFilter | None
     # Kernel parameters. a: B for bicubic/bicublin (default 0), taps for
-    # lanczos (3), sharpness for gauss (3), exponent for experimental (1).
+    # lanczos (3, at most 32), sharpness for gauss (3, > 0), exponent for
+    # experimental (1, > 0).
     # b: C for bicubic/bicublin (0.6 libswscale, 0.5 zimg). Need
     # resize_filter; an error for a kernel that does not read it.
     resize_param_a: float | None
