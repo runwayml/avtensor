@@ -1485,14 +1485,16 @@ fn init_video_stream_context(
     // context these decoders return frames in system memory (NV12), so the
     // downstream filter graph and tensor conversion are unchanged.
     let decoder = if hardware_acceleration {
-        let hw_name = format!("{}_cuvid", default_decoder.name().to_string_lossy());
-        let hw_name_c = CString::new(hw_name.clone()).context("building decoder name")?;
-        let hw_decoder = AVCodec::find_decoder_by_name(&hw_name_c).with_context(|| {
+        let hw_name = cuvid_decoder_name(codecpar.codec_id).with_context(|| {
             anyhow!(
-                "Hardware acceleration was requested, but decoder '{}' is not available in this FFmpeg build",
-                hw_name
+                "Hardware acceleration was requested, but this FFmpeg build has no NVDEC \
+                 decoder for codec '{}'",
+                codec_name(codecpar.codec_id)
             )
         })?;
+        let hw_name_c = CString::new(hw_name.clone()).context("building decoder name")?;
+        let hw_decoder = AVCodec::find_decoder_by_name(&hw_name_c)
+            .with_context(|| anyhow!("finding decoder '{hw_name}'"))?;
         log::debug!("Using hardware decoder {}", hw_name);
         hw_decoder
     } else {
@@ -2600,6 +2602,27 @@ fn compute_hw_resize(src_w: i32, src_h: i32, request: &VideoStreamRequest) -> Op
         return None;
     }
     Some((w as i32, h as i32))
+}
+
+/// FFmpeg's NVDEC wrapper for `codec_id` (e.g. `av1_cuvid`, `mpeg2_cuvid`).
+/// Looked up by codec ID: the default software decoder's name does not
+/// predict it (AV1 defaults to `libdav1d` when built in, MPEG-2 is `mpeg2video`).
+fn cuvid_decoder_name(codec_id: ffi::AVCodecID) -> Option<String> {
+    let mut opaque = std::ptr::null_mut();
+    loop {
+        let codec = unsafe { ffi::av_codec_iterate(&mut opaque) };
+        if codec.is_null() {
+            return None;
+        }
+        let codec = unsafe { &*codec };
+        if codec.id != codec_id || unsafe { ffi::av_codec_is_decoder(codec) } == 0 {
+            continue;
+        }
+        let name = unsafe { CStr::from_ptr(codec.name) }.to_string_lossy();
+        if name.ends_with("_cuvid") {
+            return Some(name.into_owned());
+        }
+    }
 }
 
 /// Returns true when the codec context decodes on GPU hardware (cuvid).
@@ -8818,6 +8841,18 @@ mod tests {
             .try_into()?;
         assert!(max_diff <= 1.0, "max diff {max_diff}");
         Ok(())
+    }
+
+    #[test]
+    fn test_cuvid_decoder_name() {
+        for (codec_id, name) in [
+            (ffi::AV_CODEC_ID_H264, Some("h264_cuvid")),
+            (ffi::AV_CODEC_ID_AV1, Some("av1_cuvid")),
+            (ffi::AV_CODEC_ID_MPEG2VIDEO, Some("mpeg2_cuvid")),
+            (ffi::AV_CODEC_ID_PRORES, None),
+        ] {
+            assert_eq!(cuvid_decoder_name(codec_id).as_deref(), name);
+        }
     }
 
     #[test]
