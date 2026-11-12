@@ -34,6 +34,15 @@ mod scenecut;
 
 pub use pairwise::interpolate_rgb_pair;
 
+/// Stream-selection failures that callers can distinguish from host failures.
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum StreamSelectionError {
+    #[error("No {0} stream found")]
+    MissingStream(&'static str),
+    #[error("Failed to find decoder for {kind} stream #{index}")]
+    DecoderUnavailable { kind: &'static str, index: usize },
+}
+
 struct StreamContext {
     stream_type: StreamType,
     stream_index: usize,
@@ -1204,8 +1213,9 @@ pub fn probe_media(
 
 /// Plans a decode without decoding: opens the container, selects streams
 /// exactly as [`decode_media`] does, and returns the buffer each stream would
-/// preallocate (video first, then audio in request order). Decoders are not
-/// opened, so codec and hardware-acceleration errors only surface at decode.
+/// preallocate (video first, then audio in request order). Default decoder
+/// availability is checked, but decoders are not opened; initialization,
+/// hardware-acceleration and media-data errors can still surface at decode.
 pub fn plan_media(
     request: MediaDecodeRequest,
     s3_config: Option<S3Config>,
@@ -1395,7 +1405,7 @@ fn select_video_stream(
                     .find_best_stream(ffi::AVMEDIA_TYPE_VIDEO)
                     .context("Failed to find best video stream!")?
                     .map(|(video_index, _codecref)| video_index)
-                    .ok_or(anyhow::anyhow!("No video stream found"))?;
+                    .ok_or(StreamSelectionError::MissingStream("video"))?;
                 Some(VideoStreamRequest {
                     index: Some(index),
                     ..video_stream
@@ -1429,7 +1439,7 @@ fn select_audio_streams(
                             .find_best_stream(ffi::AVMEDIA_TYPE_AUDIO)
                             .context("Failed to find best audio stream!")?
                             .map(|(audio_index, _codecref)| audio_index)
-                            .ok_or(anyhow::anyhow!("No audio stream found"))?
+                            .ok_or(StreamSelectionError::MissingStream("audio"))?
                     }
                 };
 
@@ -1470,8 +1480,12 @@ fn init_video_stream_context(
         .get(video_index)
         .context("Failed to get video stream")?;
     let codecpar = video_stream.codecpar();
-    let default_decoder = AVCodec::find_decoder(codecpar.codec_id)
-        .with_context(|| anyhow!("Failed to find decoder for video stream #{}", video_index))?;
+    let default_decoder = AVCodec::find_decoder(codecpar.codec_id).ok_or(
+        StreamSelectionError::DecoderUnavailable {
+            kind: "video",
+            index: video_index,
+        },
+    )?;
 
     // device="cuda" decodes on NVDEC, so an unset hardware_acceleration is
     // implied; an explicit false contradicts it.
@@ -1804,6 +1818,10 @@ fn plan_video_stream(
         .get(video_index)
         .context("Failed to get video stream")?;
     let codecpar = video_stream.codecpar();
+    AVCodec::find_decoder(codecpar.codec_id).ok_or(StreamSelectionError::DecoderUnavailable {
+        kind: "video",
+        index: video_index,
+    })?;
     let rotate = requested_rotation(request, &codecpar)?;
     let source_frame_rate = video_stream
         .guess_framerate()
@@ -1927,6 +1945,10 @@ fn plan_audio_stream(
         .get(audio_index)
         .context("Failed to get audio stream")?;
     let codecpar = audio_stream.codecpar();
+    AVCodec::find_decoder(codecpar.codec_id).ok_or(StreamSelectionError::DecoderUnavailable {
+        kind: "audio",
+        index: audio_index,
+    })?;
 
     // Without a duration from either the stream or the container we cannot
     // tell how much to preallocate, so fail with a clear error.
@@ -2018,8 +2040,12 @@ fn init_audio_stream_context(
         .get(audio_index)
         .context("Failed to get audio stream")?;
     let codecpar = audio_stream.codecpar();
-    let decoder = AVCodec::find_decoder(codecpar.codec_id)
-        .with_context(|| anyhow!("Failed to find decoder for audio stream #{}", audio_index))?;
+    let decoder = AVCodec::find_decoder(codecpar.codec_id).ok_or(
+        StreamSelectionError::DecoderUnavailable {
+            kind: "audio",
+            index: audio_index,
+        },
+    )?;
     let mut decode_context = AVCodecContext::new(&decoder);
 
     decode_context
@@ -2065,6 +2091,15 @@ const MAX_OUTPUT_TENSOR_BYTES_VAR: &str = "AVTENSOR_MAX_OUTPUT_TENSOR_BYTES";
 struct OutputLimit {
     bytes: u128,
     source: OutputLimitSource,
+}
+
+/// A configured output ceiling was exceeded, before attempting the allocation.
+#[derive(Debug, thiserror::Error)]
+#[error("output tensor for shape {shape:?} would require {bytes} bytes, exceeding {limit}")]
+pub(crate) struct OutputLimitExceeded {
+    shape: Vec<i64>,
+    bytes: u128,
+    limit: OutputLimit,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2193,9 +2228,12 @@ fn check_output_tensor_size(
             .ok_or_else(|| anyhow!("output tensor size overflow for shape {shape:?}"))?;
     }
     if total > limit.bytes {
-        return Err(anyhow!(
-            "output tensor for shape {shape:?} would require {total} bytes, exceeding {limit}"
-        ));
+        return Err(OutputLimitExceeded {
+            shape: shape.to_vec(),
+            bytes: total,
+            limit: limit.clone(),
+        }
+        .into());
     }
     Ok(())
 }
@@ -7621,6 +7659,7 @@ mod tests {
         let err = ensure_cli_capacity(&mut data, 10, 10, &limit(9 * row_bytes))
             .err()
             .context("growing past the limit must fail")?;
+        assert!(err.is::<OutputLimitExceeded>());
         assert!(
             format!("{err:#}").contains(
                 "would require 120 bytes, exceeding the request's max_output_bytes of 108"
@@ -7775,16 +7814,20 @@ mod tests {
         // 900 frames of 4K rgb24, about 22 GB: over the default, within 64 GiB.
         let shape = [900, 2160, 3840, 3];
         let error = |limit: &OutputLimit| {
-            check_output_tensor_size(&shape, 1, limit)
-                .unwrap_err()
-                .to_string()
+            let error = check_output_tensor_size(&shape, 1, limit).unwrap_err();
+            assert!(error.is::<OutputLimitExceeded>());
+            error.to_string()
         };
         let err = error(&OutputLimit::from_env(None));
         assert!(err.contains("default limit of 17179869184 bytes"), "{err}");
         assert!(err.contains("max_output_bytes"), "{err}");
         assert!(err.contains("AVTENSOR_MAX_OUTPUT_TENSOR_BYTES"), "{err}");
         check_output_tensor_size(&shape, 1, &OutputLimit::from_env(Some("64G".into()))).unwrap();
-        assert!(check_output_tensor_size(&[-1, 2], 1, &OutputLimit::resolve(Some(1))).is_err());
+        for shape in [&[-1, 2][..], &[i64::MAX, i64::MAX, i64::MAX][..]] {
+            let error =
+                check_output_tensor_size(shape, 1, &OutputLimit::resolve(Some(1))).unwrap_err();
+            assert!(!error.is::<OutputLimitExceeded>());
+        }
 
         // A value that is set but too small is named, so the error does not
         // just say to set it.
