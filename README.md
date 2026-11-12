@@ -133,10 +133,13 @@ streams = avtensor.decode_asset(request)
 ```
 
 Resizes use bicubic by default. `resize_filter` picks another kernel, and
-`resize_param_a`/`resize_param_b` set its parameters:
+`resize_params` sets its parameters:
 
 ```python
-VideoStreamRequest(width=864, height=486, resize_filter="lanczos", resize_param_a=4)
+from avtensor import ResizeParams
+
+VideoStreamRequest(width=864, height=486, resize_filter="lanczos", resize_params=ResizeParams(4))
+VideoStreamRequest(width=864, height=486, resize_filter="bicubic", resize_params=ResizeParams(a=0, b=0.5))
 ```
 
 The resize runs in zimg with `color_conversion="accurate"` and in libswscale
@@ -151,23 +154,24 @@ accepted or rejected the same way for every file. The output still follows
 the library: a shared kernel's defaults and parameters differ (bicubic C,
 fractional Lanczos taps), and libswscale resizes YUV where zimg resizes RGB.
 
-| `resize_filter` | libswscale | zimg | `resize_param_a`, `resize_param_b` |
+| `resize_filter` | libswscale | zimg | `ResizeParams` `a`, `b` |
 | --- | --- | --- | --- |
 | `"nearest"` | `neighbor` | `point` | |
 | `"fast_bilinear"` | yes | | |
 | `"bilinear"` | yes | yes | |
-| `"bicubic"` | yes | yes | B, C (libswscale 0, 0.6; zimg 0, 0.5) |
+| `"bicubic"` | yes | yes | B, C in [-2, 2] (libswscale 0, 0.6; zimg 0, 0.5) |
 | `"bicublin"` | yes | | B, C for luma; chroma is bilinear |
-| `"experimental"` | yes | | exponent (1; > 0) |
+| `"experimental"` | yes | | exponent (1; in (0, 100]) |
 | `"area"` | yes | | |
-| `"gauss"` | yes | | sharpness (3; > 0) |
+| `"gauss"` | yes | | sharpness (3; in (0, 100]) |
 | `"sinc"` | yes | | |
-| `"lanczos"` | yes | yes | taps (3; at most 32; zimg truncates to an integer ≥ 1) |
+| `"lanczos"` | yes | yes | taps (3; in [1, 32]; zimg truncates to an integer) |
 | `"spline"` | yes | | |
 | `"spline16"`, `"spline36"` | | yes | |
 
 A parameter the kernel does not read is an error, as is one without
-`resize_filter`.
+`resize_filter` or outside the kernel's range: libswscale crashes on bicubic B
+or C much beyond ±2. These errors are raised before the input is opened.
 
 By default `fps` keeps the source frame nearest each output timestamp, which
 spaces frames unevenly for non-integer ratios (30 -> 24 fps keeps 4 of every 5
@@ -279,9 +283,10 @@ Bitstream decoding runs on the GPU's NVDEC engine (FFmpeg's `*_cuvid`
 decoders); frames return to system memory, so filters and tensor conversion
 are unchanged. A requested downscale runs on the GPU before the transfer,
 shrinking the GPU→CPU copy, unless `resize_filter` is set (its kernel runs on
-the CPU). So with NVDEC an explicit `resize_filter="bicubic"` does not match
-the unset default. On 1080p production shots decoded to 256×144 this measured
-~1.7× faster with ~3.4× less CPU than software decode.
+the CPU, and an info log says so). So with NVDEC an explicit
+`resize_filter="bicubic"` does not match the unset default. On 1080p
+production shots decoded to 256×144 this measured ~1.7× faster with ~3.4×
+less CPU than software decode.
 
 Caveats: a GPU has a limited number of decode engines, so many concurrent
 decodes can saturate them (software decode scales with cores instead). NVDEC
@@ -435,7 +440,7 @@ All attributes default to `None`, meaning "keep the source value".
 | `dtype` | `str \| None` | `"uint8"` (default) or `"float32"` (`[0, 1]`, NCHW-contiguous, preserves 10/12-bit source depth) |
 | `color_conversion` | `str \| None` | `"fast"` (libswscale default; default for `uint8`) or `"accurate"` (zimg: exact `float32`, round-to-nearest `uint8`, resizes after the RGB conversion; default for `float32` when FFmpeg has libzimg). Not supported with `device="cuda"` |
 | `resize_filter` | `str \| None` | resampling kernel for `width`/`height` resizes (default bicubic; see [Resize and resample at decode time](#resize-and-resample-at-decode-time)). Ignored without `width`/`height`. An error with `device="cuda"`, even without `width`/`height` |
-| `resize_param_a`, `resize_param_b` | `float \| None` | parameters of `resize_filter` (bicubic B/C, Lanczos taps, ...) |
+| `resize_params` | `ResizeParams \| None` | parameters of `resize_filter`: `ResizeParams(a, b=None)` (bicubic B/C, Lanczos taps, ...) |
 | `autorotate` | `bool \| None` | apply the stream's display-matrix rotation as the ffmpeg CLI's `-autorotate` does (90°/270° swap the output width and height); `width`/`height` refer to the rotated frame. Default `False`. Stream-level matrix only: per-frame orientation (JPEG EXIF, H.264/HEVC SEI) is not applied |
 | `fps_mode` | `str \| None` | `"filter"` (default) or `"cli"`: the frames `ffmpeg -i <input> -f rawvideo -` outputs, at the stream's guessed rate, with the CLI's duplication/dropping and MPEG-TS/PS/HLS timestamp-discontinuity correction. Whole-file decodes only, without `fps`, `device` or `hardware_acceleration=True`. Unlike the CLI it autorotates only with `autorotate=True`. |
 

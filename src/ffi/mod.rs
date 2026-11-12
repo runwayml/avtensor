@@ -176,17 +176,10 @@ pub struct VideoStreamRequest {
     /// hardware_acceleration=True the whole resize runs on the CPU.
     #[pyo3(get, set)]
     resize_filter: Option<String>,
-    /// First kernel parameter: B for "bicubic"/"bicublin" (default 0), the
-    /// taps for "lanczos" (default 3, at most 32), the sharpness for "gauss"
-    /// (default 3, > 0), the exponent for "experimental" (default 1, > 0).
-    /// Needs `resize_filter`; an error for other kernels.
+    /// Kernel parameters; see `ResizeParams`. Need `resize_filter`; an
+    /// error for a kernel that does not read them.
     #[pyo3(get, set)]
-    resize_param_a: Option<f64>,
-    /// Second kernel parameter: C for "bicubic"/"bicublin" (default 0.6 in
-    /// libswscale, 0.5 in zimg). Needs `resize_filter`; an error for other
-    /// kernels.
-    #[pyo3(get, set)]
-    resize_param_b: Option<f64>,
+    resize_params: Option<ResizeParams>,
     /// How `fps` resampling builds each output frame: "nearest" (the
     /// default) keeps the nearest source frame, dropping or repeating
     /// whole frames; "blend" cross-fades the two neighbouring frames;
@@ -245,7 +238,7 @@ impl VideoStreamRequest {
 #[pymethods]
 impl VideoStreamRequest {
     #[new]
-    #[pyo3(signature = (*, index=None, width=None, height=None, fps=None, number_of_threads=None, hardware_acceleration=None, dimension_order=None, device=None, dtype=None, hdr_mode=None, color_conversion=None, resize_filter=None, resize_param_a=None, resize_param_b=None, fps_conversion=None, scene_cuts=None, autorotate=None, fps_mode=None))]
+    #[pyo3(signature = (*, index=None, width=None, height=None, fps=None, number_of_threads=None, hardware_acceleration=None, dimension_order=None, device=None, dtype=None, hdr_mode=None, color_conversion=None, resize_filter=None, resize_params=None, fps_conversion=None, scene_cuts=None, autorotate=None, fps_mode=None))]
     #[allow(clippy::too_many_arguments)]
     pub fn py_new(
         index: Option<usize>,
@@ -260,8 +253,7 @@ impl VideoStreamRequest {
         hdr_mode: Option<String>,
         color_conversion: Option<String>,
         resize_filter: Option<String>,
-        resize_param_a: Option<f64>,
-        resize_param_b: Option<f64>,
+        resize_params: Option<ResizeParams>,
         fps_conversion: Option<String>,
         scene_cuts: Option<String>,
         autorotate: Option<bool>,
@@ -280,8 +272,7 @@ impl VideoStreamRequest {
             hdr_mode,
             color_conversion,
             resize_filter,
-            resize_param_a,
-            resize_param_b,
+            resize_params,
             fps_conversion,
             scene_cuts,
             autorotate,
@@ -317,7 +308,7 @@ impl VideoStreamRequest {
     }
 
     fn to_decoder_request(&self) -> Result<decoder::VideoStreamRequest, anyhow::Error> {
-        Ok(decoder::VideoStreamRequest {
+        let request = decoder::VideoStreamRequest {
             index: self.index,
             width: self.width,
             height: self.height,
@@ -337,8 +328,7 @@ impl VideoStreamRequest {
                 .as_deref()
                 .map(decoder::ResizeFilter::try_from)
                 .transpose()?,
-            resize_param_a: self.resize_param_a,
-            resize_param_b: self.resize_param_b,
+            resize_params: self.resize_params.map(Into::into),
             fps_conversion: decoder::FpsConversion::try_from(self.fps_conversion.as_deref())?,
             scene_cuts: decoder::SceneCuts::try_from(self.scene_cuts.as_deref())?,
             autorotate: self.autorotate.unwrap_or(false),
@@ -351,7 +341,50 @@ impl VideoStreamRequest {
                     ))
                 }
             },
-        })
+        };
+        request.check_resize()?;
+        Ok(request)
+    }
+}
+
+/// Kernel parameters for `VideoStreamRequest.resize_filter`. `a` is B for
+/// "bicubic"/"bicublin" (default 0, in [-2, 2]), the taps for "lanczos"
+/// (default 3, in [1, 32]), the sharpness for "gauss" (default 3, in
+/// (0, 100]) or the exponent for "experimental" (default 1, in (0, 100]).
+/// `b` is C for "bicubic"/"bicublin" (default 0.6 in libswscale, 0.5 in
+/// zimg, in [-2, 2]); other kernels take no `b`. Immutable: assign a new
+/// `ResizeParams` to change one.
+#[pyclass(frozen, eq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ResizeParams {
+    #[pyo3(get)]
+    a: f64,
+    #[pyo3(get)]
+    b: Option<f64>,
+}
+
+#[pymethods]
+impl ResizeParams {
+    #[new]
+    #[pyo3(signature = (a, b=None))]
+    pub fn py_new(a: f64, b: Option<f64>) -> Self {
+        ResizeParams { a, b }
+    }
+
+    fn __repr__(&self) -> String {
+        match self.b {
+            Some(b) => format!("ResizeParams(a={:?}, b={b:?})", self.a),
+            None => format!("ResizeParams(a={:?})", self.a),
+        }
+    }
+}
+
+impl From<ResizeParams> for decoder::ResizeParams {
+    fn from(value: ResizeParams) -> Self {
+        decoder::ResizeParams {
+            a: value.a,
+            b: value.b,
+        }
     }
 }
 
@@ -1119,6 +1152,7 @@ fn avtensor(m: &Bound<'_, PyModule>) -> PyResult<()> {
         .map_err(|e| PyRuntimeError::new_err(format!("Failed to initialize logging: {}", e)))?;
 
     m.add_class::<VideoStreamRequest>()?;
+    m.add_class::<ResizeParams>()?;
     m.add_class::<AudioStreamRequest>()?;
     m.add_class::<MediaDecodeRequest>()?;
     m.add_class::<S3Config>()?;

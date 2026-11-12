@@ -34,6 +34,18 @@ ResizeFilter = Literal[
     "spline36",
 ]
 
+class ResizeParams:
+    # a: B for bicubic/bicublin (default 0, in [-2, 2]), taps for lanczos
+    # (3, in [1, 32]), sharpness for gauss (3, in (0, 100]), exponent for
+    # experimental (1, in (0, 100]).
+    # b: C for bicubic/bicublin (0.6 libswscale, 0.5 zimg, in [-2, 2]);
+    # other kernels take no b. Immutable.
+    @property
+    def a(self) -> float: ...
+    @property
+    def b(self) -> float | None: ...
+    def __init__(self, a: float, b: float | None = None): ...
+
 class StreamType(Enum):
     Video = 0
     Audio = 1
@@ -86,13 +98,9 @@ class VideoStreamRequest:
     # device="cuda" even then; with hardware_acceleration=True the whole
     # resize runs on the CPU.
     resize_filter: ResizeFilter | None
-    # Kernel parameters. a: B for bicubic/bicublin (default 0), taps for
-    # lanczos (3, at most 32), sharpness for gauss (3, > 0), exponent for
-    # experimental (1, > 0).
-    # b: C for bicubic/bicublin (0.6 libswscale, 0.5 zimg). Need
-    # resize_filter; an error for a kernel that does not read it.
-    resize_param_a: float | None
-    resize_param_b: float | None
+    # Kernel parameters; need resize_filter, an error for a kernel that does
+    # not read them.
+    resize_params: ResizeParams | None
     # How `fps` resampling builds each output frame: "nearest" (default)
     # keeps the nearest source frame (uneven spacing for e.g. 30 -> 24 fps);
     # "blend" cross-fades neighbouring frames; "motion" interpolates along
@@ -137,8 +145,7 @@ class VideoStreamRequest:
         hdr_mode: Literal["tonemap", "raw"] | None = None,
         color_conversion: Literal["fast", "accurate"] | None = None,
         resize_filter: ResizeFilter | None = None,
-        resize_param_a: float | None = None,
-        resize_param_b: float | None = None,
+        resize_params: ResizeParams | None = None,
         fps_conversion: Literal["nearest", "blend", "motion"] | None = None,
         scene_cuts: Literal["detect", "off"] | None = None,
         autorotate: bool | None = None,
