@@ -42,6 +42,21 @@ and reproduction steps in [benchmarks/](benchmarks/):
   <img alt="Single-decode wall time: avtensor and torchcodec are equal on full-clip decode; avtensor is 1.7-6x faster with decode-time resize" src="benchmarks/assets/single_decode_light.svg">
 </picture>
 
+## Error handling
+
+`decode_asset` and `plan_asset` can raise `MissingStreamError` when automatic
+selection finds no requested track, or `DecoderUnavailableError` when the default
+decoder is unavailable. Missing requested hardware decoders still raise plain
+`ValueError`. `OutputLimitExceededError` reports a stream exceeding the configured
+output-byte limit, including output growth during decoding; it does not indicate
+an allocation failure. All three subclass `ValueError` and preserve existing messages.
+Other failures keep their existing types; a plain `ValueError` can also indicate
+storage, allocation, or internal errors. Planning now checks default decoder
+availability even with an explicit stream index, rejecting unsupported streams
+that previously could be planned. A successful plan does not guarantee decoding
+will succeed. `probe_asset` and `interpolate_frames` retain their existing
+exception behavior; they do not expose these typed errors.
+
 ## Installation
 
 Install from PyPI with `pip install avtensor`. The package is distributed as
@@ -345,8 +360,9 @@ layout), `dtype`, `fps` or `sample_rate`, and the `duration_s` /
 `shape` is an upper bound on its length, except for video with
 `fps_mode="cli"`: its output grows past the plan when the CLI emits more frames
 (a file with no stored duration plans 1 frame), up to the output size limit.
-Decoders are not opened, so codec and hardware errors only surface at decode
-time.
+Default decoder availability is checked for every selected stream, including
+explicit indices. Decoders are not opened, so initialization, hardware and
+media-data errors can still surface at decode time.
 
 ### `MediaDecodeRequest(input: str | bytes)`
 
@@ -576,7 +592,8 @@ Set the environment variables from [Installation](#installation) first —
 builds and tests fail without them. CI enforces all of the following:
 
 ```bash
-make test              # cargo test --no-default-features (required PyO3 workaround)
+maturin develop --release  # Build/install the current extension in the active venv
+make test                  # Rust tests (--no-default-features) and Python tests
 cargo fmt --check
 cargo clippy --no-default-features --all-targets -- -D warnings
 

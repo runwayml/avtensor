@@ -1,0 +1,262 @@
+"""Python exception compatibility, using only small locally generated media."""
+
+import os
+import pickle
+import subprocess
+import tempfile
+import unittest
+import wave
+from pathlib import Path
+from unittest.mock import patch
+
+import avtensor
+
+
+class MediaErrorTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.directory = tempfile.TemporaryDirectory()
+        cls.addClassCleanup(cls.directory.cleanup)
+        cls.root = Path(cls.directory.name)
+        cls.video = cls.root / "video.avi"
+        subprocess.run(
+            [
+                "ffmpeg",
+                "-nostdin",
+                "-v",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                "color=c=red:s=32x32:r=4:d=1",
+                "-an",
+                "-c:v",
+                "mpeg4",
+                "-tag:v",
+                "mp4v",
+                str(cls.video),
+            ],
+            check=True,
+            capture_output=True,
+            timeout=20,
+        )
+        cls.audio = cls.root / "audio.wav"
+        with wave.open(str(cls.audio), "wb") as audio:
+            audio.setnchannels(1)
+            audio.setsampwidth(2)
+            audio.setframerate(8000)
+            audio.writeframes(b"\0\0" * 8000)
+        cls.unsupported = cls.root / "unsupported.avi"
+        encoded = cls.video.read_bytes()
+        assert b"mp4v" in encoded
+        cls.unsupported.write_bytes(encoded.replace(b"mp4v", b"zzzz"))
+        cls.unsupported_audio = cls.root / "unsupported.wav"
+        encoded_audio = bytearray(cls.audio.read_bytes())
+        # Replace the WAV format tag with an unassigned codec, leaving the
+        # container, stream index and duration available for planning.
+        format_tag = encoded_audio.index(b"fmt ") + 8
+        encoded_audio[format_tag : format_tag + 2] = b"\xff\xff"
+        cls.unsupported_audio.write_bytes(encoded_audio)
+
+    def assert_error_message(self, error, expected):
+        # anyhow appends a backtrace when enabled in the environment. Keep an
+        # exact check of the message and cause chain, independent of that suffix.
+        self.assertEqual(str(error).split("\n\nStack backtrace:", 1)[0], expected)
+
+    def request(self, path, kind, index=None, max_output_bytes=None):
+        request = avtensor.MediaDecodeRequest(
+            str(path), max_output_bytes=max_output_bytes
+        )
+        if kind == "video":
+            stream = avtensor.VideoStreamRequest()
+            stream.index = index
+            request.video_stream = stream
+        else:
+            stream = avtensor.AudioStreamRequest()
+            stream.index = index
+            request.audio_streams = [stream]
+        return request
+
+    def test_missing_streams_preserve_value_error_and_message(self):
+        for function, operation in (
+            (avtensor.decode_asset, "decode"),
+            (avtensor.plan_asset, "plan"),
+        ):
+            for path, kind in ((self.video, "audio"), (self.audio, "video")):
+                with self.subTest(operation=operation, kind=kind):
+                    with self.assertRaises(ValueError) as raised:
+                        function(self.request(path, kind))
+                    error = raised.exception
+                    self.assertIs(type(error), avtensor.MissingStreamError)
+                    self.assert_error_message(
+                        error,
+                        f"Failed to {operation} media: No {kind} stream found",
+                    )
+                    restored = pickle.loads(pickle.dumps(error))
+                    self.assertIs(type(restored), type(error))
+                    self.assertEqual(restored.args, error.args)
+
+    def test_unavailable_decoder_preserves_value_error_and_message(self):
+        for function, operation in (
+            (avtensor.decode_asset, "decode"),
+            (avtensor.plan_asset, "plan"),
+        ):
+            with self.subTest(operation=operation):
+                with self.assertRaises(ValueError) as raised:
+                    function(self.request(self.unsupported, "video"))
+                self.assertIs(type(raised.exception), avtensor.DecoderUnavailableError)
+                self.assert_error_message(
+                    raised.exception,
+                    f"Failed to {operation} media: Failed to find best video stream!\n\n"
+                    "Caused by:\n    AVERROR(-1128613112): `Decoder not found`",
+                )
+
+    def test_explicit_index_checks_decoder_for_plan_and_decode(self):
+        for path, valid_path, kind in (
+            (self.unsupported, self.video, "video"),
+            (self.unsupported_audio, self.audio, "audio"),
+        ):
+            for function, operation in (
+                (avtensor.plan_asset, "plan"),
+                (avtensor.decode_asset, "decode"),
+            ):
+                with self.subTest(operation=operation, kind=kind):
+                    with self.assertRaises(ValueError) as raised:
+                        function(self.request(path, kind, index=0))
+                    self.assertIs(
+                        type(raised.exception), avtensor.DecoderUnavailableError
+                    )
+                    self.assert_error_message(
+                        raised.exception,
+                        f"Failed to {operation} media: Failed to find decoder for {kind} stream #0",
+                    )
+                    self.assertEqual(
+                        len(function(self.request(valid_path, kind, index=0))), 1
+                    )
+
+    def test_missing_file_and_corruption_remain_plain_value_errors(self):
+        corrupt = self.root / "corrupt.avi"
+        corrupt.write_bytes(b"not a media container")
+        for function in (avtensor.decode_asset, avtensor.plan_asset):
+            for path in (self.root / "missing.avi", corrupt):
+                with self.subTest(function=function.__name__, path=path.name):
+                    with self.assertRaises(ValueError) as raised:
+                        function(self.request(path, "video"))
+                    self.assertIs(type(raised.exception), ValueError)
+
+    def test_valid_decode_after_rejection(self):
+        with self.assertRaises(avtensor.MissingStreamError):
+            avtensor.decode_asset(self.request(self.video, "audio"))
+        decoded = avtensor.decode_asset(self.request(self.video, "video"))
+        self.assertEqual(len(decoded), 1)
+        self.assertEqual(decoded[0]["stream_type"], avtensor.StreamType.Video)
+        self.assertEqual(tuple(decoded[0]["data"].shape), (4, 3, 32, 32))
+
+    def test_invalid_explicit_index_remains_plain_value_error(self):
+        for function in (avtensor.decode_asset, avtensor.plan_asset):
+            with self.subTest(function=function.__name__):
+                with self.assertRaises(ValueError) as raised:
+                    function(self.request(self.video, "video", index=999))
+                self.assertIs(type(raised.exception), ValueError)
+
+    def test_output_limit_preserves_value_error_message_and_recovery(self):
+        for path, kind, shape, size in (
+            (self.video, "video", [4, 32, 32, 3], 12288),
+            (self.audio, "audio", [1, 8000], 32000),
+        ):
+            for function, operation in (
+                (avtensor.decode_asset, "decode"),
+                (avtensor.plan_asset, "plan"),
+            ):
+                with self.subTest(operation=operation, kind=kind):
+                    with self.assertRaises(ValueError) as raised:
+                        function(self.request(path, kind, max_output_bytes=size - 1))
+                    error = raised.exception
+                    self.assertIs(type(error), avtensor.OutputLimitExceededError)
+                    self.assert_error_message(
+                        error,
+                        f"Failed to {operation} media: output tensor for shape {shape} "
+                        f"would require {size} bytes, exceeding the request's "
+                        f"max_output_bytes of {size - 1} bytes",
+                    )
+                    restored = pickle.loads(pickle.dumps(error))
+                    self.assertIs(type(restored), type(error))
+                    self.assertEqual(restored.args, error.args)
+                    # The boundary is inclusive, and rejecting a request must not
+                    # prevent the next valid plan or decode in the same process.
+                    self.assertEqual(
+                        len(function(self.request(path, kind, max_output_bytes=size))),
+                        1,
+                    )
+
+    def test_environment_output_limit_and_request_override(self):
+        with patch.dict(os.environ, {"AVTENSOR_MAX_OUTPUT_TENSOR_BYTES": "1"}):
+            for function in (avtensor.decode_asset, avtensor.plan_asset):
+                with self.subTest(function=function.__name__):
+                    with self.assertRaises(avtensor.OutputLimitExceededError):
+                        function(self.request(self.video, "video"))
+                    self.assertEqual(
+                        len(
+                            function(
+                                self.request(
+                                    self.video, "video", max_output_bytes=12288
+                                )
+                            )
+                        ),
+                        1,
+                    )
+
+    def test_output_limit_during_decode_growth(self):
+        # Writing Matroska to a pipe leaves the duration unknown. Planning
+        # reserves one frame; decoding must grow the output as frames arrive.
+        streamed = self.root / "streamed.mkv"
+        encoded = subprocess.run(
+            [
+                "ffmpeg",
+                "-nostdin",
+                "-v",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                "color=c=red:s=32x32:r=4:d=1",
+                "-vf",
+                "setpts=2*PTS",
+                "-fps_mode",
+                "passthrough",
+                "-c:v",
+                "mpeg4",
+                "-bf",
+                "0",
+                "-map_metadata",
+                "-1",
+                "-f",
+                "matroska",
+                "pipe:1",
+            ],
+            check=True,
+            capture_output=True,
+            timeout=20,
+        )
+        streamed.write_bytes(encoded.stdout)
+        frame_bytes = 32 * 32 * 3
+        request = avtensor.MediaDecodeRequest(
+            str(streamed),
+            video_stream=avtensor.VideoStreamRequest(fps_mode="cli"),
+            max_output_bytes=frame_bytes,
+        )
+        plan = avtensor.plan_asset(request)
+        self.assertEqual(plan[0]["shape"], [1, 3, 32, 32])
+        with self.assertRaises(ValueError) as raised:
+            avtensor.decode_asset(request)
+        self.assertIs(type(raised.exception), avtensor.OutputLimitExceededError)
+        self.assertIn('fps_mode="cli" output outgrew its plan', str(raised.exception))
+        request.max_output_bytes = 10 * frame_bytes
+        decoded = avtensor.decode_asset(request)
+        shape = tuple(decoded[0]["data"].shape)
+        self.assertGreater(shape[0], 1)
+        self.assertEqual(shape[1:], (3, 32, 32))
+
+
+if __name__ == "__main__":
+    unittest.main()

@@ -73,9 +73,6 @@ jobs:
       - name: Build
         run: cargo build --locked --no-default-features
 
-      - name: Run tests
-        run: make test
-
       - name: Build wheel
         run: maturin build --locked --release -o wheelhouse/ -i "$PWD/.venv/bin/python"
 
@@ -88,6 +85,9 @@ jobs:
           ruff check benchmarks/
           ruff format --check benchmarks/
           ty check
+
+      - name: Run tests
+        run: make test
 
   # The release builds an aarch64 wheel too; test it on every PR so arm-only
   # breakage (e.g. NEON rounding in swscale) shows up before a release.
@@ -130,9 +130,6 @@ jobs:
           echo "LD_LIBRARY_PATH=/opt/ffmpeg/lib:${TORCH_LIB}" >> "$GITHUB_ENV"
           echo "LIBRARY_PATH=/opt/ffmpeg/lib:${TORCH_LIB}" >> "$GITHUB_ENV"
 
-      - name: Run tests
-        run: make test
-
       - name: Build wheel
         run: maturin build --locked --release -o wheelhouse/ -i "$PWD/.venv/bin/python"
 
@@ -140,6 +137,9 @@ jobs:
         run: |
           uv pip install --python .venv/bin/python --no-deps wheelhouse/avtensor-*.whl
           python -c "import torch, avtensor; print('avtensor imports with torch', torch.__version__)"
+
+      - name: Run tests
+        run: make test
 
   coverage:
     runs-on: ubuntu-24.04

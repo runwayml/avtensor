@@ -9,6 +9,15 @@ else:
 import torch
 from typing_extensions import NotRequired
 
+class MissingStreamError(ValueError):
+    """No stream of the requested media type exists during automatic selection."""
+
+class DecoderUnavailableError(ValueError):
+    """The default decoder is unavailable; missing hardware decoders remain ValueError."""
+
+class OutputLimitExceededError(ValueError):
+    """A stream's planned or growing output exceeds the configured byte limit."""
+
 class StreamType(Enum):
     Video = 0
     Audio = 1
@@ -282,7 +291,7 @@ def plan_asset(
 ) -> list[PlannedStream]:
     """Returns the buffers decode_asset(request) would allocate, without
     decoding: same stream selection, duration, seek window, fps and size
-    handling."""
+    handling. Checks default decoder availability without opening decoders."""
     ...
 
 def interpolate_frames(

@@ -89,9 +89,6 @@ jobs:
           echo "LD_LIBRARY_PATH=/opt/ffmpeg/lib:${TORCH_LIB}" >> "$GITHUB_ENV"
           echo "LIBRARY_PATH=/opt/ffmpeg/lib:${TORCH_LIB}" >> "$GITHUB_ENV"
 
-      - name: Run tests
-        run: make test
-
       - name: Build wheel
         run: maturin build --locked --release -o wheelhouse/ -i "$PWD/.venv/bin/python"
 
@@ -105,6 +102,9 @@ jobs:
           assert got == want, f"built against torch {got}, expected {want}"
           print("avtensor imports with torch", torch.__version__)
           EOF
+
+      - name: Run tests
+        run: make test
 
       - name: Stamp commit into wheel name
         run: |
