@@ -8950,16 +8950,21 @@ mod tests {
         let filled = mono_samples(&decode_audio(&file, None, None, true)?)?;
         let samples = mono_samples(&decode_audio(&file, None, None, false)?)?;
         let reference = ffmpeg_audio(&file, None)?;
-        // The fill is the gap's 0.5 s, to within one codec frame (AAC's
-        // 1024 samples: the filled audio lands on the stream's timestamps).
-        let fill = filled.len() - samples.len();
-        assert!(fill.abs_diff(24000) <= 1024, "filled {fill} samples");
+        // The clicks after the gap come its 0.5 s earlier than in the filled
+        // audio. (The filled buffer keeps its planned size, so its tail can
+        // lose a few samples: compare the clicks, not the lengths.)
+        assert!(
+            filled.len() > samples.len(),
+            "{} vs {}",
+            filled.len(),
+            samples.len()
+        );
         let onsets = click_onsets(&samples);
         let filled_onsets = click_onsets(&filled);
         assert_eq!(onsets.len(), 4, "{onsets:?}");
         assert_eq!(onsets[..2], filled_onsets[..2], "before the gap");
         for (got, filled) in onsets[2..].iter().zip(&filled_onsets[2..]) {
-            assert_eq!(filled - got, fill, "{onsets:?} vs {filled_onsets:?}");
+            assert_eq!(filled - got, 24000, "{onsets:?} vs {filled_onsets:?}");
         }
         // The decoder's samples as FFmpeg returns them without async resampling.
         let n = samples.len().min(reference.len());
