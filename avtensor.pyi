@@ -132,6 +132,11 @@ class VideoStreamRequest:
     # matrix by default), and plan_asset is an estimate, not an upper bound
     # (the output grows past it, up to the output size limit).
     fps_mode: Literal["filter", "cli"] | None
+    # Convert HDR sources (PQ/HLG transfer or BT.2020 primaries) that carry
+    # no matrix or primaries tag as BT.2020 (NCL), the HDR standard. Default
+    # False: the stream's tags are used as they are (as before 0.6.0), so an
+    # untagged HDR source that FFmpeg cannot convert fails to decode.
+    untagged_hdr_as_bt2020: bool | None
 
     def __init__(
         self,
@@ -153,6 +158,7 @@ class VideoStreamRequest:
         scene_cuts: Literal["detect", "off"] | None = None,
         autorotate: bool | None = None,
         fps_mode: Literal["filter", "cli"] | None = None,
+        untagged_hdr_as_bt2020: bool | None = None,
     ): ...
 
 class LoudnessNormalization:
@@ -186,6 +192,13 @@ class AudioStreamRequest:
     index: int | None
     sample_rate: int | None
     loudness_normalization: LoudnessNormalization | None
+    # Lay the audio onto the timeline the decoded streams share: audio that
+    # starts after the earliest decoded stream (e.g. the video) is preceded by
+    # exact zeros, as FFmpeg's aresample=async=1:first_pts=0 places it, and
+    # gaps inside the stream are filled with zeros. Default False: samples are
+    # returned as decoded, from the audio's first sample (as before 0.7.0);
+    # the result's start_time still says where they start.
+    align_to_video_timeline: bool | None
 
     def __init__(
         self,
@@ -193,6 +206,7 @@ class AudioStreamRequest:
         index: int | None = None,
         sample_rate: int | None = None,
         loudness_normalization: LoudnessNormalization | None = None,
+        align_to_video_timeline: bool | None = None,
     ): ...
 
 class S3Config:

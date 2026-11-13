@@ -288,6 +288,13 @@ pub struct VideoStreamRequest {
     pub autorotate: bool,
     /// How the output frame rate is reached (see [`FpsMode`]).
     pub fps_mode: FpsMode,
+    /// Convert HDR sources (PQ/HLG transfer or BT.2020 primaries) that carry
+    /// no matrix or primaries tag as BT.2020 (NCL), the HDR standard (see
+    /// [`SourceColorInfo::hdr_defaults`]). Off by default: the stream's tags
+    /// are used as they are, as before 0.6.0, so an untagged HDR source that
+    /// zimg cannot linearize fails to decode, and the direct path leaves the
+    /// matrix to swscale's default.
+    pub untagged_hdr_as_bt2020: bool,
 }
 
 /// How decoded frames are mapped onto the output frame rate.
@@ -314,6 +321,12 @@ pub struct AudioStreamRequest {
     pub index: Option<usize>,
     pub sample_rate: Option<u32>,
     pub loudness_normalization: Option<LoudnessNormalization>,
+    /// Lay the audio onto the timeline the decoded streams share (see
+    /// [`align_audio`]): audio that starts after the earliest stream is
+    /// preceded by exact zeros, and gaps inside the stream are filled with
+    /// zeros. Off by default: the samples are returned as decoded, from the
+    /// audio's first sample, as before 0.7.0.
+    pub align_to_video_timeline: bool,
 }
 
 /// The media asset to decode: a URI (local path, `gs://`/`s3://`, or any URL
@@ -737,6 +750,9 @@ pub fn decode_media(
                         request.index == Some(stream_index)
                             && request.loudness_normalization.is_some()
                     }),
+                    align: audio_streams.iter().flatten().any(|request| {
+                        request.index == Some(stream_index) && request.align_to_video_timeline
+                    }),
                 };
                 let (samples, start_time) = align_audio(
                     &mut frame_data,
@@ -782,6 +798,9 @@ struct AudioTiming {
     tick: f64,
     /// Whether gaps inside the stream are filled (see [`find_gaps`]).
     fill_gaps: bool,
+    /// The request's `align_to_video_timeline`: off, [`align_audio`] leaves
+    /// the samples as decoded (no leading silence, no gap filling).
+    align: bool,
 }
 
 /// Lays an audio stream onto the timeline the decoded streams share, which
@@ -814,6 +833,9 @@ fn align_audio(
     frames: &mut Vec<Frame>,
 ) -> Result<(i64, Option<f64>), anyhow::Error> {
     let start = timing.start;
+    if !timing.align {
+        return Ok((written, start.output));
+    }
     let (Some(origin), Some(decoded), Some(first)) = (origin, start.decoded, start.output) else {
         return Ok((written, start.output));
     };
@@ -1998,9 +2020,12 @@ fn plan_audio_stream(
     // container duration runs from the file's first timestamp to its last,
     // so it already spans the silence.
     let start = known_start_seconds(audio_stream);
-    if let (Some(origin), Some(start), DurationSource::Stream) =
-        (timeline_start, start, duration_source)
-    {
+    if let (true, Some(origin), Some(start), DurationSource::Stream) = (
+        request.align_to_video_timeline,
+        timeline_start,
+        start,
+        duration_source,
+    ) {
         let pad = if starts_in_window(start, seek) {
             leading_pad_samples(start, origin, sample_rate as u32)
         } else {
@@ -3472,7 +3497,7 @@ impl DirectVideoScaler {
             dst_height,
             threads: direct_scaler_threads(config.number_of_threads),
             check_matrix: config.source_color.is_hdr(),
-            untagged_colorspace: if config.source_color.is_hdr() {
+            untagged_colorspace: if config.source_color.is_hdr() && config.untagged_hdr_as_bt2020 {
                 ffi::AVCOL_SPC_BT2020_NCL
             } else {
                 ffi::AVCOL_SPC_UNSPECIFIED
@@ -4577,12 +4602,19 @@ pub struct VideoFilterConfig {
     /// Rotation filters to apply (empty unless autorotate is requested and
     /// the stream has a non-zero display rotation).
     rotate: Vec<String>,
+    /// The request's `untagged_hdr_as_bt2020`: tag untagged HDR as BT.2020
+    /// (see [`SourceColorInfo::hdr_defaults`]).
+    untagged_hdr_as_bt2020: bool,
 }
 
 impl Display for VideoFilterConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let mut filters = Vec::new();
-        let hdr_defaults = self.source_color.hdr_defaults();
+        let hdr_defaults = if self.untagged_hdr_as_bt2020 {
+            self.source_color.hdr_defaults()
+        } else {
+            Vec::new()
+        };
         if !hdr_defaults.is_empty() {
             filters.push(format!("setparams={}", hdr_defaults.join(":")));
         }
@@ -4785,6 +4817,7 @@ impl Default for VideoFilterConfig {
             scene_cuts: Default::default(),
             number_of_threads: Default::default(),
             rotate: Default::default(),
+            untagged_hdr_as_bt2020: Default::default(),
         }
     }
 }
@@ -4936,6 +4969,7 @@ impl TryFrom<&VideoStreamRequest> for VideoFilterConfig {
             fps_conversion: req.fps_conversion,
             scene_cuts: req.scene_cuts,
             number_of_threads: req.number_of_threads,
+            untagged_hdr_as_bt2020: req.untagged_hdr_as_bt2020,
             ..Default::default()
         })
     }
@@ -6987,6 +7021,7 @@ mod tests {
     )]
     #[test_case(
         VideoFilterConfig {
+            untagged_hdr_as_bt2020: true,
             source_color: SourceColorInfo {
                 color_trc: Some("smpte2084".to_string()),
                 ..Default::default()
@@ -7018,7 +7053,8 @@ mod tests {
             scene_cuts: SceneCuts::Detect,
             number_of_threads: None,
             rotate: vec![],
-        },
+            untagged_hdr_as_bt2020: true,
+},
         "setparams=colorspace=bt2020nc,fps=24,scale=width=1920:height=1080,zscale=t=linear:npl=100,format=gbrpf32le,tonemap=hable:desat=0,zscale=p=bt709:t=bt709:m=bt709:range=tv,format=pix_fmts=rgb24";
         "HDR with fps and scale options"
     )]
@@ -7092,6 +7128,7 @@ mod tests {
     )]
     #[test_case(
         VideoFilterConfig {
+            untagged_hdr_as_bt2020: true,
             color_conversion: ColorConversion::Accurate,
             width: Some(853),
             height: Some(480),
@@ -7166,6 +7203,7 @@ mod tests {
     )]
     #[test_case(
         VideoFilterConfig {
+            untagged_hdr_as_bt2020: true,
             color_conversion: ColorConversion::Accurate,
             width: Some(853),
             height: Some(480),
@@ -7204,6 +7242,7 @@ mod tests {
     )]
     #[test_case(
         VideoFilterConfig {
+            untagged_hdr_as_bt2020: true,
             color_conversion: ColorConversion::Accurate,
             source_color: SourceColorInfo {
                 color_trc: Some("smpte2084".to_string()),
@@ -7271,6 +7310,7 @@ mod tests {
     )]
     #[test_case(
         VideoFilterConfig {
+            untagged_hdr_as_bt2020: true,
             frame_rate: Some(24.0),
             source_color: SourceColorInfo {
                 color_trc: Some("smpte2084".to_string()),
@@ -7286,6 +7326,7 @@ mod tests {
     )]
     #[test_case(
         VideoFilterConfig {
+            untagged_hdr_as_bt2020: true,
             frame_rate: Some(24.0),
             width: Some(640),
             height: Some(360),
@@ -7331,6 +7372,7 @@ mod tests {
     )]
     #[test_case(
         VideoFilterConfig {
+            untagged_hdr_as_bt2020: true,
             frame_rate: Some(24.0),
             width: Some(640),
             height: Some(360),
@@ -8553,7 +8595,11 @@ mod tests {
             start_time,
             end_time,
             video_stream: Some(VideoStreamRequest::default()),
-            audio_streams: Some(vec![audio]),
+            // These tests cover the timeline alignment, which is opt-in.
+            audio_streams: Some(vec![AudioStreamRequest {
+                align_to_video_timeline: true,
+                ..audio
+            }]),
             max_output_bytes: None,
         }
     }
@@ -8585,6 +8631,51 @@ mod tests {
 
     fn leading_zeros(samples: &[f32]) -> usize {
         samples.iter().take_while(|&&s| s == 0.0).count()
+    }
+
+    /// Without `align_to_video_timeline` (the default), audio that starts
+    /// after the video is returned as decoded, as avtensor did before 0.7.0:
+    /// from its first sample, with no leading zeros, and planned at the
+    /// stream's own length. `start_time` still says where it starts.
+    #[test_case(".mp4", 6006 ; "mp4 edit list")]
+    #[test_case(".mkv", 6000 ; "mkv")]
+    fn test_late_audio_is_not_aligned_by_default(
+        suffix: &str,
+        offset_samples: usize,
+    ) -> anyhow::Result<()> {
+        init_logger();
+        let file = crate::util::test_utils::generate_av_click_video(suffix, 4, AUDIO_OFFSET)?;
+        let request = || MediaDecodeRequest {
+            source: uri(&file),
+            start_time: None,
+            end_time: None,
+            video_stream: Some(VideoStreamRequest::default()),
+            audio_streams: Some(vec![AudioStreamRequest::default()]),
+            max_output_bytes: None,
+        };
+        let plans = plan_media(request(), None)?;
+        assert_eq!(
+            plans[1].shape,
+            vec![1, 3 * 48000],
+            "no room planned for a lead"
+        );
+        let mut streams = decode_media(request(), None)?;
+        let audio = streams.pop().context("audio stream")?;
+        let start = audio.start_time.context("start_time")?;
+        assert!(
+            (start * 48000.0 - offset_samples as f64).abs() <= 1.0,
+            "{start}"
+        );
+        let samples = mono_samples(&audio)?;
+        assert_eq!(samples.len(), 3 * 48000);
+        assert_eq!(leading_zeros(&samples), 0);
+        let onsets = click_onsets(&samples);
+        assert_eq!(
+            onsets,
+            vec![0, 48000, 2 * 48000],
+            "clicks at the decoded samples"
+        );
+        Ok(())
     }
 
     /// Audio that starts after the video starts after the video in the
@@ -8805,6 +8896,7 @@ mod tests {
         file: &tempfile::NamedTempFile,
         start_time: Option<f64>,
         end_time: Option<f64>,
+        align_to_video_timeline: bool,
     ) -> anyhow::Result<DecodedStream> {
         let mut streams = decode_media(
             MediaDecodeRequest {
@@ -8812,7 +8904,10 @@ mod tests {
                 start_time,
                 end_time,
                 video_stream: None,
-                audio_streams: Some(vec![AudioStreamRequest::default()]),
+                audio_streams: Some(vec![AudioStreamRequest {
+                    align_to_video_timeline,
+                    ..Default::default()
+                }]),
                 max_output_bytes: None,
             },
             None,
@@ -8831,6 +8926,32 @@ mod tests {
             args.extend(["-af", filter]);
         }
         crate::util::test_utils::ffmpeg_f32le_samples(&args)
+    }
+
+    /// Without `align_to_video_timeline` (the default), a gap inside an
+    /// audio stream is not filled, as before 0.7.0: the samples are the
+    /// decoder's, back to back, so the clicks after the gap come 0.5 s early.
+    #[test_case("flac", ".mkv" ; "flac mkv")]
+    #[test_case("aac", ".mkv" ; "aac mkv")]
+    fn test_audio_gap_is_not_filled_by_default(codec: &str, suffix: &str) -> anyhow::Result<()> {
+        init_logger();
+        let file =
+            crate::util::test_utils::generate_retimed_click_audio(codec, suffix, HALF_SECOND_GAP)?;
+        let filled = mono_samples(&decode_audio(&file, None, None, true)?)?;
+        let samples = mono_samples(&decode_audio(&file, None, None, false)?)?;
+        let reference = ffmpeg_audio(&file, None)?;
+        assert_eq!(filled.len() - samples.len(), 24000, "the gap's 0.5 s");
+        let onsets = click_onsets(&samples);
+        let filled_onsets = click_onsets(&filled);
+        assert_eq!(onsets.len(), 4, "{onsets:?}");
+        assert_eq!(onsets[..2], filled_onsets[..2], "before the gap");
+        for (got, filled) in onsets[2..].iter().zip(&filled_onsets[2..]) {
+            assert_eq!(filled - got, 24000, "{onsets:?} vs {filled_onsets:?}");
+        }
+        // The decoder's samples as FFmpeg returns them without async resampling.
+        let n = samples.len().min(reference.len());
+        assert!(samples[..n] == reference[..n], "differs from FFmpeg");
+        Ok(())
     }
 
     /// The audio after a 0.5 s gap lands where FFmpeg's alignment puts it,
@@ -8852,7 +8973,7 @@ mod tests {
         init_logger();
         let file =
             crate::util::test_utils::generate_retimed_click_audio(codec, suffix, HALF_SECOND_GAP)?;
-        let samples = mono_samples(&decode_audio(&file, None, None)?)?;
+        let samples = mono_samples(&decode_audio(&file, None, None, true)?)?;
         let reference = ffmpeg_audio(&file, Some("aresample=async=1:first_pts=0"))?;
 
         // Clicks at 0 s and 1 s, then at 2.5 s and 3.5 s, after the gap.
@@ -8897,7 +9018,7 @@ mod tests {
     fn test_audio_drift_is_not_filled(codec: &str, suffix: &str, pts: &str) -> anyhow::Result<()> {
         init_logger();
         let file = crate::util::test_utils::generate_retimed_click_audio(codec, suffix, pts)?;
-        let samples = mono_samples(&decode_audio(&file, None, None)?)?;
+        let samples = mono_samples(&decode_audio(&file, None, None, true)?)?;
         let raw = ffmpeg_audio(&file, None)?;
         let n = samples.len().min(raw.len());
         assert!(
@@ -8931,7 +9052,7 @@ mod tests {
     ) -> anyhow::Result<()> {
         init_logger();
         let file = crate::util::test_utils::generate_retimed_click_audio(codec, suffix, "PTS")?;
-        let samples = mono_samples(&decode_audio(&file, None, None)?)?;
+        let samples = mono_samples(&decode_audio(&file, None, None, true)?)?;
         let raw = ffmpeg_audio(&file, None)?;
         let n = samples.len().min(raw.len());
         assert!(
@@ -8957,7 +9078,7 @@ mod tests {
             (1.6, 3.0, Some(1.6), vec![2.5]),
             (1.95, 4.0, Some(1.95), vec![2.5, 3.5]),
         ] {
-            let audio = decode_audio(&file, Some(start_time), Some(end_time))?;
+            let audio = decode_audio(&file, Some(start_time), Some(end_time), true)?;
             let first = audio.start_time.context("audio start time")?;
             if let Some(start) = start {
                 assert_eq!(first, start, "padded from the window's start");
@@ -8995,6 +9116,7 @@ mod tests {
             sample_rate,
             tick: 0.001,
             fill_gaps: true,
+            align: true,
         }
     }
 
@@ -9755,20 +9877,23 @@ mod tests {
     /// graph: for untagged and BT.709-tagged sources, for 10-bit sources, and
     /// for HDR sources decoded with `HdrMode::Raw`, which take the direct
     /// path too (including the less common FCC matrix, and an HDR source with
-    /// no matrix tag, which both paths decode as BT.2020). Each source is
+    /// no matrix tag, which both paths leave to swscale's default matrix, or
+    /// decode as BT.2020 with `untagged_hdr_as_bt2020`). Each source is
     /// converted on one swscale thread (the default) and slice-threaded
     /// (`number_of_threads=0`), and the test checks that the direct path ran.
-    #[test_case(None, None, None, HdrMode::Tonemap; "untagged")]
-    #[test_case(Some("bt709"), Some("tv"), None, HdrMode::Tonemap; "bt709_tv")]
-    #[test_case(Some("bt709"), Some("tv"), Some("yuv420p10le"), HdrMode::Tonemap; "bt709_10bit")]
-    #[test_case(Some("bt2020nc"), Some("tv"), Some("yuv420p10le"), HdrMode::Raw; "hlg_raw")]
-    #[test_case(Some("fcc"), Some("tv"), Some("yuv420p10le"), HdrMode::Raw; "fcc_raw")]
-    #[test_case(None, Some("tv"), Some("yuv420p10le"), HdrMode::Raw; "untagged_matrix_hlg_raw")]
+    #[test_case(None, None, None, HdrMode::Tonemap, false; "untagged")]
+    #[test_case(Some("bt709"), Some("tv"), None, HdrMode::Tonemap, false; "bt709_tv")]
+    #[test_case(Some("bt709"), Some("tv"), Some("yuv420p10le"), HdrMode::Tonemap, false; "bt709_10bit")]
+    #[test_case(Some("bt2020nc"), Some("tv"), Some("yuv420p10le"), HdrMode::Raw, false; "hlg_raw")]
+    #[test_case(Some("fcc"), Some("tv"), Some("yuv420p10le"), HdrMode::Raw, false; "fcc_raw")]
+    #[test_case(None, Some("tv"), Some("yuv420p10le"), HdrMode::Raw, false; "untagged_matrix_hlg_raw")]
+    #[test_case(None, Some("tv"), Some("yuv420p10le"), HdrMode::Raw, true; "untagged_matrix_hlg_raw_as_bt2020")]
     fn test_direct_scale_matches_filter_graph(
         colorspace: Option<&str>,
         color_range: Option<&str>,
         pixel_format: Option<&str>,
         hdr_mode: HdrMode,
+        untagged_hdr_as_bt2020: bool,
     ) -> anyhow::Result<()> {
         init_logger();
 
@@ -9785,6 +9910,7 @@ mod tests {
         let request = |number_of_threads| VideoStreamRequest {
             hdr_mode,
             number_of_threads,
+            untagged_hdr_as_bt2020,
             ..Default::default()
         };
 
@@ -10101,9 +10227,9 @@ mod tests {
         Ok(())
     }
 
-    /// A PQ stream missing its matrix and/or primaries tag must decode as
-    /// BT.2020 (NCL), the same as the fully tagged stream, in both
-    /// conversion modes and in both HDR modes.
+    /// With `untagged_hdr_as_bt2020`, a PQ stream missing its matrix and/or
+    /// primaries tag must decode as BT.2020 (NCL), the same as the fully
+    /// tagged stream, in both conversion modes and in both HDR modes.
     #[test_case(false, true, HdrMode::Tonemap, None; "no matrix tonemap default")]
     #[test_case(false, true, HdrMode::Tonemap, Some(ColorConversion::Fast); "no matrix tonemap fast")]
     #[test_case(false, false, HdrMode::Tonemap, None; "transfer only tonemap default")]
@@ -10127,6 +10253,7 @@ mod tests {
                         dtype: OutputDtype::Float32,
                         hdr_mode,
                         color_conversion,
+                        untagged_hdr_as_bt2020: true,
                         ..Default::default()
                     }),
                     audio_streams: None,
@@ -10147,6 +10274,48 @@ mod tests {
         assert!(
             max_diff < 1e-6,
             "untagged differs from bt2020 by {max_diff}"
+        );
+        Ok(())
+    }
+
+    /// Without `untagged_hdr_as_bt2020` (the default), a PQ stream missing
+    /// its matrix tag is decoded with the tags it has, as before 0.6.0: the
+    /// default tone mapping cannot linearize it and the decode fails, while
+    /// the flag decodes it as BT.2020, as the tagged stream does.
+    #[test]
+    fn test_untagged_hdr_is_not_bt2020_by_default() -> anyhow::Result<()> {
+        init_logger();
+        let decode = |path: &str, untagged_hdr_as_bt2020: bool| {
+            decode_media(
+                MediaDecodeRequest {
+                    source: MediaSource::Uri(path.to_string()),
+                    start_time: None,
+                    end_time: None,
+                    video_stream: Some(VideoStreamRequest {
+                        untagged_hdr_as_bt2020,
+                        ..Default::default()
+                    }),
+                    audio_streams: None,
+                    max_output_bytes: None,
+                },
+                None,
+            )
+        };
+        let untagged = generate_pq_ffv1_video(64, 48, false, true)?;
+        let path = untagged.path().to_str().context("temp path")?;
+        let error = decode(path, false)
+            .err()
+            .context("the default decode should fail")?;
+        assert!(format!("{error:#}").contains("filtering"), "{error:#}");
+        let tagged = generate_pq_ffv1_video(64, 48, true, true)?;
+        let reference = decode(tagged.path().to_str().context("temp path")?, false)?
+            .remove(0)
+            .data
+            .context("video data")?;
+        let output = decode(path, true)?.remove(0).data.context("video data")?;
+        assert!(
+            output.equal(&reference),
+            "untagged as BT.2020 differs from tagged"
         );
         Ok(())
     }

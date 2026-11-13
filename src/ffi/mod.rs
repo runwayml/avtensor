@@ -232,6 +232,13 @@ pub struct VideoStreamRequest {
     /// estimate rather than an upper bound for it.
     #[pyo3(get, set)]
     fps_mode: Option<String>,
+    /// Convert HDR sources (PQ/HLG transfer or BT.2020 primaries) that carry
+    /// no matrix or primaries tag as BT.2020 (NCL), the HDR standard.
+    /// Defaults to False: the stream's tags are used as they are, as before
+    /// 0.6.0, so an untagged HDR source that FFmpeg cannot convert fails to
+    /// decode.
+    #[pyo3(get, set)]
+    untagged_hdr_as_bt2020: Option<bool>,
 }
 
 impl VideoStreamRequest {
@@ -251,7 +258,7 @@ impl VideoStreamRequest {
 #[pymethods]
 impl VideoStreamRequest {
     #[new]
-    #[pyo3(signature = (*, index=None, width=None, height=None, fps=None, number_of_threads=None, hardware_acceleration=None, dimension_order=None, device=None, dtype=None, hdr_mode=None, color_conversion=None, resize_filter=None, resize_params=None, fps_conversion=None, scene_cuts=None, autorotate=None, fps_mode=None))]
+    #[pyo3(signature = (*, index=None, width=None, height=None, fps=None, number_of_threads=None, hardware_acceleration=None, dimension_order=None, device=None, dtype=None, hdr_mode=None, color_conversion=None, resize_filter=None, resize_params=None, fps_conversion=None, scene_cuts=None, autorotate=None, fps_mode=None, untagged_hdr_as_bt2020=None))]
     #[allow(clippy::too_many_arguments)]
     pub fn py_new(
         index: Option<usize>,
@@ -271,6 +278,7 @@ impl VideoStreamRequest {
         scene_cuts: Option<String>,
         autorotate: Option<bool>,
         fps_mode: Option<String>,
+        untagged_hdr_as_bt2020: Option<bool>,
     ) -> Self {
         VideoStreamRequest {
             index,
@@ -290,6 +298,7 @@ impl VideoStreamRequest {
             scene_cuts,
             autorotate,
             fps_mode,
+            untagged_hdr_as_bt2020,
         }
     }
 }
@@ -345,6 +354,7 @@ impl VideoStreamRequest {
             fps_conversion: decoder::FpsConversion::try_from(self.fps_conversion.as_deref())?,
             scene_cuts: decoder::SceneCuts::try_from(self.scene_cuts.as_deref())?,
             autorotate: self.autorotate.unwrap_or(false),
+            untagged_hdr_as_bt2020: self.untagged_hdr_as_bt2020.unwrap_or(false),
             fps_mode: match self.fps_mode.as_deref() {
                 None | Some("filter") => decoder::FpsMode::Filter,
                 Some("cli") => decoder::FpsMode::Cli,
@@ -504,11 +514,22 @@ pub struct AudioStreamRequest {
     /// Loudness normalization configuration.
     #[pyo3(get, set)]
     loudness_normalization: Option<Py<LoudnessNormalization>>,
+    /// Lay the audio onto the timeline the decoded streams share: audio that
+    /// starts after the earliest decoded stream (e.g. the video) is preceded
+    /// by exact zeros, as FFmpeg's `aresample=async=1:first_pts=0` places
+    /// it, and gaps inside the stream are filled with zeros. Defaults to
+    /// False: the samples are returned as decoded, from the audio's first
+    /// sample, as before 0.7.0 (`start_time` still reports where they start).
+    #[pyo3(get, set)]
+    align_to_video_timeline: Option<bool>,
 }
 
 impl PartialEq for AudioStreamRequest {
     fn eq(&self, other: &Self) -> bool {
-        if self.index != other.index || self.sample_rate != other.sample_rate {
+        if self.index != other.index
+            || self.sample_rate != other.sample_rate
+            || self.align_to_video_timeline != other.align_to_video_timeline
+        {
             return false;
         }
         match (&self.loudness_normalization, &other.loudness_normalization) {
@@ -522,16 +543,18 @@ impl PartialEq for AudioStreamRequest {
 #[pymethods]
 impl AudioStreamRequest {
     #[new]
-    #[pyo3(signature = (*, index=None, sample_rate=None, loudness_normalization=None))]
+    #[pyo3(signature = (*, index=None, sample_rate=None, loudness_normalization=None, align_to_video_timeline=None))]
     pub fn py_new(
         index: Option<usize>,
         sample_rate: Option<u32>,
         loudness_normalization: Option<Py<LoudnessNormalization>>,
+        align_to_video_timeline: Option<bool>,
     ) -> Self {
         AudioStreamRequest {
             index,
             sample_rate,
             loudness_normalization,
+            align_to_video_timeline,
         }
     }
 }
@@ -545,6 +568,7 @@ impl AudioStreamRequest {
                 .loudness_normalization
                 .as_ref()
                 .map(|ln| ln.borrow(py).clone().into()),
+            align_to_video_timeline: self.align_to_video_timeline.unwrap_or(false),
         }
     }
 }

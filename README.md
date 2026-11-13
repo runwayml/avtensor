@@ -356,7 +356,11 @@ The GIL is released for the duration of the decode.
 
 #### Audio and video alignment
 
-Audio is laid on the same timeline as the video. The timeline starts at the
+By default, audio is returned as decoded, from its first sample, with no
+leading silence and no gap filling, as before 0.7.0; the result's
+`start_time` says where it starts. With
+`AudioStreamRequest(align_to_video_timeline=True)`, the audio is laid on the
+same timeline as the video, as follows. The timeline starts at the
 earliest start of the decoded streams, or at the request's `start_time` when
 that is later. Audio that starts after the timeline, for example a track that
 starts 125 ms after the video (an MP4 edit list, or a later first timestamp in
@@ -375,8 +379,8 @@ differences, from timestamp rounding, are left alone. Frames that overlap keep
 all their samples, back to back. Gaps are not filled with loudness
 normalization, whose output timestamps are not sample-accurate.
 
-`plan_asset` includes the padding in the planned shape, and the [output size
-limit](#output-size-limit) applies to it.
+With `align_to_video_timeline=True`, `plan_asset` includes the padding in the
+planned shape, and the [output size limit](#output-size-limit) applies to it.
 
 ### `probe_asset(input: str | bytes) -> MediaMetadata`
 
@@ -542,9 +546,13 @@ provider-specific support — the URL is handed to FFmpeg's http protocol.
   primaries — are automatically tone-mapped
   (`zscale` → `tonemap=hable` → `zscale`) so the returned RGB tensors are
   sRGB/BT.709, consistent with SDR sources.
-- HDR streams (PQ/HLG transfer or BT.2020 primaries) missing a matrix or
-  primaries tag are treated as BT.2020 (non-constant luminance), in both
-  `hdr_mode`s. Untagged SDR keeps swscale's BT.601 default.
+- With `VideoStreamRequest(untagged_hdr_as_bt2020=True)`, HDR streams
+  (PQ/HLG transfer or BT.2020 primaries) missing a matrix or primaries tag are
+  treated as BT.2020 (non-constant luminance), in both `hdr_mode`s. By
+  default the stream's tags are used as they are, as before 0.6.0: a PQ/HLG
+  stream with no matrix tag fails the default tone mapping (zimg cannot
+  linearize it), and in `hdr_mode="raw"` converts with swscale's default
+  matrix. Untagged SDR keeps swscale's BT.601 default either way.
 - `float32` output is clamped to `[0, 1]`. zimg does not clip out-of-gamut
   YUV, and tone-mapped HDR can exceed 1.0 (in either `color_conversion` mode).
 - `color_conversion="accurate"` converts with zimg and resizes after the
