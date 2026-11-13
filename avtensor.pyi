@@ -18,6 +18,34 @@ class DecoderUnavailableError(ValueError):
 class OutputLimitExceededError(ValueError):
     """A stream's planned or growing output exceeds the configured byte limit."""
 
+ResizeFilter = Literal[
+    "nearest",
+    "fast_bilinear",
+    "bilinear",
+    "bicubic",
+    "bicublin",
+    "experimental",
+    "area",
+    "gauss",
+    "sinc",
+    "lanczos",
+    "spline",
+    "spline16",
+    "spline36",
+]
+
+class ResizeParams:
+    # a: B for bicubic/bicublin (default 0, in [-2, 2]), taps for lanczos
+    # (3, in [1, 32]), sharpness for gauss (3, in (0, 100]), exponent for
+    # experimental (1, in (0, 100]).
+    # b: C for bicubic/bicublin (0.6 libswscale, 0.5 zimg, in [-2, 2]);
+    # other kernels take no b. Immutable.
+    @property
+    def a(self) -> float: ...
+    @property
+    def b(self) -> float | None: ...
+    def __init__(self, a: float, b: float | None = None): ...
+
 class StreamType(Enum):
     Video = 0
     Audio = 1
@@ -58,6 +86,21 @@ class VideoStreamRequest:
     # per channel on 4:2:0 sources and scales float32 by 255/256. "accurate"
     # is not supported with device="cuda".
     color_conversion: Literal["fast", "accurate"] | None
+    # Resampling kernel for width/height resizes; unset is bicubic.
+    # libswscale: nearest, fast_bilinear, bilinear, bicubic, bicublin,
+    # experimental, area, gauss, sinc, lanczos, spline. zimg: nearest,
+    # bilinear, bicubic, lanczos, spline16, spline36. The resize runs in zimg
+    # with color_conversion="accurate", in libswscale with "fast"; a kernel
+    # that library lacks is an error. "accurate" with fps_conversion=
+    # "blend"/"motion", and float32 without color_conversion, accept only
+    # nearest, bilinear, bicubic and lanczos (the library depends on the
+    # source or build). Ignored without width/height; an error with
+    # device="cuda" even then; with hardware_acceleration=True the whole
+    # resize runs on the CPU.
+    resize_filter: ResizeFilter | None
+    # Kernel parameters; need resize_filter, an error for a kernel that does
+    # not read them.
+    resize_params: ResizeParams | None
     # How `fps` resampling builds each output frame: "nearest" (default)
     # keeps the nearest source frame (uneven spacing for e.g. 30 -> 24 fps);
     # "blend" cross-fades neighbouring frames; "motion" interpolates along
@@ -101,6 +144,8 @@ class VideoStreamRequest:
         dtype: str | None = None,
         hdr_mode: Literal["tonemap", "raw"] | None = None,
         color_conversion: Literal["fast", "accurate"] | None = None,
+        resize_filter: ResizeFilter | None = None,
+        resize_params: ResizeParams | None = None,
         fps_conversion: Literal["nearest", "blend", "motion"] | None = None,
         scene_cuts: Literal["detect", "off"] | None = None,
         autorotate: bool | None = None,

@@ -132,6 +132,47 @@ request = MediaDecodeRequest(
 streams = avtensor.decode_asset(request)
 ```
 
+Resizes use bicubic by default. `resize_filter` picks another kernel, and
+`resize_params` sets its parameters:
+
+```python
+from avtensor import ResizeParams
+
+VideoStreamRequest(width=864, height=486, resize_filter="lanczos", resize_params=ResizeParams(4))
+VideoStreamRequest(width=864, height=486, resize_filter="bicubic", resize_params=ResizeParams(a=0, b=0.5))
+```
+
+The resize runs in zimg with `color_conversion="accurate"` and in libswscale
+with `"fast"`. A kernel the resizing library lacks is an error. Two cases pick
+the library per source or per FFmpeg build, so they accept only the kernels
+both libraries have (`"nearest"`, `"bilinear"`, `"bicubic"`, `"lanczos"`):
+`"accurate"` with `fps_conversion="blend"`/`"motion"` (libswscale on
+non-tone-mapped sources unless the source rate is an integer multiple of
+`fps`), and float32 output without `color_conversion` (`"accurate"` only when
+FFmpeg has libzimg). The check uses the request alone, so a request is
+accepted or rejected the same way for every file. The output still follows
+the library: a shared kernel's defaults and parameters differ (bicubic C,
+fractional Lanczos taps), and libswscale resizes YUV where zimg resizes RGB.
+
+| `resize_filter` | libswscale | zimg | `ResizeParams` `a`, `b` |
+| --- | --- | --- | --- |
+| `"nearest"` | `neighbor` | `point` | |
+| `"fast_bilinear"` | yes | | |
+| `"bilinear"` | yes | yes | |
+| `"bicubic"` | yes | yes | B, C in [-2, 2] (libswscale 0, 0.6; zimg 0, 0.5) |
+| `"bicublin"` | yes | | B, C for luma; chroma is bilinear |
+| `"experimental"` | yes | | exponent (1; in (0, 100]) |
+| `"area"` | yes | | |
+| `"gauss"` | yes | | sharpness (3; in (0, 100]) |
+| `"sinc"` | yes | | |
+| `"lanczos"` | yes | yes | taps (3; in [1, 32]; zimg truncates to an integer) |
+| `"spline"` | yes | | |
+| `"spline16"`, `"spline36"` | | yes | |
+
+A parameter the kernel does not read is an error, as is one without
+`resize_filter` or outside the kernel's range: libswscale crashes on bicubic B
+or C much beyond ±2. These errors are raised before the input is opened.
+
 By default `fps` keeps the source frame nearest each output timestamp, which
 spaces frames unevenly for non-integer ratios (30 -> 24 fps keeps 4 of every 5
 frames). `fps_conversion="blend"` cross-fades neighbouring frames instead, and
@@ -241,8 +282,11 @@ request.video_stream = VideoStreamRequest(hardware_acceleration=True)
 Bitstream decoding runs on the GPU's NVDEC engine (FFmpeg's `*_cuvid`
 decoders); frames return to system memory, so filters and tensor conversion
 are unchanged. A requested downscale runs on the GPU before the transfer,
-shrinking the GPU→CPU copy. On 1080p production shots decoded to 256×144
-this measured ~1.7× faster with ~3.4× less CPU than software decode.
+shrinking the GPU→CPU copy, unless `resize_filter` is set (its kernel runs on
+the CPU, and an info log says so). So with NVDEC an explicit
+`resize_filter="bicubic"` does not match the unset default. On 1080p
+production shots decoded to 256×144 this measured ~1.7× faster with ~3.4×
+less CPU than software decode.
 
 Caveats: a GPU has a limited number of decode engines, so many concurrent
 decodes can saturate them (software decode scales with cores instead). NVDEC
@@ -395,6 +439,8 @@ All attributes default to `None`, meaning "keep the source value".
 | `device` | `str \| None` | `"cuda"` / `"cuda:N"`: keep frames on the GPU, implies `hardware_acceleration` (see [GPU-accelerated decoding](#gpu-accelerated-decoding-nvdec)) |
 | `dtype` | `str \| None` | `"uint8"` (default) or `"float32"` (`[0, 1]`, NCHW-contiguous, preserves 10/12-bit source depth) |
 | `color_conversion` | `str \| None` | `"fast"` (libswscale default; default for `uint8`) or `"accurate"` (zimg: exact `float32`, round-to-nearest `uint8`, resizes after the RGB conversion; default for `float32` when FFmpeg has libzimg). Not supported with `device="cuda"` |
+| `resize_filter` | `str \| None` | resampling kernel for `width`/`height` resizes (default bicubic; see [Resize and resample at decode time](#resize-and-resample-at-decode-time)). Ignored without `width`/`height`. An error with `device="cuda"`, even without `width`/`height` |
+| `resize_params` | `ResizeParams \| None` | parameters of `resize_filter`: `ResizeParams(a, b=None)` (bicubic B/C, Lanczos taps, ...) |
 | `autorotate` | `bool \| None` | apply the stream's display-matrix rotation as the ffmpeg CLI's `-autorotate` does (90°/270° swap the output width and height); `width`/`height` refer to the rotated frame. Default `False`. Stream-level matrix only: per-frame orientation (JPEG EXIF, H.264/HEVC SEI) is not applied |
 | `fps_mode` | `str \| None` | `"filter"` (default) or `"cli"`: the frames `ffmpeg -i <input> -f rawvideo -` outputs, at the stream's guessed rate, with the CLI's duplication/dropping and MPEG-TS/PS/HLS timestamp-discontinuity correction. Whole-file decodes only, without `fps`, `device` or `hardware_acceleration=True`. Unlike the CLI it autorotates only with `autorotate=True`. |
 
@@ -501,10 +547,11 @@ provider-specific support — the URL is handed to FFmpeg's http protocol.
   YUV, and tone-mapped HDR can exceed 1.0 (in either `color_conversion` mode).
 - `color_conversion="accurate"` converts with zimg and resizes after the
   conversion to RGB (for tone-mapped HDR, in the first, linearizing step).
-  zimg upsamples subsampled chroma with bicubic rather than swscale's
-  bilinear. That is more accurate on natural content, but can ring slightly
-  at saturated hard edges. Odd-size 4:2:0/4:2:2 frames are upsampled to
-  4:4:4 first, because zimg rejects them otherwise.
+  zimg upsamples subsampled chroma with bicubic (or the `resize_filter`
+  kernel, when zimg resizes) rather than swscale's bilinear. That is more
+  accurate on natural content, but can ring slightly at saturated hard edges.
+  Odd-size 4:2:0/4:2:2 frames are upsampled to 4:4:4 first, because zimg
+  rejects them otherwise.
 
 ## Direct conversion path
 
