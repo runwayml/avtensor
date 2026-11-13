@@ -18,6 +18,9 @@ class DecoderUnavailableError(ValueError):
 class OutputLimitExceededError(ValueError):
     """A stream's planned or growing output exceeds the configured byte limit."""
 
+class ResizeRequestError(ValueError):
+    """resize_filter/resize_params are invalid for the request; raised before the input is opened."""
+
 ResizeFilter = Literal[
     "nearest",
     "fast_bilinear",

@@ -15,6 +15,19 @@ use crate::decoder::{self, decode_media, interpolate_rgb_pair, DecodedStream, Fr
 pyo3::create_exception!(avtensor, MissingStreamError, PyValueError);
 pyo3::create_exception!(avtensor, DecoderUnavailableError, PyValueError);
 pyo3::create_exception!(avtensor, OutputLimitExceededError, PyValueError);
+pyo3::create_exception!(avtensor, ResizeRequestError, PyValueError);
+
+fn request_error(error: anyhow::Error) -> PyErr {
+    let message = format!("Failed to convert request: {error:?}");
+    if error
+        .chain()
+        .any(|cause| cause.is::<decoder::ResizeRequestError>())
+    {
+        ResizeRequestError::new_err(message)
+    } else {
+        PyValueError::new_err(message)
+    }
+}
 
 #[derive(Debug, PartialEq)]
 enum MediaErrorKind {
@@ -1043,9 +1056,7 @@ fn plan_asset(
     request: PyRef<'_, MediaDecodeRequest>,
     s3_config: Option<PyRef<'_, S3Config>>,
 ) -> PyResult<Vec<PlannedStream>> {
-    let decoder_request = request
-        .to_decoder_request(py)
-        .map_err(|e| PyValueError::new_err(format!("Failed to convert request: {:?}", e)))?;
+    let decoder_request = request.to_decoder_request(py).map_err(request_error)?;
     let s3_config = s3_config.map(|c| c.to_decoder_config());
     let nhwc = match &request.video_stream {
         Some(v) => v
@@ -1073,9 +1084,7 @@ fn decode_asset(
     request: PyRef<'_, MediaDecodeRequest>,
     s3_config: Option<PyRef<'_, S3Config>>,
 ) -> PyResult<Vec<DecodeResult>> {
-    let decoder_request = request
-        .to_decoder_request(py)
-        .map_err(|e| PyValueError::new_err(format!("Failed to convert request: {:?}", e)))?;
+    let decoder_request = request.to_decoder_request(py).map_err(request_error)?;
     // Snapshot into a plain Rust struct before releasing the GIL.
     let s3_config = s3_config.map(|c| c.to_decoder_config());
     let nhwc = match &request.video_stream {
@@ -1169,6 +1178,10 @@ fn avtensor(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add(
         "OutputLimitExceededError",
         m.py().get_type::<OutputLimitExceededError>(),
+    )?;
+    m.add(
+        "ResizeRequestError",
+        m.py().get_type::<ResizeRequestError>(),
     )?;
     m.add_function(wrap_pyfunction!(probe_asset, m)?)?;
     m.add_function(wrap_pyfunction!(plan_asset, m)?)?;
