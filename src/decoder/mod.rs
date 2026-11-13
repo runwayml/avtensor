@@ -8653,11 +8653,21 @@ mod tests {
             audio_streams: Some(vec![AudioStreamRequest::default()]),
             max_output_bytes: None,
         };
+        // The plan is the stream's own length, as before 0.7.0 (MP4's track
+        // duration; Matroska has none, so its container duration), with no
+        // room for a lead: smaller than the aligned plan by the lead.
         let plans = plan_media(request(), None)?;
-        assert_eq!(
-            plans[1].shape,
-            vec![1, 3 * 48000],
-            "no room planned for a lead"
+        let aligned = plan_media(av_request(&file, None, None, Default::default()), None)?;
+        if suffix == ".mp4" {
+            assert_eq!(
+                plans[1].shape,
+                vec![1, 3 * 48000],
+                "no room planned for a lead"
+            );
+        }
+        assert!(
+            plans[1].shape[1] <= aligned[1].shape[1],
+            "{plans:?} vs {aligned:?}"
         );
         let mut streams = decode_media(request(), None)?;
         let audio = streams.pop().context("audio stream")?;
@@ -8940,13 +8950,16 @@ mod tests {
         let filled = mono_samples(&decode_audio(&file, None, None, true)?)?;
         let samples = mono_samples(&decode_audio(&file, None, None, false)?)?;
         let reference = ffmpeg_audio(&file, None)?;
-        assert_eq!(filled.len() - samples.len(), 24000, "the gap's 0.5 s");
+        // The fill is the gap's 0.5 s, to within one codec frame (AAC's
+        // 1024 samples: the filled audio lands on the stream's timestamps).
+        let fill = filled.len() - samples.len();
+        assert!(fill.abs_diff(24000) <= 1024, "filled {fill} samples");
         let onsets = click_onsets(&samples);
         let filled_onsets = click_onsets(&filled);
         assert_eq!(onsets.len(), 4, "{onsets:?}");
         assert_eq!(onsets[..2], filled_onsets[..2], "before the gap");
         for (got, filled) in onsets[2..].iter().zip(&filled_onsets[2..]) {
-            assert_eq!(filled - got, 24000, "{onsets:?} vs {filled_onsets:?}");
+            assert_eq!(filled - got, fill, "{onsets:?} vs {filled_onsets:?}");
         }
         // The decoder's samples as FFmpeg returns them without async resampling.
         let n = samples.len().min(reference.len());
