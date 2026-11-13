@@ -97,8 +97,13 @@ class ResizeParamsTests(unittest.TestCase):
                     resize_filter=resize_filter,
                     resize_params=params,
                 )
-                with self.assertRaisesRegex(ValueError, message):
+                with self.assertRaisesRegex(avtensor.ResizeRequestError, message):
                     self.decode(request, path=missing)
+
+    def test_unavailable_kernel_raises_resize_request_error(self):
+        request = VideoStreamRequest(width=32, height=18, resize_filter="spline36")
+        with self.assertRaisesRegex(avtensor.ResizeRequestError, "zimg"):
+            self.decode(request)
 
 
 if __name__ == "__main__":

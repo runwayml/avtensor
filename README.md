@@ -49,7 +49,9 @@ selection finds no requested track, or `DecoderUnavailableError` when the defaul
 decoder is unavailable. Missing requested hardware decoders still raise plain
 `ValueError`. `OutputLimitExceededError` reports a stream exceeding the configured
 output-byte limit, including output growth during decoding; it does not indicate
-an allocation failure. All three subclass `ValueError` and preserve existing messages.
+an allocation failure. `ResizeRequestError` reports `resize_filter`/`resize_params`
+that the request cannot use, before the input is opened. All four subclass
+`ValueError` and preserve existing messages.
 Other failures keep their existing types; a plain `ValueError` can also indicate
 storage, allocation, or internal errors. Planning now checks default decoder
 availability even with an explicit stream index, rejecting unsupported streams
