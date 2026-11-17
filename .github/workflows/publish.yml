@@ -9,10 +9,23 @@ name: Publish to PyPI
 # Authentication uses PyPI trusted publishing (OIDC) — no API token. The
 # PyPI project must be configured with this repo, this workflow file, and
 # the `pypi` GitHub environment as a trusted publisher.
+#
+# release.yml dispatches this workflow on the tag after creating the release:
+# releases created with GITHUB_TOKEN do not fire `release: published`. A
+# release published by hand still triggers it directly; the duplicate upload
+# that follows a hand edit of a bot release is skipped (`skip-existing`).
+# To test against TestPyPI first (needs a matching trusted publisher there):
+#   gh workflow run publish.yml --ref vX.Y.Z -f repository_url=https://test.pypi.org/legacy/
 
 on:
   release:
     types: [published]
+  workflow_dispatch:
+    inputs:
+      repository_url:
+        description: "Package index upload URL (TestPyPI for a dry run)"
+        default: "https://upload.pypi.org/legacy/"
+        required: true
 
 jobs:
   ci:
@@ -33,6 +46,10 @@ jobs:
 
       - name: Verify tag matches Cargo.toml version
         run: |
+          if [[ "$GITHUB_REF" != refs/tags/v* ]]; then
+            echo "::error::Run on a release tag (--ref vX.Y.Z), not $GITHUB_REF"
+            exit 1
+          fi
           TAG="${GITHUB_REF#refs/tags/v}"
           VERSION=$(grep -Po '(?<=^version = ")[^"]+' Cargo.toml | head -1)
           if [ "$TAG" != "$VERSION" ]; then
@@ -48,3 +65,6 @@ jobs:
 
       - name: Publish to PyPI
         uses: pypa/gh-action-pypi-publish@cef221092ed1bacb1cc03d23a2d87d1d172e277b # v1.14.0
+        with:
+          repository-url: ${{ inputs.repository_url || 'https://upload.pypi.org/legacy/' }}
+          skip-existing: true
