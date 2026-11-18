@@ -4,7 +4,8 @@ name: Release wheel
 # no GPU, so standard runners work), one per architecture: x86_64 and
 # aarch64, each on a native runner. Triggered by version tags (v*) or
 # manually with a torch/CUDA override. The full test suite gates each build,
-# and the wheels are attached to the GitHub release.
+# and the wheels are attached to the GitHub release. On a tag, the release
+# job then dispatches publish.yml to upload the sdist to PyPI.
 #
 # Consumers that mirror wheels elsewhere (e.g. an internal package bucket)
 # should copy the release assets from their own infrastructure.
@@ -126,6 +127,7 @@ jobs:
     runs-on: ubuntu-24.04
     permissions:
       contents: write # create the GitHub release
+      actions: write # dispatch publish.yml
     steps:
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
@@ -141,3 +143,13 @@ jobs:
           ls -la wheelhouse/
           gh release create "${GITHUB_REF_NAME}" wheelhouse/*.whl --title "${GITHUB_REF_NAME}" --generate-notes \
             || gh release upload "${GITHUB_REF_NAME}" wheelhouse/*.whl
+
+      # A release created with GITHUB_TOKEN does not trigger other workflows,
+      # so publish.yml's `release: published` trigger never fires for it.
+      # workflow_dispatch is exempt from that rule. publish.yml must stay a
+      # top-level workflow: PyPI trusted publishing rejects reusable ones.
+      - name: Publish the sdist to PyPI
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: gh workflow run publish.yml --ref "${GITHUB_REF_NAME}"
