@@ -19,7 +19,7 @@ use tch::IndexOp;
 
 use crate::{
     conversion::convert_audio_into_tensor,
-    decoder::io::{cloud_storage_avio_reader, memory_avio_reader},
+    decoder::io::{cloud_storage_avio_reader, memory_avio_reader, Prefetch},
     util::{ffmpeg::RetUpgrade, pts_to_seconds, s3::S3Config},
 };
 
@@ -327,13 +327,18 @@ impl MediaSource {
     /// Opens an [`AVFormatContextInput`] for this source.
     ///
     /// `s3_config` is the explicit S3 client configuration for `s3://` URIs;
-    /// it is ignored for other sources.
-    fn open(self, s3_config: Option<S3Config>) -> Result<AVFormatContextInput, anyhow::Error> {
+    /// it is ignored for other sources. `prefetch` controls how much of a
+    /// cloud object is fetched ahead of FFmpeg's reads.
+    fn open(
+        self,
+        s3_config: Option<S3Config>,
+        prefetch: Prefetch,
+    ) -> Result<AVFormatContextInput, anyhow::Error> {
         match self {
             MediaSource::Uri(uri) => {
                 let file_path =
                     CString::new(uri).context("Failed to create CStr from file path")?;
-                cloud_storage_avio_reader(&file_path, s3_config)
+                cloud_storage_avio_reader(&file_path, s3_config, prefetch)
             }
             MediaSource::Bytes(bytes) => memory_avio_reader(bytes),
         }
@@ -373,7 +378,7 @@ pub fn decode_media(
     } = request;
     let output_limit = OutputLimit::resolve(max_output_bytes);
 
-    let mut input_format_context = source.open(s3_config)?;
+    let mut input_format_context = source.open(s3_config, Prefetch::All)?;
 
     // Stream selection
     let video_stream = select_video_stream(&input_format_context, video_stream_request)?;
@@ -1156,16 +1161,19 @@ pub fn probe_media(
     source: MediaSource,
     s3_config: Option<S3Config>,
 ) -> Result<ProbedMedia, anyhow::Error> {
-    let input_format_context = source.open(s3_config)?;
+    probe_opened(&source.open(s3_config, Prefetch::Lazy)?)
+}
+
+fn probe_opened(input_format_context: &AVFormatContextInput) -> Result<ProbedMedia, anyhow::Error> {
     let mut probed = ProbedMedia {
-        format_name: format_name(&input_format_context),
-        duration_seconds: container_duration_seconds(&input_format_context),
+        format_name: format_name(input_format_context),
+        duration_seconds: container_duration_seconds(input_format_context),
         ..Default::default()
     };
     for (index, stream) in input_format_context.streams().iter().enumerate() {
         let codecpar = stream.codecpar();
         let (duration_seconds, duration_source) =
-            match stream_duration_seconds(&input_format_context, stream) {
+            match stream_duration_seconds(input_format_context, stream) {
                 Some((duration, source)) => (Some(duration), source),
                 None => (None, DurationSource::None),
             };
@@ -1225,16 +1233,30 @@ pub fn plan_media(
         audio_streams,
         max_output_bytes,
     } = request;
-    let output_limit = OutputLimit::resolve(max_output_bytes);
-    let input_format_context = source.open(s3_config)?;
-    let video_stream = select_video_stream(&input_format_context, video_stream)?;
-    let audio_streams = select_audio_streams(&input_format_context, audio_streams)?;
-    let seek = Seek {
-        start_time,
-        end_time,
-    };
-    let timeline_start = planned_timeline_start(
+    let input_format_context = source.open(s3_config, Prefetch::Lazy)?;
+    plan_opened(
         &input_format_context,
+        video_stream,
+        audio_streams,
+        Seek {
+            start_time,
+            end_time,
+        },
+        OutputLimit::resolve(max_output_bytes),
+    )
+}
+
+fn plan_opened(
+    input_format_context: &AVFormatContextInput,
+    video_stream: Option<VideoStreamRequest>,
+    audio_streams: Option<Vec<AudioStreamRequest>>,
+    seek: Seek,
+    output_limit: OutputLimit,
+) -> Result<Vec<StreamPlan>, anyhow::Error> {
+    let video_stream = select_video_stream(input_format_context, video_stream)?;
+    let audio_streams = select_audio_streams(input_format_context, audio_streams)?;
+    let timeline_start = planned_timeline_start(
+        input_format_context,
         video_stream.as_ref(),
         audio_streams.as_deref(),
         &seek,
@@ -1242,7 +1264,7 @@ pub fn plan_media(
     let mut plans = Vec::new();
     if let Some(video_stream) = &video_stream {
         plans.push(plan_video_stream(
-            &input_format_context,
+            input_format_context,
             video_stream,
             &seek,
             &output_limit,
@@ -1250,7 +1272,7 @@ pub fn plan_media(
     }
     for audio_stream in audio_streams.iter().flatten() {
         plans.push(plan_audio_stream(
-            &input_format_context,
+            input_format_context,
             audio_stream,
             &seek,
             timeline_start,
@@ -8363,7 +8385,7 @@ mod tests {
         // because the decoded output is trimmed afterwards.
         let webm = crate::util::test_utils::generate_test_webm_file(Duration::from_secs(10))?;
         let input_format_context =
-            MediaSource::Uri(webm.path().to_str().unwrap().into()).open(None)?;
+            MediaSource::Uri(webm.path().to_str().unwrap().into()).open(None, Prefetch::All)?;
         let video_request =
             select_video_stream(&input_format_context, Some(VideoStreamRequest::default()))?
                 .unwrap();
@@ -11211,5 +11233,388 @@ mod tests {
         let expected: Vec<i64> = (first..first + expected_frames as i64).collect();
         assert_eq!(frame_indices, expected);
         Ok(())
+    }
+}
+
+/// End-to-end tests of [`Prefetch::Lazy`] against an S3-compatible range
+/// server: lazily opened probes and plans must match an eager open of the
+/// same object while fetching only part of it.
+#[cfg(test)]
+mod lazy_prefetch_tests {
+    use super::io::range_server::{Quirks, RangeServer};
+    use super::*;
+    use crate::util::test_utils::init_logger;
+    use std::process::Command;
+    use test_case::test_case;
+
+    /// Base chunk for these tests: small enough that the fixtures span many
+    /// chunks, as real assets do with the 1 MiB default.
+    const CHUNK: usize = 16 * 1024;
+
+    /// A ~2 MB clip (10 s of noisy H.264 at 1.6 Mb/s, plus AAC), written
+    /// with `ffmpeg_args` selecting the container layout. Noise keeps the
+    /// encoder from compressing it to a few KB, so the file spans many
+    /// chunks, as real assets do.
+    fn fixture(ffmpeg_args: &[&str], extension: &str) -> Vec<u8> {
+        let output = tempfile::Builder::new()
+            .suffix(extension)
+            .tempfile()
+            .unwrap();
+        let status = Command::new("ffmpeg")
+            .args(["-nostdin", "-v", "error", "-y"])
+            .args([
+                "-f",
+                "lavfi",
+                "-i",
+                "testsrc2=s=320x240:r=30:d=10,noise=alls=40:allf=t",
+            ])
+            .args(["-f", "lavfi", "-i", "sine=f=440:d=10"])
+            .args(["-c:v", "libx264", "-preset", "ultrafast", "-b:v", "1600k"])
+            .args(["-g", "30", "-c:a", "aac", "-shortest"])
+            .args(ffmpeg_args)
+            .arg(output.path())
+            .status()
+            .unwrap();
+        assert!(status.success(), "ffmpeg remux failed");
+        std::fs::read(output.path()).unwrap()
+    }
+
+    fn open(server: &RangeServer, key: &str, prefetch: Prefetch) -> AVFormatContextInput {
+        let uri = CString::new(format!("s3://bucket/{key}")).unwrap();
+        io::cloud_storage_avio_reader(&uri, Some(server.s3_config()), prefetch).unwrap()
+    }
+
+    fn plan(input: &AVFormatContextInput) -> String {
+        format!(
+            "{:?}",
+            plan_opened(
+                input,
+                Some(VideoStreamRequest::default()),
+                Some(vec![AudioStreamRequest::default()]),
+                Seek {
+                    start_time: None,
+                    end_time: None,
+                },
+                OutputLimit::resolve(None),
+            )
+            .unwrap()
+        )
+    }
+
+    /// (probe, plan) of `key` opened with `prefetch`, plus the bytes and
+    /// requests the server served for it.
+    fn read(server: &RangeServer, key: &str, prefetch: Prefetch) -> (String, String, usize, usize) {
+        let before = server.served().len();
+        let input = open(server, key, prefetch);
+        let probed = format!("{:?}", probe_opened(&input).unwrap());
+        let planned = plan(&input);
+        drop(input);
+        let served = &server.served()[before..];
+        let bytes = served.iter().map(|s| s.bytes).sum();
+        (probed, planned, bytes, served.len())
+    }
+
+    #[test_case(&["-movflags", "+faststart"], ".mp4"; "mp4 moov at the front")]
+    #[test_case(&[], ".mp4"; "mp4 moov at the end")]
+    #[test_case(&["-f", "matroska"], ".mkv"; "mkv")]
+    fn test_lazy_matches_eager_and_fetches_a_bounded_part(args: &[&str], extension: &str) {
+        init_logger();
+        let data = fixture(args, extension);
+        let size = data.len();
+        let server = RangeServer::start();
+        server.put("asset", data, "v1");
+
+        let (eager_probe, eager_plan, _, _) = read(&server, "asset", Prefetch::All);
+        let (lazy_probe, lazy_plan, bytes, requests) =
+            read(&server, "asset", Prefetch::LazyWithChunk(CHUNK));
+        assert_eq!(lazy_probe, eager_probe);
+        assert_eq!(lazy_plan, eager_plan);
+        // The header plus what `avformat_find_stream_info` reads (FFmpeg's
+        // default 5 MB / 5 s probe window: half of this 10 s clip), not the
+        // object. Real assets are far longer than the window, so the share
+        // there is much smaller (~1 MB of a 106 MB file).
+        assert!(
+            bytes <= size / 2,
+            "lazy read {bytes} of {size} bytes in {requests} requests"
+        );
+    }
+
+    /// Without a `sidx`, the mov demuxer reads every `moof` at open, so a
+    /// fragmented MP4 is fetched nearly whole. The request size grows on each
+    /// forward hop, so the hops cost a logarithmic number of requests rather
+    /// than one per chunk.
+    #[test]
+    fn test_lazy_fragmented_mp4_grows_requests() {
+        init_logger();
+        let data = fixture(
+            &["-movflags", "+frag_keyframe+empty_moov+default_base_moof"],
+            ".mp4",
+        );
+        let size = data.len();
+        let server = RangeServer::start();
+        server.put("fragmented", data, "v1");
+
+        let (eager_probe, eager_plan, _, _) = read(&server, "fragmented", Prefetch::All);
+        let before = server.served().len();
+        let (lazy_probe, lazy_plan, _, requests) =
+            read(&server, "fragmented", Prefetch::LazyWithChunk(CHUNK));
+        assert_eq!(lazy_probe, eager_probe);
+        assert_eq!(lazy_plan, eager_plan);
+        let chunks = size.div_ceil(CHUNK);
+        let starts: Vec<usize> = server.served()[before..].iter().map(|s| s.start).collect();
+        assert!(
+            requests <= 2 * (chunks.ilog2() as usize + 2),
+            "{requests} requests for {chunks} chunks of {size} bytes, at {starts:?}"
+        );
+    }
+
+    /// Stores that deviate from S3 still probe the same as an eager read:
+    /// - `Content-Range: bytes a-b/*` (and a chunked open-ended read with no
+    ///   Content-Length): the body length must not be taken for the size;
+    /// - a 200 that ignores Range: its full body is used, not refetched;
+    /// - weak ETags: not used for If-Match, which compares strongly.
+    #[test_case(Quirks { unknown_total: true, ..Default::default() }; "unknown total")]
+    #[test_case(Quirks { ignore_range: true, ..Default::default() }; "range ignored")]
+    #[test_case(Quirks { weak_etag: true, ..Default::default() }; "weak etag")]
+    #[test_case(Quirks { capitalized_unit: true, ..Default::default() }; "capitalized unit")]
+    #[test_case(Quirks { ignore_range: true, chunked_full: true, ..Default::default() }; "range ignored chunked")]
+    fn test_lazy_s3_quirks_probe_like_eager(quirks: Quirks) {
+        init_logger();
+        let data = fixture(&[], ".mp4");
+        let server = RangeServer::start();
+        server.put("asset", data, "v1");
+        let (eager_probe, eager_plan, _, _) = read(&server, "asset", Prefetch::All);
+        server.set_quirks(quirks);
+        let before = server.served().len();
+        let (lazy_probe, lazy_plan, _, _) = read(&server, "asset", Prefetch::LazyWithChunk(CHUNK));
+        assert_eq!(lazy_probe, eager_probe);
+        assert_eq!(lazy_plan, eager_plan);
+        let requests = server.served().len() - before;
+        if quirks.ignore_range && !quirks.chunked_full {
+            assert_eq!(requests, 1, "the full 200 body was refetched");
+        }
+        if quirks.capitalized_unit {
+            // A `Bytes` total is still read, so no open-ended re-read: the
+            // same requests as with a lowercase unit.
+            server.set_quirks(Quirks::default());
+            let (_, _, _, lowercase) = read(&server, "asset", Prefetch::LazyWithChunk(CHUNK));
+            assert_eq!(
+                requests, lowercase,
+                "a capitalized unit cost extra requests"
+            );
+        }
+    }
+
+    /// After a 416 falls back to an open-ended read, a `bytes a-b/*` answer
+    /// is already open-ended: its range end is the object's end, so no
+    /// second open-ended GET is needed.
+    #[test]
+    fn test_lazy_span_cap_fallback_is_not_repeated() {
+        init_logger();
+        let data = fixture(&["-movflags", "+faststart"], ".mp4");
+        let server = RangeServer::start();
+        server.put("asset", data, "v1");
+        let (eager_probe, _, _, _) = read(&server, "asset", Prefetch::All);
+        // Every bounded request is refused, so the open is one 416 and one
+        // open-ended read.
+        server.set_quirks(Quirks {
+            unknown_total: true,
+            max_bounded_span: Some(0),
+            ..Default::default()
+        });
+        let before = server.served().len();
+        let input = open(&server, "asset", Prefetch::LazyWithChunk(CHUNK));
+        let opened = server.served()[before..].len();
+        let probed = format!("{:?}", probe_opened(&input).unwrap());
+        assert_eq!(probed, eager_probe);
+        assert_eq!(
+            opened,
+            1,
+            "open-ended GETs to open: {:?}",
+            &server.served()[before..]
+        );
+    }
+
+    /// A store that answers every request, open-ended ones included, with a
+    /// chunked 200 carrying no size gets a single request: the open-ended
+    /// read would only get the same answer, so it is not asked again before
+    /// the open fails for want of a size.
+    #[test]
+    fn test_sizeless_open_ended_200_is_not_repeated() {
+        init_logger();
+        let server = RangeServer::start();
+        server.put("asset", fixture(&[], ".mp4"), "v1");
+        server.set_quirks(Quirks {
+            chunked_always: true,
+            ..Default::default()
+        });
+        let uri = CString::new("s3://bucket/asset").unwrap();
+        let opened = io::cloud_storage_avio_reader(&uri, Some(server.s3_config()), Prefetch::All);
+        assert!(opened.is_err(), "opened without an object size");
+        assert_eq!(server.served().len(), 1, "requests: {:?}", server.served());
+    }
+
+    /// Dropping an opened input stops its downloads. Reader tasks used to
+    /// hold the reader context strongly, so it outlived the input and the
+    /// read kept streaming the object to the end, for every eager open and
+    /// for a lazy one that fell back to an open-ended read.
+    #[test_case(Prefetch::All, Quirks::default(); "eager")]
+    #[test_case(Prefetch::LazyWithChunk(CHUNK), Quirks { max_bounded_span: Some(0), ..Default::default() }; "lazy fallen back to open-ended")]
+    fn test_dropping_the_input_stops_its_downloads(prefetch: Prefetch, quirks: Quirks) {
+        init_logger();
+        let data = fixture(&["-movflags", "+faststart"], ".mp4");
+        let size = data.len();
+        let server = RangeServer::start();
+        server.put("asset", data, "v1");
+        // Hold the body after 256 KiB, past the faststart header the open
+        // needs: whatever the machine's speed, the reader is mid-download
+        // when the input is dropped.
+        let held = 256 * 1024;
+        server.set_quirks(Quirks {
+            throttle: Some(std::time::Duration::from_millis(1)),
+            hold_after: Some(held),
+            ..quirks
+        });
+        drop(open(&server, "asset", prefetch));
+        let at_drop = server.bytes_sent();
+        // The gate is what makes this test meaningful; a piece already in
+        // flight may land just past it.
+        assert!(
+            at_drop <= held + 16 * 1024,
+            "{at_drop} of {size} bytes sent before the drop"
+        );
+        server.release();
+        std::thread::sleep(std::time::Duration::from_millis(1500));
+        let later = server.bytes_sent();
+        // A reader aborted at the drop has closed its connection, so the
+        // released body goes nowhere; one that outlived the input streams it.
+        assert!(
+            later - at_drop < size / 4,
+            "{} more of {size} bytes sent after the input was dropped",
+            later - at_drop
+        );
+    }
+
+    /// A store that caps bounded spans refuses the grown requests of a
+    /// fragmented MP4's moof walk (hole and seek requests alike) with 416;
+    /// each falls back to an open-ended read, so the probe still matches.
+    #[test]
+    fn test_lazy_span_capped_store_falls_back_open_ended() {
+        init_logger();
+        let data = fixture(
+            &["-movflags", "+frag_keyframe+empty_moov+default_base_moof"],
+            ".mp4",
+        );
+        let server = RangeServer::start();
+        server.put("fragmented", data, "v1");
+        let (eager_probe, eager_plan, _, _) = read(&server, "fragmented", Prefetch::All);
+        server.set_quirks(Quirks {
+            max_bounded_span: Some(2 * CHUNK),
+            ..Default::default()
+        });
+        let (lazy_probe, lazy_plan, _, _) =
+            read(&server, "fragmented", Prefetch::LazyWithChunk(CHUNK));
+        assert_eq!(lazy_probe, eager_probe);
+        assert_eq!(lazy_plan, eager_plan);
+    }
+
+    /// An open-ended read whose body drops is resumed open-ended, not as one
+    /// bounded range for the remainder, which gateways capping bounded spans
+    /// refuse.
+    #[test]
+    fn test_lazy_open_ended_read_resumes_open_ended() {
+        init_logger();
+        let data = fixture(&[], ".mp4");
+        let server = RangeServer::start();
+        server.put("asset", data, "v1");
+        let (eager_probe, eager_plan, _, _) = read(&server, "asset", Prefetch::All);
+        // `/*` totals make the first read open-ended; drop its body early
+        // and refuse bounded spans longer than four chunks.
+        server.set_quirks(Quirks {
+            unknown_total: true,
+            truncate_request: Some(server.served().len() + 1),
+            max_bounded_span: Some(4 * CHUNK),
+            ..Default::default()
+        });
+        let (lazy_probe, lazy_plan, _, _) = read(&server, "asset", Prefetch::LazyWithChunk(CHUNK));
+        assert_eq!(lazy_probe, eager_probe);
+        assert_eq!(lazy_plan, eager_plan);
+        // Resumed open-ended, the remainder never hits the span cap; asked
+        // as one bounded range it would be refused and only then fall back.
+        assert_eq!(
+            server.refused(),
+            0,
+            "the resume asked for a capped bounded span"
+        );
+    }
+
+    /// A versioned bucket returns a version id, but reading by version id
+    /// needs `s3:GetObjectVersion`, which a reader may lack. Later requests
+    /// pin with the strong ETag (`s3:GetObject` is enough), so a multi-request
+    /// probe works for such a reader.
+    #[test]
+    fn test_lazy_versioned_object_pins_without_version_reads() {
+        init_logger();
+        // moov at the end, so probing takes more than one request.
+        let data = fixture(&[], ".mp4");
+        let server = RangeServer::start();
+        server.put("asset", data, "v1");
+        let (eager_probe, eager_plan, _, _) = read(&server, "asset", Prefetch::All);
+        server.set_quirks(Quirks {
+            version_ids: true,
+            ..Default::default()
+        });
+        let (lazy_probe, lazy_plan, _, requests) =
+            read(&server, "asset", Prefetch::LazyWithChunk(CHUNK));
+        assert!(requests > 1, "probe took a single request");
+        assert_eq!(lazy_probe, eager_probe);
+        assert_eq!(lazy_plan, eager_plan);
+    }
+
+    /// An object overwritten while it is being opened fails the open, rather
+    /// than returning metadata from whatever FFmpeg parsed before the
+    /// pinned read was refused.
+    #[test]
+    fn test_lazy_object_overwritten_during_open_fails() {
+        init_logger();
+        // moov at the front, and the swap after FFmpeg has it (two
+        // requests): the refused read is one of the packet reads in
+        // `avformat_find_stream_info`, which on its own carries on and
+        // returns the streams it has.
+        let data = fixture(&["-movflags", "+faststart"], ".mp4");
+        let server = RangeServer::start();
+        server.put("asset", data.clone(), "v1");
+        server.swap_after(2, "asset", data, "v2");
+        let uri = CString::new("s3://bucket/asset").unwrap();
+        let opened = io::cloud_storage_avio_reader(
+            &uri,
+            Some(server.s3_config()),
+            Prefetch::LazyWithChunk(CHUNK),
+        );
+        assert!(opened.is_err(), "open succeeded across an overwrite");
+    }
+
+    /// A connection dropped halfway through a grown request is respawned for
+    /// the rest of that request's range, so the probe still succeeds.
+    #[test]
+    fn test_lazy_respawn_covers_a_dropped_grown_request() {
+        init_logger();
+        let data = fixture(&[], ".mp4");
+        let server = RangeServer::start();
+        server.put("asset", data, "v1");
+        let (eager_probe, eager_plan, _, _) = read(&server, "asset", Prefetch::All);
+        let (_, _, _, undisturbed) = read(&server, "asset", Prefetch::LazyWithChunk(CHUNK));
+        // Request 1 of the lazy read is the first grown one.
+        server.set_quirks(Quirks {
+            truncate_request: Some(server.served().len() + 1),
+            ..Default::default()
+        });
+        let (lazy_probe, lazy_plan, _, requests) =
+            read(&server, "asset", Prefetch::LazyWithChunk(CHUNK));
+        assert_eq!(lazy_probe, eager_probe);
+        assert_eq!(lazy_plan, eager_plan);
+        // One respawn for the rest of the dropped range, not a run of
+        // base-sized ones that could exhaust the respawn budget.
+        assert_eq!(requests, undisturbed + 1, "respawn requests");
     }
 }
