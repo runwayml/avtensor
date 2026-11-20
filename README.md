@@ -487,6 +487,17 @@ range requests on seek, buffered in memory (`AVTENSOR_MAX_CLOUD_OBJECT_BYTES`
 caps the buffer; default 16 GiB). HTTP(S) inputs go through FFmpeg's own
 protocol layer.
 
+`decode_asset` streams the whole object. `probe_asset` and `plan_asset` only
+need the container header, so they fetch what FFmpeg reads, in ranged
+requests of 1 MiB (`AVTENSOR_LAZY_CHUNK_BYTES`). Requests double, up to
+16 MiB, while FFmpeg keeps reading forward, for example through the fragments
+of a fragmented MP4. A probe of a file with its index at the front typically
+fetches well under 1 MiB, whatever the file's size. All requests after the
+first are pinned to the object version the first one saw. If the object
+changes mid-probe, the probe fails and can be retried. A failed request is
+not retried internally either; retry the whole probe. Dropping a decode or
+probe stops its downloads.
+
 ### Google Cloud Storage (`gs://`)
 
 Authentication uses
